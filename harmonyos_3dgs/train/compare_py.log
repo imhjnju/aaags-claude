@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/home/robota/h00813233/Graph/3dgs/harmonyos_3dgs/tools/train_compare_py.py", line 365, in <module>
+    losses = main()
+  File "/home/robota/h00813233/Graph/3dgs/harmonyos_3dgs/tools/train_compare_py.py", line 254, in main
+    raw_pos = np.fromfile(os.path.join(base_dir, 'train/compare_raw_pos.bin'), dtype=F).reshape(N, 3)
+              ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/home/robota/h00813233/Graph/3dgs/harmonyos_3dgs/train/compare_raw_pos.bin'

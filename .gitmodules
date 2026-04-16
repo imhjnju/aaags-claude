@@ -1,0 +1,6 @@
+[submodule "AAA-Gaussians"]
+	path = AAA-Gaussians
+	url = ./AAA-Gaussians/
+[submodule "harness_builder"]
+	path = harness_builder
+	url = ./harness_builder/

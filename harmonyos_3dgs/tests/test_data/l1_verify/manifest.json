@@ -1,0 +1,47 @@
+[
+  {
+    "name": "tiny_1x1",
+    "H": 1,
+    "W": 1,
+    "n_elements": 3,
+    "loss_serial": 0.5316044688224792,
+    "loss_numpy": 0.5316044688224792,
+    "serial_numpy_diff": 0.0
+  },
+  {
+    "name": "small_4x4",
+    "H": 4,
+    "W": 4,
+    "n_elements": 48,
+    "loss_serial": 0.30330774188041687,
+    "loss_numpy": 0.3033077120780945,
+    "serial_numpy_diff": 2.9802322387695312e-08
+  },
+  {
+    "name": "med_16x16",
+    "H": 16,
+    "W": 16,
+    "n_elements": 768,
+    "loss_serial": 0.33347517251968384,
+    "loss_numpy": 0.33347511291503906,
+    "serial_numpy_diff": 5.960464477539063e-08
+  },
+  {
+    "name": "med_64x64",
+    "H": 64,
+    "W": 64,
+    "n_elements": 12288,
+    "loss_serial": 0.33259332180023193,
+    "loss_numpy": 0.3325934112071991,
+    "serial_numpy_diff": 8.940696716308594e-08
+  },
+  {
+    "name": "large_256x256",
+    "H": 256,
+    "W": 256,
+    "n_elements": 196608,
+    "loss_serial": 0.3335191607475281,
+    "loss_numpy": 0.33351948857307434,
+    "serial_numpy_diff": 3.2782554626464844e-07
+  }
+]
