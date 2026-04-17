@@ -1,0 +1,278 @@
+{
+  "step": 1,
+  "camera_idx": 0,
+  "seed": 42,
+  "reference_commit": "",
+  "config_hash": "",
+  "artifacts": [
+    {
+      "filename": "preprocess_conic_opacity.npy",
+      "operator": "preprocess",
+      "tensor": "conic_opacity",
+      "shape": [
+        20,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_depths.npy",
+      "operator": "preprocess",
+      "tensor": "depths",
+      "shape": [
+        20
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_means2D.npy",
+      "operator": "preprocess",
+      "tensor": "means2D",
+      "shape": [
+        20,
+        2
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_point_offsets.npy",
+      "operator": "preprocess",
+      "tensor": "point_offsets",
+      "shape": [
+        20
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_rgb.npy",
+      "operator": "preprocess",
+      "tensor": "rgb",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_tiles_touched.npy",
+      "operator": "preprocess",
+      "tensor": "tiles_touched",
+      "shape": [
+        20
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "rasterize_n_contrib.npy",
+      "operator": "rasterize",
+      "tensor": "n_contrib",
+      "shape": [
+        4096
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "rasterize_transmittance.npy",
+      "operator": "rasterize",
+      "tensor": "transmittance",
+      "shape": [
+        4096
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_keys_sorted.npy",
+      "operator": "sort",
+      "tensor": "keys_sorted",
+      "shape": [
+        103
+      ],
+      "dtype": "uint64",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_keys_unsorted.npy",
+      "operator": "sort",
+      "tensor": "keys_unsorted",
+      "shape": [
+        103
+      ],
+      "dtype": "uint64",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_tile_ranges.npy",
+      "operator": "sort",
+      "tensor": "tile_ranges",
+      "shape": [
+        16,
+        2
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_values_sorted.npy",
+      "operator": "sort",
+      "tensor": "values_sorted",
+      "shape": [
+        103
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_values_unsorted.npy",
+      "operator": "sort",
+      "tensor": "values_unsorted",
+      "shape": [
+        103
+      ],
+      "dtype": "uint32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "rasterize_image.npy",
+      "operator": "rasterize",
+      "tensor": "image",
+      "shape": [
+        3,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "preprocess_radii.npy",
+      "operator": "preprocess",
+      "tensor": "radii",
+      "shape": [
+        20
+      ],
+      "dtype": "int32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_dL_dout_color.npy",
+      "operator": "backward",
+      "tensor": "dL_dout_color",
+      "shape": [
+        3,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_means2D.npy",
+      "operator": "backward",
+      "tensor": "d_means2D",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_colors.npy",
+      "operator": "backward",
+      "tensor": "d_colors",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_opacity.npy",
+      "operator": "backward",
+      "tensor": "d_opacity",
+      "shape": [
+        20,
+        1
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_means3D.npy",
+      "operator": "backward",
+      "tensor": "d_means3D",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_cov3D.npy",
+      "operator": "backward",
+      "tensor": "d_cov3D",
+      "shape": [
+        20,
+        6
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_sh.npy",
+      "operator": "backward",
+      "tensor": "d_sh",
+      "shape": [
+        20,
+        16,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_scales.npy",
+      "operator": "backward",
+      "tensor": "d_scales",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_rotations.npy",
+      "operator": "backward",
+      "tensor": "d_rotations",
+      "shape": [
+        20,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "backward_d_conic.npy",
+      "operator": "backward",
+      "tensor": "d_conic",
+      "shape": [
+        20,
+        2,
+        2
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    }
+  ]
+}
