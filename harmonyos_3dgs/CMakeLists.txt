@@ -102,6 +102,7 @@ if(BUILD_TESTS)
         tests/test_npy_reader.cpp
         tests/test_compare.cpp
         tests/test_manifest.cpp
+        tests/test_golden_roundtrip.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
