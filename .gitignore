@@ -2,3 +2,12 @@ basket0.ply
 basket-aaa.ply
 *.ppm
 basket*.ply
+
+# SP-0 golden artifacts — large, not committed
+dev_notes/ground_truth/**/*.npy
+dev_notes/ground_truth/**/*.pth
+dev_notes/ground_truth/**/*.ply
+# keep .gitkeep
+!dev_notes/ground_truth/.gitkeep
+!dev_notes/ground_truth/*/.gitkeep
+# tiny fixtures ARE committed (see tests/golden/tiny/)
