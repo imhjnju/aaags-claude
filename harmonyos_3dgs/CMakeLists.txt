@@ -91,8 +91,10 @@ if(BUILD_TESTS)
         tests/test_preprocessor_backward_gpu.cpp
         tests/test_trainer_gpu.cpp
         tests/test_density_controller.cpp
+        tests/test_npy_reader.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main)
+    target_include_directories(gs3d_tests PRIVATE tests)
     target_compile_definitions(gs3d_tests PRIVATE
         TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
     include(GoogleTest)
