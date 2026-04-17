@@ -678,9 +678,9 @@ cmd.end(); cmd.submit_and_wait();
 
 ```
 per step:
-  A. if step % 1000 == 0: oneupSHdegree()
-  B. 若 viewpoint_stack 空则 refill；randint(pop)
-  C. xyz_lr = lr_scheduler(step)
+  A. xyz_lr = lr_scheduler(step)                               # train.py:78
+  B. if step % 1000 == 0: oneupSHdegree()                      # train.py:81-82
+  C. 若 viewpoint_stack 空则 refill；randint(pop)              # train.py:85-87
 
   D. [GPU] 前向链 → rendered_image
   E. [GPU] L1LossPass → dL_L1
