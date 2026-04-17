@@ -4,6 +4,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                  "npy_reader assumes little-endian host; NPY '<' dtype and header_len u16 rely on it.");
+#endif
+
 enum class NpyDtype { float32, int32, int64, uint32, uint64 };
 
 struct NpyArray {
@@ -26,6 +31,14 @@ struct NpyArray {
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
+
+inline void read_exact_(std::ifstream& f, void* buf, size_t n, const std::string& path) {
+    f.read(reinterpret_cast<char*>(buf), n);
+    if (f.gcount() != static_cast<std::streamsize>(n))
+        throw std::runtime_error("npy_reader: truncated file " + path
+                                 + " (expected " + std::to_string(n)
+                                 + " bytes, got " + std::to_string(f.gcount()) + ")");
+}
 
 inline NpyDtype parse_descr(const std::string& descr) {
     // descr format: "<f4", "<i4", "<i8", "<u4", "<u8" (little-endian assumed)
@@ -85,18 +98,18 @@ inline NpyArray load_npy(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("npy_reader: cannot open " + path);
     char magic[6];
-    f.read(magic, 6);
+    read_exact_(f, magic, 6, path);
     if (std::memcmp(magic, "\x93NUMPY", 6) != 0)
         throw std::runtime_error("npy_reader: bad magic at " + path);
     uint8_t major, minor;
-    f.read(reinterpret_cast<char*>(&major), 1);
-    f.read(reinterpret_cast<char*>(&minor), 1);
+    read_exact_(f, &major, 1, path);
+    read_exact_(f, &minor, 1, path);
     if (major != 1) throw std::runtime_error("npy_reader: only v1.0 supported, got v"
                                              + std::to_string(major));
     uint16_t header_len;
-    f.read(reinterpret_cast<char*>(&header_len), 2);
+    read_exact_(f, &header_len, 2, path);
     std::string header(header_len, '\0');
-    f.read(&header[0], header_len);
+    read_exact_(f, &header[0], header_len, path);
 
     NpyArray arr;
     std::string descr = extract_dict_value(header, "descr");
