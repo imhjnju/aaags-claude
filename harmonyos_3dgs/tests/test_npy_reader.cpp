@@ -57,3 +57,36 @@ TEST(NpyReader, AssertShape_FailThrows) {
 TEST(NpyReader, MissingFileThrows) {
     EXPECT_THROW(load_npy("/nonexistent/path.npy"), std::runtime_error);
 }
+
+TEST(NpyReader, FortranOrderThrows) {
+    EXPECT_THROW(
+        load_npy(std::string(TEST_DATA_DIR) + "/golden/fixtures/f32_fortran.npy"),
+        std::runtime_error);
+}
+
+TEST(NpyReader, UnsupportedDtypeThrows) {
+    // float64 is not in the 5-dtype whitelist; parse_descr must reject
+    EXPECT_THROW(
+        load_npy(std::string(TEST_DATA_DIR) + "/golden/fixtures/f64_unsupported.npy"),
+        std::runtime_error);
+}
+
+TEST(NpyReader, TruncatedFileThrows) {
+    // file has valid header but payload chopped — short read at payload or earlier
+    EXPECT_THROW(
+        load_npy(std::string(TEST_DATA_DIR) + "/golden/fixtures/f32_truncated.npy"),
+        std::runtime_error);
+}
+
+TEST(NpyReader, Load3D_Float32) {
+    auto a = load_npy(std::string(TEST_DATA_DIR) + "/golden/fixtures/f32_2x2x2.npy");
+    EXPECT_EQ(a.dtype, NpyDtype::float32);
+    EXPECT_EQ(a.shape.size(), 3u);
+    EXPECT_EQ(a.shape[0], 2u);
+    EXPECT_EQ(a.shape[1], 2u);
+    EXPECT_EQ(a.shape[2], 2u);
+    EXPECT_EQ(a.numel(), 8u);
+    // Values are np.arange(8).reshape(2,2,2) → flat [0,1,2,3,4,5,6,7]
+    float* d = a.f32();
+    for (int i = 0; i < 8; ++i) EXPECT_FLOAT_EQ(d[i], static_cast<float>(i));
+}
