@@ -24,13 +24,18 @@
 
 ### 现有基础
 
-- 完整 OpenCL 后端已实现（10 个 GPU kernel，作为 Vulkan 移植参照）
 - 137 个单元测试全部通过，构建清洁
 - 抽象接口已定义：`Preprocessor` / `TileBinner` / `Sorter` / `Rasterizer`（`include/*.h`）
-- CPU 参考实现完备（`src/cpu/*`）
 - Python baseline 环境可用：`/home/robota/miniconda3/envs/aaa-gs`
 - 已有 Vulkan 迁移分析：`dev_notes/master_plan/vulkan_migration_plan.md`
 - 已知陷阱文档：`PORTING_PITFALLS.md`
+
+### 既有代码的定位（避免误读为验收基准）
+
+- **CUDA（`AAA-Gaussians/`）**：**唯一 golden 来源**。所有数值验收对齐 CUDA 导出的 `.npy` artifact。
+- **OpenCL 后端（`src/gpu/`，10 kernel）**：legacy 实现，**不作为** Vulkan 验收基准。仅在调试期可作**局部实现 sanity 参考**（例如检查某个计算的思路），不在验收链上。
+- **CPU 参考（`src/cpu/*`）**：同上，legacy；**不作为** Vulkan 验收基准。仅在开发者需要单步调试时作为**实现 sanity 参考**。
+- 本 spec 的所有 "golden"、"容差"、"对齐" 术语均指向 CUDA 导出，不指向 OpenCL 或 CPU。
 
 ### 核心方法论
 
@@ -247,7 +252,21 @@ struct VulkanDeviceCapabilities {
 };
 ```
 
-**设备选择流程**：枚举 → 过滤（必需能力）→ 按类型排序（INTEGRATED > DISCRETE > CPU）→ 取第一个。过滤失败输出诊断信息。
+**设备选择流程**：枚举 → 过滤（必需能力）→ 按类型排序 → 取第一个。过滤失败输出诊断信息。
+
+**类型优先级（目标机 vs 开发机分离）**：
+
+| 场景 | 默认优先级 | 触发条件 |
+|------|----------|---------|
+| 开发机（如 Tegra Thor，双 GPU 环境）| DISCRETE > INTEGRATED > CPU | 未设 `GS3D_VK_DEVICE` 环境变量时默认 |
+| 目标机（Maleoon 920，HarmonyOS）| INTEGRATED > DISCRETE > CPU | 交叉编译或显式 `--prefer-integrated` |
+
+**显式 override**（覆盖自动策略）：
+- `GS3D_VK_DEVICE=<index>`：直接指定 physical device 索引（`vkEnumeratePhysicalDevices` 返回顺序）
+- `GS3D_VK_DEVICE_NAME=<substring>`：按设备名字串匹配
+- 任一 override 生效时跳过类型排序，仅做能力过滤
+
+SP-6 性能报告必须记录实际选中的设备名（从 `VkPhysicalDeviceProperties::deviceName` 读）。
 
 `VulkanContext` 是**普通 RAII 类，无内置单例**。单例放测试 helper。
 
@@ -667,8 +686,9 @@ per step:
   E. [GPU] L1LossPass → dL_L1
   F. [GPU] SSIMForwardPass + SSIMBackwardPass → dL_SSIM
   G. [CPU weights] 合并 dL_dimage = (1-λ)*L1 + λ*SSIM
-  H. [GPU] RegLossPass → d_opacity, d_scales 累加
-  I. [GPU] 反向链
+  H. [GPU] 反向链（清零所有 d_* buffer，然后从 dL_dimage 填充梯度）
+  I. [GPU] RegLossPass → d_opacity, d_scales 在 H 输出基础上累加正则项
+           （严禁放在 H 之前：H 的清零会抹掉 RegLossPass 的贡献）
 
   J. [densify] if step < 10000 && step > 5000 && step%100==0:
         relocate_gs(...)      # 先 relocate
@@ -678,7 +698,10 @@ per step:
   M. [GPU] NoiseInjectionPass（用 Adam 后激活参数重建协方差）
 ```
 
-**关键顺序**：densify **在** Adam **之前**；noise **在** Adam **之后**。
+**关键顺序**：
+- RegLossPass **在** 反向链 **之后**（对齐 train.py:104-108：Python 把 reg 并入 loss 再 `loss.backward()`，反向末态含 reg 梯度）
+- densify **在** Adam **之前**
+- noise **在** Adam **之后**
 
 ### 6.3 AdamPass
 
@@ -762,14 +785,17 @@ active_sh_degree = min(step // 1000, 3)
 
 ```glsl
 // L_op = λ_op * mean(sigmoid(o)), L_sc = λ_sc * mean(exp(s))
+// scaling shape [N, 3] —— k 枚举 3 个分量（0, 1, 2），严禁写成 k < 4 或 k <= 3
 float sig_o = 1.0 / (1.0 + exp(-op_raw[i]));
 d_op[i] += pc.opacity_reg * sig_o * (1.0 - sig_o) / float(pc.N);
-for k in 0..3:
-    float exp_s = exp(sc_raw[i*3+k]);
-    d_sc[i*3+k] += pc.scale_reg * exp_s / float(3 * pc.N);
+for (int k = 0; k < 3; ++k) {
+    float exp_s = exp(sc_raw[i*3 + k]);
+    d_sc[i*3 + k] += pc.scale_reg * exp_s / float(3 * pc.N);
+}
 ```
 
 **输入是 raw opacity/scaling**（未激活），链式经激活函数。
+**严格要求**：scaling 只有 3 个维度（x/y/z），循环上界固定 `k < 3`；超出即越界写，会污染下一个高斯的 `d_sc[0]`。
 
 ### 6.9 超参数（SP-4 固定）
 
@@ -840,15 +866,18 @@ for k in 0..3:
 
 ### 7.3 SP-6：10000 步 Soak + 性能
 
-**Python 参考**（需 `--eval` 切分 train/test）：
+**Python 参考**（需 `--eval` 切分 train/test；使用 AAA-Gaussians `train.py` 现有 CLI）：
 ```bash
 conda run -n aaa-gs python AAA-Gaussians/train.py \
-  -s /home/robota/Downloads/basketball --iterations 10000 \
+  -s /home/robota/Downloads/basketball \
+  -m dev_notes/ground_truth/sp6/ \
+  --iterations 10000 \
   --densify_from_iter 5000 --densify_until_iter 10000 \
   --densification_interval 100 --eval \
-  --test_iterations 10000 --save_iterations 10000 \
-  --output_path dev_notes/ground_truth/sp6/
+  --test_iterations 10000 --save_iterations 10000
 ```
+
+注：`-m` / `--model_path` 是 AAA-Gaussians `__init__.py:52-59` 提供的输出目录参数；**不存在** `--output_path`。`dump_tool.py` 如需新参数应作为独立 CLI，不混入 `train.py`。
 
 **Vulkan 侧**：
 ```bash
