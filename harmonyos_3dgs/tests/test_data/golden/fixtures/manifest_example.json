@@ -1,0 +1,25 @@
+{
+  "step": 1,
+  "camera_idx": 0,
+  "seed": 42,
+  "reference_commit": "abc1234",
+  "config_hash": "sha256:deadbeef",
+  "artifacts": [
+    {
+      "filename": "preprocess_means2D.npy",
+      "operator": "preprocess",
+      "tensor": "means2D",
+      "shape": [100, 2],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "sort_keys_sorted.npy",
+      "operator": "sort",
+      "tensor": "keys_sorted",
+      "shape": [500],
+      "dtype": "uint64",
+      "layout": "flat"
+    }
+  ]
+}
