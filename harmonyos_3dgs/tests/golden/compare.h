@@ -5,6 +5,10 @@
 #include <vector>
 #include <limits>
 
+// CompareResult diagnostics.
+// NOTE: On size-mismatch, compare_f32 returns a default-constructed result
+// (passed=false, max_*_err=0). Callers must always check `passed` before
+// reading max_*_err / first_bad_index / num_bad.
 struct CompareResult {
     bool    passed        = false;
     float   max_abs_err   = 0.0f;
@@ -19,9 +23,10 @@ inline CompareResult compare_f32(const std::vector<float>& a,
     CompareResult r;
     if (a.size() != b.size()) return r;
     for (size_t i = 0; i < a.size(); ++i) {
-        float abs_err = std::fabs(a[i] - b[i]);
-        float rel_err = abs_err / (std::fabs(b[i]) + 1e-30f);
-        bool bad = (abs_err > abs_tol) && (rel_err > rel_tol);
+        bool is_nan = std::isnan(a[i]) || std::isnan(b[i]);
+        float abs_err = is_nan ? std::numeric_limits<float>::infinity() : std::fabs(a[i] - b[i]);
+        float rel_err = is_nan ? std::numeric_limits<float>::infinity() : abs_err / (std::fabs(b[i]) + 1e-30f);
+        bool bad = is_nan || ((abs_err > abs_tol) && (rel_err > rel_tol));
         if (bad) {
             if (r.num_bad == 0) r.first_bad_index = i;
             ++r.num_bad;

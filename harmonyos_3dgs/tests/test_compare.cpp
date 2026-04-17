@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cmath>
 #include <vector>
 #include "golden/compare.h"
 
@@ -51,4 +52,31 @@ TEST(Compare, MismatchSize_Fails) {
     std::vector<float> b{1.0f};
     auto r = compare_f32(a, b, 1e-6f, 1e-4f);
     EXPECT_FALSE(r.passed);
+}
+
+TEST(Compare, F32_LargeMagnitude_RelTolerancePass) {
+    // abs_err=10, abs_tol=1e-6 -> fails abs
+    // rel_err=10/1e6=1e-5, rel_tol=1e-4 -> passes rel
+    // Overall: passes via OR semantics
+    std::vector<float> a{1e6f};
+    std::vector<float> b{1.00001e6f};  // diff = 10 in absolute, 1e-5 relative
+    auto r = compare_f32(a, b, 1e-6f, 1e-4f);
+    EXPECT_TRUE(r.passed);
+}
+
+TEST(Compare, F32_MultipleBad_CountsAndFirstIndex) {
+    std::vector<float> a{1.0f, 1.0f, 1.0f, 1.0f};
+    std::vector<float> b{2.0f, 1.0f, 2.0f, 1.0f};  // bad at index 0 and 2
+    auto r = compare_f32(a, b, 1e-6f, 1e-4f);
+    EXPECT_FALSE(r.passed);
+    EXPECT_EQ(r.num_bad, 2u);
+    EXPECT_EQ(r.first_bad_index, 0u);
+}
+
+TEST(Compare, F32_NaN_Fails) {
+    std::vector<float> a{std::nanf(""), 1.0f};
+    std::vector<float> b{1.0f, 1.0f};
+    auto r = compare_f32(a, b, 1e6f, 1e6f);  // generous tolerance
+    EXPECT_FALSE(r.passed);                   // must fail despite generous tol
+    EXPECT_EQ(r.first_bad_index, 0u);
 }
