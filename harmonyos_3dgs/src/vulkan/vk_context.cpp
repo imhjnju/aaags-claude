@@ -1,6 +1,10 @@
 #include "vulkan/vk_context.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 #include <vector>
 
 // Enforce spec §3.1 required minimums. A device that fails any check is
@@ -36,6 +40,27 @@ static void log_minimums_failure(const char* device_name,
                  device_name ? device_name : "<unnamed>", reason);
 }
 
+namespace {
+
+struct Candidate {
+    VkPhysicalDevice dev;
+    uint32_t         qf;
+    std::string      name;
+    VkPhysicalDeviceType type;
+    VulkanDeviceCapabilities caps;
+};
+
+int device_type_rank(VkPhysicalDeviceType t) {
+    switch (t) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 0;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 1;
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return 2;
+        default:                                     return 3;
+    }
+}
+
+}  // namespace
+
 bool VulkanContext::init() {
     if (instance_ != VK_NULL_HANDLE) return true;
 
@@ -50,49 +75,117 @@ bool VulkanContext::init() {
         return false;
     }
 
-    uint32_t n = 0;
-    vkEnumeratePhysicalDevices(instance_, &n, nullptr);
-    if (n == 0) { release(); return false; }
-    std::vector<VkPhysicalDevice> devs(n);
-    vkEnumeratePhysicalDevices(instance_, &n, devs.data());
+    // Enumerate all physical devices
+    uint32_t n_phys = 0;
+    vkEnumeratePhysicalDevices(instance_, &n_phys, nullptr);
+    if (n_phys == 0) {
+        std::cerr << "VulkanContext: no physical devices\n";
+        release();
+        return false;
+    }
+    std::vector<VkPhysicalDevice> phys_list(n_phys);
+    vkEnumeratePhysicalDevices(instance_, &n_phys, phys_list.data());
 
-    bool picked = false;
-    for (VkPhysicalDevice pd : devs) {
-        uint32_t qn = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
-        std::vector<VkQueueFamilyProperties> qs(qn);
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qs.data());
-        uint32_t compute_family = UINT32_MAX;
-        for (uint32_t i = 0; i < qn; ++i) {
-            if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                compute_family = i;
-                break;
-            }
+    // Env overrides
+    const char* env_index = std::getenv("GS3D_VK_DEVICE");
+    const char* env_name  = std::getenv("GS3D_VK_DEVICE_NAME");
+
+    // Gather candidates passing minimums + having compute queue
+    std::vector<Candidate> candidates;
+    for (uint32_t i = 0; i < n_phys; ++i) {
+        VkPhysicalDevice pd = phys_list[i];
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(pd, &props);
+
+        // Find compute queue family
+        uint32_t nqf = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(pd, &nqf, nullptr);
+        std::vector<VkQueueFamilyProperties> qfs(nqf);
+        vkGetPhysicalDeviceQueueFamilyProperties(pd, &nqf, qfs.data());
+        uint32_t chosen_qf = UINT32_MAX;
+        for (uint32_t q = 0; q < nqf; ++q) {
+            if (qfs[q].queueFlags & VK_QUEUE_COMPUTE_BIT) { chosen_qf = q; break; }
         }
-        if (compute_family == UINT32_MAX) continue;
+        if (chosen_qf == UINT32_MAX) continue;
 
-        // Probe caps and enforce spec §3.1 required minimums. Rejected
-        // devices are logged so diagnostics show which check tripped.
-        VulkanDeviceCapabilities probed = probe_capabilities(pd);
-        if (!meets_minimums(probed)) {
-            VkPhysicalDeviceProperties p{};
-            vkGetPhysicalDeviceProperties(pd, &p);
-            log_minimums_failure(p.deviceName, probed);
+        VulkanDeviceCapabilities caps = probe_capabilities(pd);
+        if (!meets_minimums(caps)) {
+            log_minimums_failure(props.deviceName, caps);
             continue;
         }
 
-        phys_ = pd;
-        compute_qf_ = compute_family;
-        caps_ = probed;
-        picked = true;
-        break;
+        candidates.push_back({pd, chosen_qf, std::string(props.deviceName),
+                              props.deviceType, caps});
     }
-    if (!picked) { release(); return false; }
+    if (candidates.empty()) {
+        std::cerr << "VulkanContext: no device passes capability minimums\n";
+        release();
+        return false;
+    }
 
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(phys_, &props);
-    device_name_ = props.deviceName;
-    api_version_ = props.apiVersion;
+    // Env override by index
+    bool picked = false;
+    if (env_index) {
+        int want = std::atoi(env_index);
+        if (want < 0 || static_cast<uint32_t>(want) >= n_phys) {
+            std::cerr << "GS3D_VK_DEVICE=" << want << " out of range (0.."
+                      << (n_phys-1) << ")\n";
+            release();
+            return false;
+        }
+        VkPhysicalDevice wanted = phys_list[want];
+        for (auto& c : candidates) {
+            if (c.dev == wanted) {
+                phys_        = c.dev;
+                compute_qf_  = c.qf;
+                device_name_ = c.name;
+                api_version_ = c.caps.api_version;
+                caps_        = c.caps;
+                picked = true;
+                break;
+            }
+        }
+        if (!picked) {
+            std::cerr << "GS3D_VK_DEVICE index selected a device that fails minimums\n";
+            release();
+            return false;
+        }
+    }
+
+    // Env override by name substring
+    if (!picked && env_name) {
+        std::string needle(env_name);
+        for (auto& c : candidates) {
+            if (c.name.find(needle) != std::string::npos) {
+                phys_        = c.dev;
+                compute_qf_  = c.qf;
+                device_name_ = c.name;
+                api_version_ = c.caps.api_version;
+                caps_        = c.caps;
+                picked = true;
+                break;
+            }
+        }
+        if (!picked) {
+            std::cerr << "GS3D_VK_DEVICE_NAME=" << needle
+                      << " matched no capable device\n";
+            release();
+            return false;
+        }
+    }
+
+    // Auto-priority: DISCRETE > INTEGRATED > CPU > OTHER
+    if (!picked) {
+        std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return device_type_rank(a.type) < device_type_rank(b.type);
+            });
+        phys_        = candidates[0].dev;
+        compute_qf_  = candidates[0].qf;
+        device_name_ = candidates[0].name;
+        api_version_ = candidates[0].caps.api_version;
+        caps_        = candidates[0].caps;
+    }
 
     float qp = 1.0f;
     VkDeviceQueueCreateInfo dqci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
