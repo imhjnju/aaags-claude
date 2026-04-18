@@ -159,10 +159,28 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             set(${OUT_SPV_VAR} ${_spv} PARENT_SCOPE)
         endfunction()
 
+        # Embed an already-compiled .spv as a C header via xxd -i.
+        # Produces ${CMAKE_CURRENT_BINARY_DIR}/shaders/<shader>_spv.h
+        # with `unsigned char <shader>_spv[]` and `unsigned int <shader>_spv_len`.
+        find_program(XXD xxd REQUIRED)
+        function(gs3d_embed_spirv SHADER_NAME OUT_HEADER_VAR)
+            set(_spv    ${_vk_shader_dir}/${SHADER_NAME}.spv)
+            set(_header ${_vk_shader_dir}/${SHADER_NAME}_spv.h)
+            add_custom_command(
+                OUTPUT ${_header}
+                COMMAND ${CMAKE_COMMAND} -E chdir ${_vk_shader_dir}
+                        ${XXD} -i ${SHADER_NAME}.spv > ${_header}
+                DEPENDS ${_spv}
+                COMMENT "Embedding ${SHADER_NAME}.spv as C header via xxd -i"
+                VERBATIM)
+            set(${OUT_HEADER_VAR} ${_header} PARENT_SCOPE)
+        endfunction()
+
         gs3d_compile_glsl(add_one    _spv_add_one)
         gs3d_compile_glsl(preprocess _spv_preprocess)
+        gs3d_embed_spirv(add_one _hdr_add_one)
         add_custom_target(gs3d_vulkan_shaders
-            DEPENDS ${_spv_add_one} ${_spv_preprocess})
+            DEPENDS ${_spv_add_one} ${_spv_preprocess} ${_hdr_add_one})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
