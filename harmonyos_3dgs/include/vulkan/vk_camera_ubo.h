@@ -12,7 +12,7 @@ struct alignas(16) CameraUBO {
     float fov_size[4];            // 16B: x=tan_fovx, y=tan_fovy, z=width, w=height
 };
 static_assert(sizeof(CameraUBO) == 224, "CameraUBO std140 layout mismatch (spec §4.6)");
-static_assert(offsetof(CameraUBO, projmatrix)         == 64,  "");
-static_assert(offsetof(CameraUBO, inv_viewprojmatrix) == 128, "");
-static_assert(offsetof(CameraUBO, campos_pad)         == 192, "");
-static_assert(offsetof(CameraUBO, fov_size)           == 208, "");
+static_assert(offsetof(CameraUBO, projmatrix)         == 64,  "CameraUBO projmatrix offset mismatch (spec §4.6)");
+static_assert(offsetof(CameraUBO, inv_viewprojmatrix) == 128, "CameraUBO inv_viewprojmatrix offset mismatch (spec §4.6)");
+static_assert(offsetof(CameraUBO, campos_pad)         == 192, "CameraUBO campos_pad offset mismatch (spec §4.6)");
+static_assert(offsetof(CameraUBO, fov_size)           == 208, "CameraUBO fov_size offset mismatch (spec §4.6)");

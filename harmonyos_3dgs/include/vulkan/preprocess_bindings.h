@@ -25,7 +25,7 @@ constexpr uint32_t CAMERA_UBO          = 12;
 struct PreprocessPushConstants {
     uint32_t num_gaussians;
     uint32_t sh_degree;
-    uint32_t sh_coeffs_per_g;
+    uint32_t sh_coeffs_per_g;  // == (sh_degree+1)^2; set via helper to avoid drift with sh_degree
     uint32_t num_tiles_x;
     uint32_t num_tiles_y;
     float    scale_modifier;
@@ -51,7 +51,7 @@ struct PrefixSumPushConstants {
     uint32_t stride;
     uint32_t _pad;
 };
-static_assert(sizeof(PrefixSumPushConstants) == 16, "");
+static_assert(sizeof(PrefixSumPushConstants) == 16, "PrefixSumPushConstants must be 16 bytes per spec §4.8.2");
 
 // --- scatter.comp bindings (spec §4.8.3) ---
 namespace scatter_bind {
@@ -69,7 +69,7 @@ struct ScatterPushConstants {
     uint32_t tile_w;
     uint32_t tile_h;
 };
-static_assert(sizeof(ScatterPushConstants) == 16, "");
+static_assert(sizeof(ScatterPushConstants) == 16, "ScatterPushConstants must be 16 bytes per spec §4.8.3");
 
 // --- radix_sort_count.comp bindings (spec §4.8.4) ---
 namespace radix_count_bind {
@@ -90,7 +90,7 @@ struct RadixSortPushConstants {
     uint32_t _pad0;
     uint32_t _pad1;
 };
-static_assert(sizeof(RadixSortPushConstants) == 16, "");
+static_assert(sizeof(RadixSortPushConstants) == 16, "RadixSortPushConstants must be 16 bytes per spec §4.8.4/5");
 
 // --- tile_range.comp bindings (spec §4.8.6) ---
 namespace tile_range_bind {
@@ -103,7 +103,7 @@ struct TileRangePushConstants {
     uint32_t _pad0;
     uint32_t _pad1;
 };
-static_assert(sizeof(TileRangePushConstants) == 16, "");
+static_assert(sizeof(TileRangePushConstants) == 16, "TileRangePushConstants must be 16 bytes per spec §4.8.6");
 
 // --- rasterize.comp bindings (spec §4.8.7) ---
 namespace rasterize_bind {
@@ -124,4 +124,4 @@ struct RasterizePushConstants {
     uint32_t num_tiles_x;
     uint32_t num_tiles_y;
 };
-static_assert(sizeof(RasterizePushConstants) == 20, "");
+static_assert(sizeof(RasterizePushConstants) == 20, "RasterizePushConstants must be 20 bytes per spec §4.8.7");
