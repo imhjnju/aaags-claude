@@ -207,11 +207,15 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_capabilities.cpp
                 tests/test_vk_device_selection.cpp
                 tests/test_vk_pipeline_dispatch.cpp
+                tests/test_vk_hello.cpp
                 tests/test_preprocessor_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
                 gs3d_vk_core gs3d_core GTest::gtest_main)
+            target_include_directories(gs3d_vk_tests PRIVATE
+                ${_vk_shader_dir}   # xxd-embedded headers (hello_spv.h etc.)
+                tests)
             target_compile_definitions(gs3d_vk_tests PRIVATE
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}")
