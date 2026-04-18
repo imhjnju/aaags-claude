@@ -87,11 +87,11 @@ layout(std140, set = 0, binding = 8) uniform RasterUBO {
 
 // RasterizePushConstants — 20 bytes (spec §4.8.7).
 layout(push_constant) uniform PC {
-    uint num_gaussians;
+    uint num_gaussians;  // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
     uint image_width;
     uint image_height;
     uint num_tiles_x;
-    uint num_tiles_y;
+    uint num_tiles_y;    // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
 } pc;
 
 // --- Shared cache of the current batch (up to 256 Gaussians) ---
@@ -133,6 +133,9 @@ void main() {
     bool pixel_done = !valid_pixel;
 
     // --- Batched march through this tile's sorted Gaussian list ---
+    // TODO(SP-3-perf): add subgroup-wide early-exit when all pixels in tile are done
+    // (CUDA equivalent: __syncthreads_count(done) at forward.cu:386-388; Vulkan uses
+    // subgroupAllEqual() or a shared counter + barrier + uniform read).
     for (uint batch_start = range_start;
          batch_start < range_end;
          batch_start += BATCH_SIZE)
