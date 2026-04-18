@@ -1,0 +1,299 @@
+#version 450
+// GL_EXT_shader_atomic_float is required for atomicAdd on float SSBOs.
+// The device feature was probed in SP-1 (VulkanContext::init checks
+// shaderBufferFloat32AtomicAdd). glslangValidator accepts this extension
+// target without a special Vulkan instance extension.
+#extension GL_EXT_shader_atomic_float : require
+
+// SP-2/SP-3 rasterize_backward.comp — per-tile back-to-front alpha-blend
+// gradient pass (spec §4.8.8).
+//
+// One workgroup = one 16x16 tile. Each invocation = one pixel. The workgroup
+// cooperatively loads batches of up to 256 Gaussians from the TAIL of the
+// sorted list (back-to-front order), then each pixel walks backward through
+// contributors to accumulate gradients.
+//
+// CUDA reference: AAA-Gaussians/submodules/diff-gaussian-rasterization/
+//   cuda_rasterizer/backward.cu: renderCUDA(...) EVAL_3D=false path.
+//
+// Bindings match rasterize_backward_bind:: in include/vulkan/backward_bindings.h.
+//
+// dL_dpixels layout: pixel-major [H*W][C] — matches the CPU backward pass
+// (d_image[pix*3+ch]). The MSE loss gradient is computed in pixel-major order.
+//
+// Gradient output buffers (dL_dmeans2D, dL_dconics, dL_dopacity, dL_dcolors)
+// must be zero-filled by the caller before dispatch; this shader uses
+// atomicAdd to accumulate contributions from multiple pixels per Gaussian.
+//
+// Shared memory: 4 arrays * 256 entries = 4 KB + colors 768*4 = 3 KB = ~7 KB.
+// Under the Vulkan 1.1 guaranteed 16 KB minimum.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// ---- Input SSBOs (read-only) -----------------------------------------------
+
+// binding 0 — tile ranges [start, end] per tile (flat pairs).
+layout(std430, set = 0, binding = 0) readonly buffer TileRanges {
+    uint tile_ranges[];
+};
+
+// binding 1 — sorted Gaussian indices (one per (Gaussian, tile) pair).
+layout(std430, set = 0, binding = 1) readonly buffer ValuesSorted {
+    uint values_sorted[];
+};
+
+// binding 2 — means2D interleaved [x0,y0, x1,y1, ...].
+layout(std430, set = 0, binding = 2) readonly buffer Means2D {
+    float means2D[];
+};
+
+// binding 3 — packed [a, b, c, opacity] per Gaussian (stride 4 floats).
+// con_o.x=a, con_o.y=b, con_o.z=c, con_o.w=opacity (matches rasterize.comp).
+layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity {
+    float conic_opacity[];
+};
+
+// binding 4 — per-Gaussian RGB [r,g,b] interleaved (stride 3 floats).
+layout(std430, set = 0, binding = 4) readonly buffer Colors {
+    float colors[];
+};
+
+// binding 5 — per-pixel final transmittance from forward pass (H*W floats).
+layout(std430, set = 0, binding = 5) readonly buffer TFinal {
+    float T_final[];
+};
+
+// binding 6 — per-pixel blended-Gaussian count from forward pass (H*W uints).
+layout(std430, set = 0, binding = 6) readonly buffer NContrib {
+    uint n_contrib[];
+};
+
+// binding 7 — loss gradient w.r.t. output pixels, pixel-major [H*W][3]:
+//   dL_dpixels[pix*3+ch]. Matches CPU backward (d_image[pix*3+ch]).
+layout(std430, set = 0, binding = 7) readonly buffer DLDPixels {
+    float dL_dpixels[];
+};
+
+// ---- Output SSBOs (read-write, atomicAdd) -----------------------------------
+
+// binding 8 — gradient w.r.t. means2D [N*2]: [dx0,dy0, dx1,dy1, ...].
+layout(std430, set = 0, binding = 8) buffer DLDMeans2D {
+    float dL_dmeans2D[];
+};
+
+// binding 9 — gradient w.r.t. conic params [N*3]: [a0,b0,c0, a1,b1,c1, ...].
+layout(std430, set = 0, binding = 9) buffer DLDConics {
+    float dL_dconics[];
+};
+
+// binding 10 — gradient w.r.t. opacity_2d [N].
+layout(std430, set = 0, binding = 10) buffer DLDOpacity {
+    float dL_dopacity[];
+};
+
+// binding 11 — gradient w.r.t. colors [N*3]: [r0,g0,b0, r1,g1,b1, ...].
+layout(std430, set = 0, binding = 11) buffer DLDColors {
+    float dL_dcolors[];
+};
+
+// ---- UBO -------------------------------------------------------------------
+
+// binding 12 — backward pass parameters (std140, 32 bytes).
+layout(std140, set = 0, binding = 12) uniform RasterizeBackwardUBO {
+    uint  W;
+    uint  H;
+    uint  num_tiles_x;
+    uint  _pad;
+    vec3  bg_color;
+    float _pad2;
+};
+
+// ---- Shared memory ---------------------------------------------------------
+// One batch: up to 256 Gaussians loaded cooperatively.
+// Layout matches collected_id / collected_xy / collected_conic_opacity /
+// collected_colors in backward.cu.
+shared int   s_id     [256];
+shared vec2  s_xy     [256];   // means2D (x, y)
+shared vec4  s_conic_o[256];  // (a, b, c, opacity)
+shared float s_colors [768];  // 3 * 256 in channel-major: [ch*256 + li]
+
+const uint  BLOCK_SIZE = 256u;
+const float ALPHA_THRESHOLD = 1.0 / 255.0;
+
+void main() {
+    // ---- Tile identification -----------------------------------------------
+    uint tile_id = gl_WorkGroupID.y * num_tiles_x + gl_WorkGroupID.x;
+    uint range_start = tile_ranges[tile_id * 2u];
+    uint range_end   = tile_ranges[tile_id * 2u + 1u];
+
+    // ---- Per-pixel setup ---------------------------------------------------
+    uint pixel_x = gl_GlobalInvocationID.x;
+    uint pixel_y = gl_GlobalInvocationID.y;
+    bool inside  = (pixel_x < W) && (pixel_y < H);
+
+    uint pix = pixel_y * W + pixel_x;
+
+    uint li = gl_LocalInvocationIndex;   // 0..255
+
+    // ---- Load per-pixel forward data --------------------------------------
+    float T_pix       = inside ? T_final[pix]  : 0.0;
+    uint  last_contrib = inside ? n_contrib[pix] : 0u;
+
+    // Load loss gradient for this pixel (pixel-major layout).
+    vec3 dL_dpix = vec3(0.0);
+    if (inside) {
+        dL_dpix.x = dL_dpixels[pix * 3u + 0u];
+        dL_dpix.y = dL_dpixels[pix * 3u + 1u];
+        dL_dpix.z = dL_dpixels[pix * 3u + 2u];
+    }
+
+    int  toDo = int(range_end - range_start);
+    int  rounds = (toDo + int(BLOCK_SIZE) - 1) / int(BLOCK_SIZE);
+
+    // Running state for backward accumulation.
+    float T        = T_pix;   // transmittance at this point (starts at T_final, recovered going back)
+    vec3  accum_rec = vec3(0.0);
+    float last_alpha = 0.0;
+    vec3  last_color = vec3(0.0);
+
+    // Whether this pixel is active for gradient accumulation.
+    // Pixels with no contributions (last_contrib == 0) skip gradient work.
+    // This uses count-based n_contrib (our CPU and Vulkan forward convention):
+    // n_contrib[pix] = number of Gaussians that actually blended into this pixel.
+    // (Different from CUDA's last_contributor position convention — see forward.cu:429.)
+    // We process ALL Gaussians in the tile range and use alpha/power checks to
+    // identify and skip non-contributing Gaussians, matching the CPU backward's
+    // forward-replay approach.
+    bool pix_active = inside && (last_contrib > 0u);
+
+    // No viewport scaling here — our CPU backward does NOT apply the 0.5*W/H
+    // factor that appears in the CUDA reference. The CUDA factor accounts for
+    // the normalized-screen-space → pixel-space Jacobian which is already
+    // folded into our CPU means2D representation.  Validated by FD tests.
+
+    // ---- Back-to-front batched traversal ----------------------------------
+    for (int i = 0; i < rounds; i++, toDo -= int(BLOCK_SIZE)) {
+        // Cooperative load: each thread loads one Gaussian from the TAIL
+        // of the sorted list (back-to-front).
+        barrier();
+
+        int progress = i * int(BLOCK_SIZE) + int(li);
+        if (range_start + uint(progress) < range_end) {
+            // Load from the END minus progress (back-to-front).
+            int coll_id = int(values_sorted[range_end - 1u - uint(progress)]);
+            s_id[li]       = coll_id;
+            s_xy[li]       = vec2(means2D[coll_id * 2], means2D[coll_id * 2 + 1]);
+            s_conic_o[li]  = vec4(
+                conic_opacity[coll_id * 4 + 0],
+                conic_opacity[coll_id * 4 + 1],
+                conic_opacity[coll_id * 4 + 2],
+                conic_opacity[coll_id * 4 + 3]);
+            // Colors stored channel-major in shared: [ch*256 + li]
+            s_colors[0u * 256u + li] = colors[coll_id * 3 + 0];
+            s_colors[1u * 256u + li] = colors[coll_id * 3 + 1];
+            s_colors[2u * 256u + li] = colors[coll_id * 3 + 2];
+        }
+        barrier();
+
+        // Per-pixel backward walk through this batch.
+        int batch_size = min(int(BLOCK_SIZE), toDo);
+        for (int j = 0; j < batch_size; j++) {
+            // Only active pixels compute gradients.
+            if (!pix_active)
+                continue;
+
+            vec4 con_o = s_conic_o[j];
+            vec2 xy    = s_xy[j];
+            vec2 d     = xy - vec2(float(pixel_x), float(pixel_y));
+
+            // Recompute Gaussian weight (same formula as forward rasterize.comp).
+            float power = -0.5 * (con_o.x * d.x * d.x + con_o.z * d.y * d.y)
+                          - con_o.y * d.x * d.y;
+            if (power > 0.0)
+                continue;
+
+            float G         = exp(power);
+            float raw_alpha = con_o.w * G;
+            float alpha     = min(0.99, raw_alpha);
+            if (alpha < ALPHA_THRESHOLD)
+                continue;
+
+            // Recover transmittance T_i (before this Gaussian) by dividing out
+            // the (1-alpha) factor. T started at T_final and we walk backward.
+            // Matches CUDA: T = T / (1.f - alpha).
+            T = T / (1.0 - alpha);
+            float dchannel_dcolor = alpha * T;
+
+            // Accumulate color gradient (dL/dcolor_ch += alpha * T * dL_dpix_ch).
+            float dL_dalpha = 0.0;
+            int global_id = s_id[j];
+
+            for (int ch = 0; ch < 3; ch++) {
+                float c = s_colors[ch * 256 + j];
+                // Update running accumulated color (behind this Gaussian).
+                // accum_rec tracks the expected color from Gaussians seen so far
+                // in this back-to-front walk.
+                accum_rec[ch] = last_alpha * last_color[ch]
+                               + (1.0 - last_alpha) * accum_rec[ch];
+                last_color[ch] = c;
+
+                float dL_dchannel = dL_dpix[ch];
+                dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+                atomicAdd(dL_dcolors[global_id * 3 + ch],
+                          dchannel_dcolor * dL_dchannel);
+            }
+
+            dL_dalpha *= T;
+            last_alpha = alpha;
+
+            // Background gradient contribution.
+            // Matches CUDA: dL_dalpha += (-T_final / (1 - alpha)) * bg_dot_dpixel.
+            float bg_dot = dot(bg_color, dL_dpix);
+            dL_dalpha += (-T_pix / (1.0 - alpha)) * bg_dot;
+
+            // Spatial and opacity gradients only when NOT saturated (alpha < 0.99).
+            // When raw_alpha >= 0.99 the min() clamp kills the gradient path:
+            // d_power and d_opacity_2d are both zero (matches CPU backward lines
+            // rasterizer_backward_cpu.cpp:115-121).
+            if (raw_alpha < 0.99) {
+                // Gradient w.r.t. the Gaussian weight G (= exp(power)).
+                float dL_dG = con_o.w * dL_dalpha;
+
+                float gdx = G * d.x;
+                float gdy = G * d.y;
+
+                // Gradient w.r.t. means2D. CPU backward formula:
+                //   d_power = dL_dalpha * opacity * G  (= G * dL_dG)
+                //   d_means2D[0] += d_power * (-con_a * dx - con_b * dy)
+                //                 = G * dL_dG * (-con_a * dx - con_b * dy)
+                //                 = dL_dG * (-gdx*con_a - gdy*con_b)
+                // No viewport scaling (0.5*W/H factor): our means2D is in pixel
+                // space, not normalized screen space — the CUDA factor does not apply.
+                atomicAdd(dL_dmeans2D[global_id * 2 + 0],
+                          dL_dG * (-gdx * con_o.x - gdy * con_o.y));
+                atomicAdd(dL_dmeans2D[global_id * 2 + 1],
+                          dL_dG * (-gdy * con_o.z - gdx * con_o.y));
+
+                // Gradient w.r.t. conics. CPU backward formula:
+                //   d_power = G * dL_dG
+                //   d_conics[0] += d_power * (-0.5 * dx * dx) = dL_dG * (-0.5*gdx*dx)
+                //   d_conics[1] += d_power * (-dx * dy)       = dL_dG * (-gdx*dy)
+                //   d_conics[2] += d_power * (-0.5 * dy * dy) = dL_dG * (-0.5*gdy*dy)
+                // Note: conic[1] (off-diagonal b) uses the full -dx*dy (no 0.5 factor),
+                // matching d(power)/d(b) = -dx*dy from the power formula
+                //   power = -0.5*(a*dx^2 + c*dy^2) - b*dx*dy.
+                // The CUDA backward uses -0.5*gdx*d.y for conic.y which is off by 0.5
+                // (a quirk of their parameterization). We follow the CPU (FD-validated).
+                atomicAdd(dL_dconics[global_id * 3 + 0],
+                          dL_dG * (-0.5 * gdx * d.x));
+                atomicAdd(dL_dconics[global_id * 3 + 1],
+                          dL_dG * (-gdx * d.y));
+                atomicAdd(dL_dconics[global_id * 3 + 2],
+                          dL_dG * (-0.5 * gdy * d.y));
+
+                // Gradient w.r.t. opacity_2d. Matches CPU: G * dL_dalpha.
+                atomicAdd(dL_dopacity[global_id], G * dL_dalpha);
+            }
+        }
+    }
+}
