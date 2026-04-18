@@ -66,10 +66,12 @@ constexpr uint32_t VALUES_UNSORTED = 6;
 struct ScatterPushConstants {
     uint32_t num_gaussians;
     uint32_t num_tiles_x;
+    uint32_t num_tiles_y;
     uint32_t tile_w;
     uint32_t tile_h;
+    uint32_t _pad;  // align to 24 bytes
 };
-static_assert(sizeof(ScatterPushConstants) == 16, "ScatterPushConstants must be 16 bytes per spec §4.8.3");
+static_assert(sizeof(ScatterPushConstants) == 24, "ScatterPushConstants must be 24 bytes per spec §4.8.3");
 
 // --- radix_sort_count.comp bindings (spec §4.8.4) ---
 namespace radix_count_bind {
