@@ -1,4 +1,4 @@
-// SP-3 T23 / SP-4 T3: PreprocessBackwardPass — wraps preprocess_backward.comp.
+// SP-3 T23 / SP-4 T3/T4: PreprocessBackwardPass — wraps preprocess_backward.comp.
 //
 // Bindings (mirroring preprocess_backward_bind::):
 //   0..9  read-only SSBOs: positions, radii, cov3D, d_conics, d_opacity,
@@ -7,6 +7,7 @@
 //   14    read-only SSBO:   opacities (activated sigmoid values)
 //   15    write-only SSBO:  d_raw_opacities
 //   16    uniform buffer:   PreprocessBackwardUBO (192 bytes)
+//   17    read-only SSBO:   raw_rotations (unnormalized quaternions)
 //
 // Dispatch: one 256-thread workgroup per Gaussian block.
 // Grid = ceil(N/256) × 1 × 1.
@@ -29,9 +30,9 @@ PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(preprocess_backward_spv),
         static_cast<std::size_t>(preprocess_backward_spv_len));
 
-    // --- 2. Descriptor layout: 16 SSBOs (bindings 0..15) + 1 UBO (binding 16) ---
-    // 17 bindings total; binding 16 is UNIFORM_BUFFER.
-    std::vector<VkDescriptorType> binding_types(17,
+    // --- 2. Descriptor layout: 17 SSBOs (bindings 0..15, 17) + 1 UBO (binding 16) ---
+    // 18 bindings total; binding 16 is UNIFORM_BUFFER, binding 17 is STORAGE_BUFFER.
+    std::vector<VkDescriptorType> binding_types(18,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[preprocess_backward_bind::PREPROCESS_BACKWARD_UBO] =
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -83,6 +84,8 @@ void PreprocessBackwardPass::bind_buffers(const Buffers& b, VkBuffer ubo) {
                            preprocess_backward_bind::OPACITIES,       b.opacities);
     pipeline_->update_ssbo(descriptor_set_,
                            preprocess_backward_bind::D_RAW_OPACITIES, b.d_raw_opacities);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::RAW_ROTATIONS,   b.raw_rotations);
 
     // UBO binding 16 (PreprocessBackwardUBO, 192 bytes).
     pipeline_->update_ubo(descriptor_set_,

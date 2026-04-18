@@ -46,7 +46,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
                                            const RenderConfig& cfg,
                                            const ForwardCache& cache,
                                            const RasterGradOutput& rgrad,
-                                           const RawGaussianParams& /*raw*/,
+                                           const RawGaussianParams& raw,
                                            GradientOutput& grads,
                                            FrameAllocator& alloc) {
     // --- Guard: eval_3D path not implemented --------------------------------
@@ -106,6 +106,9 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     auto opa_in_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto d_raw_opa_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+    const VkDeviceSize bytes_raw_rot = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    auto raw_rot_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_raw_rot, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
     auto ubo_buf    = std::make_unique<VulkanBuffer>(ctx_,
                           static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -122,6 +125,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     drgb_buf->upload(rgrad.d_rgb,                    static_cast<std::size_t>(bytes_d_rgb));
     dm2d_buf->upload(rgrad.d_means2D,               static_cast<std::size_t>(bytes_d_m2d));
     opa_in_buf->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
+    raw_rot_buf->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
 
     // Zero-fill gradient output buffers.
     {
@@ -179,6 +183,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     pb.d_rotations     = drot_buf   ->handle();
     pb.opacities       = opa_in_buf ->handle();
     pb.d_raw_opacities = d_raw_opa_buf->handle();
+    pb.raw_rotations   = raw_rot_buf->handle();
 
     pass_->bind_buffers(pb, ubo_buf->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));

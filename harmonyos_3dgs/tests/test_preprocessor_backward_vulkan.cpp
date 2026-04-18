@@ -350,3 +350,124 @@ TEST(PreprocessorBackwardVulkan, CulledGaussianZeroGrad) {
     }
     EXPECT_TRUE(sh0_nonzero) << "Active Gaussian 0 d_sh should be nonzero";
 }
+
+// ============================================================================
+// Test: UnnormalizedQuaternionJacobian
+//
+// Verifies the quaternion normalization Jacobian uses |q_raw| (not 1.0).
+// Uses raw_rotations = {2.0, 0.0, 0.0, 0.0} so |q_raw| = 2.0, inv_len = 0.5.
+// The old shader assumed inv_len = 1.0, which would give wrong gradients.
+// Both CPU and Vulkan must agree on d_raw_rotations within 1e-4.
+// ============================================================================
+TEST(PreprocessorBackwardVulkan, UnnormalizedQuaternionJacobian) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    const int N          = 1;
+    const int sh_degree  = 0;
+    const int max_coeffs = 1;
+
+    // Raw quaternion is deliberately unnormalized: |q_raw| = 2.0
+    float raw_pos[3]    = {0.0f, 0.0f, 5.0f};
+    float raw_scales[3] = {0.5f, 0.3f, 0.1f};
+    float raw_rot[4]    = {2.0f, 0.0f, 0.0f, 0.0f};  // |q_raw| = 2.0, NOT unit length
+    float raw_sh[3]     = {1.0f, 0.5f, 0.8f};
+    float raw_opacity[1]= {2.0f};  // sigmoid(2) ~ 0.88
+
+    Camera cam;
+    setup_simple_camera_vk(cam);
+
+    RenderConfig cfg;
+    cfg.sh_degree      = sh_degree;
+    cfg.tile_w         = 16;
+    cfg.tile_h         = 16;
+    cfg.bg_color[0]    = cfg.bg_color[1] = cfg.bg_color[2] = 0.0f;
+    cfg.eval_3D        = false;
+    cfg.antialiasing   = false;
+    cfg.scale_modifier = 1.0f;
+    cfg.training       = true;
+
+    const int npix = cam.width * cam.height;
+    std::vector<float> gt(npix * 3, 0.0f);
+
+    FrameAllocator alloc(16 * 1024 * 1024);
+
+    // raw holds the UNNORMALIZED quaternion (used by CPU backward for |q_raw|)
+    RawGaussianParams raw;
+    raw.count        = N;
+    raw.sh_degree    = sh_degree;
+    raw.max_coeffs   = max_coeffs;
+    raw.raw_positions  = raw_pos;
+    raw.raw_scales     = raw_scales;
+    raw.raw_rotations  = raw_rot;
+    raw.raw_sh_coeffs  = raw_sh;
+    raw.raw_opacities  = raw_opacity;
+
+    // g.rotations must be the NORMALIZED quaternion (activate() normalizes raw_rot)
+    GaussianData g;
+    g.count      = N;
+    g.sh_degree  = sh_degree;
+    g.max_coeffs = max_coeffs;
+    g.positions  = alloc.allocate_array<float>(N * 3);
+    g.scales     = alloc.allocate_array<float>(N * 3);
+    g.rotations  = alloc.allocate_array<float>(N * 4);
+    g.sh_coeffs  = alloc.allocate_array<float>(N * max_coeffs * 3);
+    g.opacities  = alloc.allocate_array<float>(N);
+    g.filter_3D  = nullptr;
+    raw.activate(g);  // normalizes raw_rot -> g.rotations = {1,0,0,0}
+
+    ForwardCache cache{};
+    PreprocessorCPU preprocessor;
+    PreprocessOutput pre = preprocessor.process(g, cam, cfg, alloc, &cache);
+
+    ASSERT_GT(pre.radii[0], 0) << "Gaussian must be visible for gradient test";
+
+    cache.pre = &pre;
+
+    TileBinnerCPU binner;
+    BinningOutput bin = binner.bin(pre, N, cam, cfg, alloc);
+    cache.bin = &bin;
+
+    SorterCPU sorter;
+    sorter.sort(bin, alloc);
+
+    float* out_img = alloc.allocate_array<float>(npix * 3);
+    std::memset(out_img, 0, npix * 3 * sizeof(float));
+    RasterizerCPU rast;
+    rast.rasterize(pre, bin, cam, cfg, out_img, nullptr, &cache, &alloc);
+
+    float* d_image = alloc.allocate_array<float>(npix * 3);
+    float inv_n = 1.0f / (float)(npix * 3);
+    for (int px = 0; px < npix * 3; px++) {
+        float diff = out_img[px] - gt[px];
+        d_image[px] = 2.0f * diff * inv_n;
+    }
+
+    RasterGradOutput rgrad;
+    rgrad.allocate_and_zero(alloc, N);
+    RasterizerBackwardCPU rast_bwd;
+    rast_bwd.backward(pre, bin, cam, cfg, cache, d_image, rgrad);
+
+    // CPU backward: uses raw.raw_rotations for |q_raw| = 2.0, inv_len = 0.5
+    GradientOutput grads_cpu;
+    grads_cpu.allocate_and_zero(alloc, N, max_coeffs);
+    PreprocessorBackwardCPU preproc_bwd;
+    preproc_bwd.backward(g, cam, cfg, cache, rgrad, raw, grads_cpu);
+
+    // Vulkan backward: must now use raw_rotations binding (binding 17) for |q_raw|
+    GradientOutput grads_vk;
+    PreprocessorBackwardVulkan vk_bwd(ctx);
+    vk_bwd.backward(g, N, cam, cfg, cache, rgrad, raw, grads_vk, alloc);
+
+    // d_raw_rotations must match: old shader (inv_len=1) would give 2x wrong answer
+    const float tol = 1e-4f;
+    for (int k = 0; k < N * 4; k++) {
+        EXPECT_NEAR(grads_vk.d_raw_rotations[k], grads_cpu.d_raw_rotations[k], tol)
+            << "d_raw_rotations[" << k << "]: vk=" << grads_vk.d_raw_rotations[k]
+            << " cpu=" << grads_cpu.d_raw_rotations[k]
+            << " (old inv_len=1 would give " << (grads_cpu.d_raw_rotations[k] * 2.0f)
+            << ")";
+    }
+}

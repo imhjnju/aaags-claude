@@ -42,6 +42,7 @@ layout(std430, set = 0, binding = 12) writeonly buffer BufDScales    { float d_s
 layout(std430, set = 0, binding = 13) writeonly buffer BufDRotations { float d_rotations[];};
 layout(std430, set = 0, binding = 14) readonly  buffer BufOpacities     { float opacities[];     };
 layout(std430, set = 0, binding = 15) writeonly buffer BufDRawOpacities { float d_raw_opacities[];};
+layout(std430, set = 0, binding = 17) readonly  buffer BufRawRotations  { float raw_rotations[]; };
 
 // ---- UBO (std140, binding 16) ----------------------------------------------
 layout(std140, set = 0, binding = 16) uniform PreprocessBwdUBO {
@@ -468,24 +469,22 @@ void main() {
     // d_normalized_quat -> d_raw_quat through quaternion normalization
     // q_norm = q_raw / |q_raw|
     // d_raw[k] = (d_norm[k] - q_norm[k] * dot(d_norm, q_norm)) / |q_raw|
-    // Note: rotations[] already hold the normalized quaternion (r, x, y, z).
-    // We treat them as q_norm here; we need |q_raw| but raw params aren't stored.
-    // For normalized quaternion: |q_norm| = 1, so we use the identity:
-    // d_raw[k] = (d_norm[k] - q_norm[k] * dot(d_norm, q_norm)) / |q_raw|
-    // Since rotations[] is already normalized, |q_raw| = length(raw_rotation).
-    // However, we don't have raw_rotation in the shader.
-    // The CPU backward (preprocessor_backward_cpu.cpp:508-518) uses raw.raw_rotations
-    // for the normalization denominator. Since we don't have raw rotations here,
-    // we approximate with the normalized quaternion (i.e. assume |q_raw| ~ 1).
-    // This is exact when q_raw is already unit-length (which is enforced at load time).
-    // For the gradient we use d_q_norm directly as d_q_raw (|q_raw|=1 approximation).
-    // This matches what CUDA backward does (normalizes then differentiates).
+    // Matches CPU: preprocessor_backward_cpu.cpp:505-519.
+    // rotations[] holds the normalized quaternion (qr, qx, qy, qz); raw_rotations[]
+    // holds the unnormalized input quaternion needed for the |q_raw| denominator.
+    float qrr = raw_rotations[base4 + 0u];
+    float qrx = raw_rotations[base4 + 1u];
+    float qry = raw_rotations[base4 + 2u];
+    float qrz = raw_rotations[base4 + 3u];
+    float q_raw_len = max(sqrt(qrr*qrr + qrx*qrx + qry*qry + qrz*qrz), 1e-12);
+    float inv_len = 1.0 / q_raw_len;
+
     float dot_dqn_qn = d_qn_r*qr + d_qn_x*qx + d_qn_y*qy + d_qn_z*qz;
 
-    d_rotations[base4 + 0u] = d_qn_r - qr * dot_dqn_qn;  // inv_len = 1.0
-    d_rotations[base4 + 1u] = d_qn_x - qx * dot_dqn_qn;
-    d_rotations[base4 + 2u] = d_qn_y - qy * dot_dqn_qn;
-    d_rotations[base4 + 3u] = d_qn_z - qz * dot_dqn_qn;
+    d_rotations[base4 + 0u] = (d_qn_r - qr * dot_dqn_qn) * inv_len;
+    d_rotations[base4 + 1u] = (d_qn_x - qx * dot_dqn_qn) * inv_len;
+    d_rotations[base4 + 2u] = (d_qn_y - qy * dot_dqn_qn) * inv_len;
+    d_rotations[base4 + 3u] = (d_qn_z - qz * dot_dqn_qn) * inv_len;
 
     // =========================================================================
     // Part C: d_rgb -> d_sh (SH backward)

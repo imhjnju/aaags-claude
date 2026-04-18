@@ -1,4 +1,4 @@
-// preprocess_backward_pass.h — SP-3 T23 / SP-4 T3: thin owner of the
+// preprocess_backward_pass.h — SP-3 T23 / SP-4 T3/T4: thin owner of the
 // preprocess_backward.comp compute pipeline.
 //
 // One workgroup = 256 Gaussians. Dispatch: ceil(N/256) × 1 × 1.
@@ -11,7 +11,8 @@
 //   14     read-only SSBO   (opacities — activated sigmoid values)
 //   15     write-only SSBO  (d_raw_opacities)
 //   16     UBO              (PreprocessBackwardUBO)
-// 17 bindings total: 16 SSBOs + 1 UBO
+//   17     read-only SSBO   (raw_rotations — unnormalized quaternions)
+// 18 bindings total: 17 SSBOs + 1 UBO
 //
 // The caller is responsible for zeroing the gradient SSBOs before calling
 // bind_buffers() / dispatch_sync().
@@ -29,7 +30,7 @@
 
 class PreprocessBackwardPass {
 public:
-    /// All VkBuffers wired to bindings 0..16. Names mirror preprocess_backward_bind::.
+    /// All VkBuffers wired to bindings 0..17. Names mirror preprocess_backward_bind::.
     struct Buffers {
         VkBuffer positions;       // RO float[N*3]
         VkBuffer radii;           // RO int[N]
@@ -47,6 +48,7 @@ public:
         VkBuffer d_rotations;     // RW float[N*4]  zero-filled by caller
         VkBuffer opacities;       // RO float[N]    activated sigmoid values
         VkBuffer d_raw_opacities; // WO float[N]    d_raw_opacities output
+        VkBuffer raw_rotations;   // RO float[N*4]  unnormalized quaternions
     };
 
     explicit PreprocessBackwardPass(VulkanContext& ctx);
