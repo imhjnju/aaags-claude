@@ -192,8 +192,13 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/vk_capabilities.cpp
             src/vulkan/vk_buffer.cpp
             src/vulkan/vk_shader.cpp
-            src/vulkan/vk_pipeline.cpp)
+            src/vulkan/vk_pipeline.cpp
+            src/vulkan/preprocess_pass.cpp)
+        add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
+        # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
+        # produced into ${_vk_shader_dir}.
+        target_include_directories(gs3d_vk_core PRIVATE ${_vk_shader_dir})
         target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan)
 
         add_executable(gs3d_vulkan_hello src/vulkan/hello_vulkan_main.cpp)
