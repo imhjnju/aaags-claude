@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 VulkanComputePipeline::VulkanComputePipeline(VulkanContext& ctx,
                                              const VulkanShader& shader,
@@ -9,6 +10,15 @@ VulkanComputePipeline::VulkanComputePipeline(VulkanContext& ctx,
                                              uint32_t push_constant_bytes,
                                              uint32_t max_descriptor_sets)
     : ctx_(ctx), num_ssbo_bindings_(num_ssbo_bindings) {
+    if (push_constant_bytes > ctx.capabilities().max_push_constants_size) {
+        throw std::runtime_error(
+            "VulkanComputePipeline: push_constant_bytes=" +
+            std::to_string(push_constant_bytes) +
+            " exceeds device limit=" +
+            std::to_string(ctx.capabilities().max_push_constants_size) +
+            "; use a UBO instead.");
+    }
+
     // Descriptor set layout: N storage buffers, contiguous bindings.
     std::vector<VkDescriptorSetLayoutBinding> bindings(num_ssbo_bindings);
     for (uint32_t i = 0; i < num_ssbo_bindings; ++i) {
