@@ -77,8 +77,9 @@ PreprocessPass::PreprocessPass(VulkanContext& ctx,
 }
 
 void PreprocessPass::bind_buffers(const Buffers& b) {
-    // Update the 12 SSBO bindings in-place on the pre-allocated descriptor
-    // set. Ordering mirrors preprocess_bind::.
+    // Update all 17 bindings in-place on the pre-allocated descriptor set:
+    // 16 SSBOs (bindings 0..11, 13..16) + 1 UBO (binding 12).
+    // Ordering mirrors preprocess_bind::.
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::POSITIONS,            b.positions);
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::SCALES,               b.scales);
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::ROTATIONS,            b.rotations);

@@ -291,7 +291,10 @@ enum RecBufIdx : size_t {
     kRadii,
     kTilesTouched,
     kCameraUBO,
-    kRadiusF,    // binding 13: float eigenvalue radius (scatter fix)
+    kRadiusF,        // binding 13: float eigenvalue radius (scatter fix)
+    kCov3DCache,     // binding 14: ForwardCache cov3D [N*6 floats]
+    kPViewCache,     // binding 15: ForwardCache p_view [N*3 floats]
+    kPHomWCache,     // binding 16: ForwardCache p_hom_w [N floats]
     kRecBufCount,
 };
 }  // namespace
@@ -357,6 +360,15 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
         ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     record_bufs_[kRadiusF]             =
         mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    // ForwardCache output scratch buffers (bindings 14..16).
+    // Always allocated so the descriptor set is fully bound. Layer-2 callers
+    // that use record() don't download these — that is a Layer-1 concern.
+    record_bufs_[kCov3DCache]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 6 * sizeof(float));
+    record_bufs_[kPViewCache]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    record_bufs_[kPHomWCache]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
 
     // --- 2. Upload inputs ----------------------------------------------------
     record_bufs_[kPositions]->upload(g.positions,
@@ -415,6 +427,9 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     b.tiles_touched        = record_bufs_[kTilesTouched]        ->handle();
     b.camera_ubo           = record_bufs_[kCameraUBO]           ->handle();
     b.radius_f             = record_bufs_[kRadiusF]             ->handle();
+    b.cov3D_cache          = record_bufs_[kCov3DCache]          ->handle();
+    b.p_view_cache         = record_bufs_[kPViewCache]          ->handle();
+    b.p_hom_w_cache        = record_bufs_[kPHomWCache]          ->handle();
     pass_->bind_buffers(b);
 }
 
