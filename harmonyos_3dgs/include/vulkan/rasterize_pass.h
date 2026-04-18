@@ -55,6 +55,15 @@ public:
                        uint32_t image_width, uint32_t image_height,
                        uint32_t num_tiles_x, uint32_t num_tiles_y);
 
+    /// Layer 2: record dispatch into an external command buffer.
+    /// bind_buffers() must have been called. No internal barrier — the
+    /// caller inserts a barrier BEFORE (producers → SSBO inputs) and AFTER
+    /// (consumer reading out_image / T_final / n_contrib) if needed.
+    void record(VkCommandBuffer cmd,
+                uint32_t num_gaussians,
+                uint32_t image_width, uint32_t image_height,
+                uint32_t num_tiles_x, uint32_t num_tiles_y);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<VulkanShader>          shader_;

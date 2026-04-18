@@ -216,3 +216,115 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layer-2 record-mode: prepare_record / record / download_* / getters.
+// ---------------------------------------------------------------------------
+void RasterizerVulkan::prepare_record(uint32_t N_eff, uint32_t W, uint32_t H,
+                                      uint32_t num_tiles_x,
+                                      uint32_t num_tiles_y,
+                                      const float bg_color[3],
+                                      VkBuffer values_sorted,
+                                      VkBuffer tile_ranges,
+                                      VkBuffer means2D,
+                                      VkBuffer conic_opacity_packed,
+                                      VkBuffer rgb) {
+    if (W == 0u || H == 0u)
+        throw std::runtime_error(
+            "RasterizerVulkan::prepare_record: W/H must be > 0");
+
+    // Silence unused-parameter warning — N_eff is only meaningful for the
+    // push constant at record() time. Left in the API to match the plan.
+    (void)N_eff;
+
+    // Release any previously held buffers up front.
+    r_img_.reset();
+    r_tfinal_.reset();
+    r_ncontrib_.reset();
+    r_ubo_.reset();
+
+    const uint32_t HW = H * W;
+    const VkDeviceSize bytes_img      =
+        static_cast<VkDeviceSize>(HW) * 3u * sizeof(float);
+    const VkDeviceSize bytes_tfinal   =
+        static_cast<VkDeviceSize>(HW) * sizeof(float);
+    const VkDeviceSize bytes_ncontrib =
+        static_cast<VkDeviceSize>(HW) * sizeof(uint32_t);
+
+    r_img_      = std::make_unique<VulkanBuffer>(
+        ctx_, bytes_img,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_tfinal_   = std::make_unique<VulkanBuffer>(
+        ctx_, bytes_tfinal,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_ncontrib_ = std::make_unique<VulkanBuffer>(
+        ctx_, bytes_ncontrib, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_ubo_      = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    // Upload background colour into the UBO up front. Nothing else in the UBO.
+    RasterizeUBO ubo{};
+    ubo.bg_r = bg_color[0];
+    ubo.bg_g = bg_color[1];
+    ubo.bg_b = bg_color[2];
+    r_ubo_->upload(&ubo, sizeof(ubo));
+
+    RasterizePass::Buffers rb{};
+    rb.values_sorted        = values_sorted;
+    rb.tile_ranges          = tile_ranges;
+    rb.means2D              = means2D;
+    rb.conic_opacity_packed = conic_opacity_packed;
+    rb.rgb                  = rgb;
+    rb.out_image            = r_img_     ->handle();
+    rb.transmittance        = r_tfinal_  ->handle();
+    rb.n_contrib            = r_ncontrib_->handle();
+    rb.raster_ubo           = r_ubo_     ->handle();
+    pass_->bind_buffers(rb);
+
+    r_W_   = W;
+    r_H_   = H;
+    r_ntx_ = num_tiles_x;
+    r_nty_ = num_tiles_y;
+}
+
+void RasterizerVulkan::record(VkCommandBuffer cmd,
+                              uint32_t N_eff, uint32_t W, uint32_t H,
+                              uint32_t num_tiles_x, uint32_t num_tiles_y) {
+    if (!r_img_)
+        throw std::runtime_error(
+            "RasterizerVulkan::record called before prepare_record()");
+    pass_->record(cmd, N_eff, W, H, num_tiles_x, num_tiles_y);
+}
+
+void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) {
+    if (!r_img_)
+        throw std::runtime_error(
+            "RasterizerVulkan::download_image called before prepare_record()");
+    const std::size_t bytes =
+        static_cast<std::size_t>(W) * H * 3u * sizeof(float);
+    r_img_->download(dst, bytes);
+}
+
+void RasterizerVulkan::download_cache(float* T_final, int* n_contrib,
+                                      uint32_t HW) {
+    if (!r_img_)
+        throw std::runtime_error(
+            "RasterizerVulkan::download_cache called before prepare_record()");
+    if (T_final) {
+        r_tfinal_->download(T_final,
+            static_cast<std::size_t>(HW) * sizeof(float));
+    }
+    if (n_contrib) {
+        r_ncontrib_->download(n_contrib,
+            static_cast<std::size_t>(HW) * sizeof(uint32_t));
+    }
+}
+
+VkBuffer RasterizerVulkan::out_image_buf() const {
+    return r_img_ ? r_img_->handle() : VK_NULL_HANDLE;
+}
+VkBuffer RasterizerVulkan::transmittance_buf() const {
+    return r_tfinal_ ? r_tfinal_->handle() : VK_NULL_HANDLE;
+}
+VkBuffer RasterizerVulkan::n_contrib_buf() const {
+    return r_ncontrib_ ? r_ncontrib_->handle() : VK_NULL_HANDLE;
+}

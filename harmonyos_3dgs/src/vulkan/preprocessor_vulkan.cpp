@@ -223,25 +223,196 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     return out;
 }
 
-// Layer-2 external-cmd-buffer path: deferred to T19 when the full
-// preprocess -> sort -> rasterize chain is wired through record().
-void PreprocessorVulkan::record(VkCommandBuffer /*cmd*/,
-                                uint32_t /*num_gaussians*/,
-                                uint32_t /*sh_degree*/,
-                                uint32_t /*sh_coeffs_per_g*/,
-                                uint32_t /*num_tiles_x*/,
-                                uint32_t /*num_tiles_y*/,
-                                float    /*scale_modifier*/) {
-    throw std::runtime_error("PreprocessorVulkan::record: deferred to T19");
+// ---------------------------------------------------------------------------
+// Layer-2 record path: prepare_record() + record() + buffer getters.
+//
+// Shape mirrors the first 4 steps of process(): alloc + upload + CameraUBO +
+// bind. The resulting GPU buffers stay owned by `record_bufs_` until the next
+// prepare_record() or destruction, so downstream adapters (TileBinnerVulkan,
+// SorterVulkan, RasterizerVulkan) can read the handles via the getters.
+// ---------------------------------------------------------------------------
+namespace {
+// Fixed indices into PreprocessorVulkan::record_bufs_. Matches preprocess_bind::
+// for readability — but CAMERA_UBO (binding 12) sits at index 12 in the vector,
+// all other bindings are SSBOs and their index == binding.
+enum RecBufIdx : size_t {
+    kPositions = 0,
+    kScales,
+    kRotations,
+    kOpacities,
+    kSH,
+    kFilter3D,
+    kMeans2D,
+    kDepths,
+    kConicOpacityPacked,
+    kRGB,
+    kRadii,
+    kTilesTouched,
+    kCameraUBO,
+    kRecBufCount,
+};
+}  // namespace
+
+void PreprocessorVulkan::prepare_record(const GaussianData& g,
+                                        const Camera& cam,
+                                        const RenderConfig& cfg) {
+    // --- SP-2 hard errors (spec §4.4, same set as process()) -----------------
+    if (cfg.eval_3D)
+        throw std::runtime_error(
+            "PreprocessorVulkan::prepare_record: eval_3D=true not supported in SP-2");
+    if (cfg.tile_w != 16 || cfg.tile_h != 16)
+        throw std::runtime_error(
+            "PreprocessorVulkan::prepare_record: only 16x16 tiles supported");
+    if (cfg.antialiasing)
+        throw std::runtime_error(
+            "PreprocessorVulkan::prepare_record: antialiasing flag not supported");
+
+    const int N = g.count;
+    const int M = g.max_coeffs;
+    if (N <= 0)
+        throw std::runtime_error(
+            "PreprocessorVulkan::prepare_record: count must be > 0");
+
+    // Release any previously held buffers up front so memory usage doesn't
+    // double-balloon while we allocate the new set.
+    record_bufs_.clear();
+    record_bufs_.resize(kRecBufCount);
+
+    auto mk_ssbo = [&](VkDeviceSize bytes) {
+        return std::make_unique<VulkanBuffer>(
+            ctx_, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    };
+
+    // --- 1. Allocate host-visible buffers ------------------------------------
+    // Inputs
+    record_bufs_[kPositions] =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    record_bufs_[kScales]    =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    record_bufs_[kRotations] =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 4 * sizeof(float));
+    record_bufs_[kOpacities] =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    record_bufs_[kSH]        =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * M * 3 * sizeof(float));
+    record_bufs_[kFilter3D]  =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    // Outputs
+    record_bufs_[kMeans2D]             =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 2 * sizeof(float));
+    record_bufs_[kDepths]              =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    record_bufs_[kConicOpacityPacked]  =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 4 * sizeof(float));
+    record_bufs_[kRGB]                 =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    record_bufs_[kRadii]               =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(int32_t));
+    record_bufs_[kTilesTouched]        =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(int32_t));
+    record_bufs_[kCameraUBO]           = std::make_unique<VulkanBuffer>(
+        ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    // --- 2. Upload inputs ----------------------------------------------------
+    record_bufs_[kPositions]->upload(g.positions,
+        static_cast<std::size_t>(N) * 3 * sizeof(float));
+    record_bufs_[kScales]->upload(g.scales,
+        static_cast<std::size_t>(N) * 3 * sizeof(float));
+    record_bufs_[kRotations]->upload(g.rotations,
+        static_cast<std::size_t>(N) * 4 * sizeof(float));
+    record_bufs_[kOpacities]->upload(g.opacities,
+        static_cast<std::size_t>(N) * sizeof(float));
+    record_bufs_[kSH]->upload(g.sh_coeffs,
+        static_cast<std::size_t>(N) * M * 3 * sizeof(float));
+
+    if (g.filter_3D != nullptr) {
+        record_bufs_[kFilter3D]->upload(g.filter_3D,
+            static_cast<std::size_t>(N) * sizeof(float));
+    } else {
+        std::vector<float> zeros(static_cast<std::size_t>(N), 0.0f);
+        record_bufs_[kFilter3D]->upload(zeros.data(),
+            static_cast<std::size_t>(N) * sizeof(float));
+    }
+
+    // --- 3. Build CameraUBO (same as process()) ------------------------------
+    CameraUBO c{};
+    std::memcpy(c.viewmatrix, cam.view_matrix,     16 * sizeof(float));
+    std::memcpy(c.projmatrix, cam.viewproj_matrix, 16 * sizeof(float));
+    float inv_vp[16];
+    if (!invertMatrix4x4(cam.viewproj_matrix, inv_vp)) {
+        std::memset(inv_vp, 0, sizeof(inv_vp));
+        inv_vp[0] = inv_vp[5] = inv_vp[10] = inv_vp[15] = 1.0f;
+    }
+    std::memcpy(c.inv_viewprojmatrix, inv_vp, 16 * sizeof(float));
+    c.campos_pad[0] = cam.cam_pos[0];
+    c.campos_pad[1] = cam.cam_pos[1];
+    c.campos_pad[2] = cam.cam_pos[2];
+    c.campos_pad[3] = 0.0f;
+    c.fov_size[0] = cam.tan_fovx;
+    c.fov_size[1] = cam.tan_fovy;
+    c.fov_size[2] = static_cast<float>(cam.width);
+    c.fov_size[3] = static_cast<float>(cam.height);
+    record_bufs_[kCameraUBO]->upload(&c, sizeof(CameraUBO));
+
+    // --- 4. Bind to PreprocessPass ------------------------------------------
+    PreprocessPass::Buffers b{};
+    b.positions            = record_bufs_[kPositions]           ->handle();
+    b.scales               = record_bufs_[kScales]              ->handle();
+    b.rotations            = record_bufs_[kRotations]           ->handle();
+    b.opacities            = record_bufs_[kOpacities]           ->handle();
+    b.sh                   = record_bufs_[kSH]                  ->handle();
+    b.filter_3D            = record_bufs_[kFilter3D]            ->handle();
+    b.means2D              = record_bufs_[kMeans2D]             ->handle();
+    b.depths               = record_bufs_[kDepths]              ->handle();
+    b.conic_opacity_packed = record_bufs_[kConicOpacityPacked]  ->handle();
+    b.rgb                  = record_bufs_[kRGB]                 ->handle();
+    b.radii                = record_bufs_[kRadii]               ->handle();
+    b.tiles_touched        = record_bufs_[kTilesTouched]        ->handle();
+    b.camera_ubo           = record_bufs_[kCameraUBO]           ->handle();
+    pass_->bind_buffers(b);
 }
 
-// Buffer-handle getters are exposed for the chained forward pipeline (T19),
-// which reads them to wire preprocess outputs straight into sort/scatter/
-// rasterize inputs without a CPU round-trip. In the Layer-1 sync path the
-// buffers are scoped to a single process() call, so these stubs return null.
-VkBuffer PreprocessorVulkan::means2D_buffer()              const { return VK_NULL_HANDLE; }
-VkBuffer PreprocessorVulkan::depths_buffer()               const { return VK_NULL_HANDLE; }
-VkBuffer PreprocessorVulkan::conic_opacity_packed_buffer() const { return VK_NULL_HANDLE; }
-VkBuffer PreprocessorVulkan::rgb_buffer()                  const { return VK_NULL_HANDLE; }
-VkBuffer PreprocessorVulkan::radii_buffer()                const { return VK_NULL_HANDLE; }
-VkBuffer PreprocessorVulkan::tiles_touched_buffer()        const { return VK_NULL_HANDLE; }
+void PreprocessorVulkan::record(VkCommandBuffer cmd,
+                                uint32_t num_gaussians, uint32_t sh_degree,
+                                uint32_t sh_coeffs_per_g, uint32_t num_tiles_x,
+                                uint32_t num_tiles_y, float scale_modifier) {
+    if (record_bufs_.empty())
+        throw std::runtime_error(
+            "PreprocessorVulkan::record called before prepare_record()");
+
+    PreprocessPushConstants pc{};
+    pc.num_gaussians   = num_gaussians;
+    pc.sh_degree       = sh_degree;
+    pc.sh_coeffs_per_g = sh_coeffs_per_g;
+    pc.num_tiles_x     = num_tiles_x;
+    pc.num_tiles_y     = num_tiles_y;
+    pc.scale_modifier  = scale_modifier;
+    pass_->record(cmd, pc);
+}
+
+// Handle getters: return VK_NULL_HANDLE if prepare_record() hasn't run yet,
+// otherwise the persistent VkBuffer handle from the last prepare_record().
+VkBuffer PreprocessorVulkan::means2D_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kMeans2D]->handle();
+}
+VkBuffer PreprocessorVulkan::depths_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kDepths]->handle();
+}
+VkBuffer PreprocessorVulkan::conic_opacity_packed_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kConicOpacityPacked]->handle();
+}
+VkBuffer PreprocessorVulkan::rgb_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kRGB]->handle();
+}
+VkBuffer PreprocessorVulkan::radii_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kRadii]->handle();
+}
+VkBuffer PreprocessorVulkan::tiles_touched_buffer() const {
+    return record_bufs_.empty() ? VK_NULL_HANDLE
+                                : record_bufs_[kTilesTouched]->handle();
+}

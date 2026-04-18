@@ -144,3 +144,89 @@ void SorterVulkan::sort(BinningOutput& bin, FrameAllocator& alloc) {
     vals_a->download(bin.values_sorted, static_cast<std::size_t>(bytes_vals));
     ranges_b->download(bin.tile_ranges, static_cast<std::size_t>(bytes_ranges));
 }
+
+// ---------------------------------------------------------------------------
+// Layer-2 record-mode.
+// ---------------------------------------------------------------------------
+void SorterVulkan::prepare_record(uint32_t R, uint32_t num_tiles,
+                                  VkBuffer keys_unsorted,
+                                  VkBuffer values_unsorted) {
+    if (R == 0u)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record: R must be > 0");
+    if (num_tiles == 0u)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record: num_tiles must be > 0");
+    if (keys_unsorted == VK_NULL_HANDLE || values_unsorted == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record: keys/values_unsorted is null");
+
+    // Release old ones.
+    r_keys_b_.reset();
+    r_vals_b_.reset();
+    r_hist_cnt_.reset();
+    r_hist_scn_.reset();
+    r_wg_sums_.reset();
+    r_ranges_.reset();
+
+    const VkDeviceSize bytes_keys   = static_cast<VkDeviceSize>(R) * sizeof(uint64_t);
+    const VkDeviceSize bytes_vals   = static_cast<VkDeviceSize>(R) * sizeof(uint32_t);
+    const VkDeviceSize bytes_hist   = 16u * sizeof(uint32_t);
+    const VkDeviceSize bytes_ranges =
+        static_cast<VkDeviceSize>(num_tiles) * 2u * sizeof(uint32_t);
+
+    r_keys_b_   = std::make_unique<VulkanBuffer>(ctx_, bytes_keys,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_vals_b_   = std::make_unique<VulkanBuffer>(ctx_, bytes_vals,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_hist_cnt_ = std::make_unique<VulkanBuffer>(ctx_, bytes_hist,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_hist_scn_ = std::make_unique<VulkanBuffer>(ctx_, bytes_hist,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // workgroup sums for the 16-element inner scan — 1 uint suffices; size 16
+    // to match the other histogram buffers (over-allocation is negligible).
+    r_wg_sums_  = std::make_unique<VulkanBuffer>(ctx_, bytes_hist,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_ranges_   = std::make_unique<VulkanBuffer>(ctx_, bytes_ranges,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // tile_range.comp precondition: tile_ranges must be zero on dispatch so
+    // empty tiles read back as [0, 0). Uploading zeros satisfies this now —
+    // the command buffer will execute after prepare_record() returns, so the
+    // GPU-visible contents at dispatch time are our zeros.
+    std::vector<uint32_t> zeros(static_cast<size_t>(num_tiles) * 2u, 0u);
+    r_ranges_->upload(zeros.data(), zeros.size() * sizeof(uint32_t));
+
+    // Stash the external "A" handles. No ownership transfer — caller keeps
+    // the binner's buffers alive across record + submit.
+    r_keys_a_ = keys_unsorted;
+    r_vals_a_ = values_unsorted;
+}
+
+void SorterVulkan::record(VkCommandBuffer cmd,
+                          uint32_t R, uint32_t num_tiles) {
+    if (!r_keys_b_)
+        throw std::runtime_error(
+            "SorterVulkan::record called before prepare_record()");
+
+    // 16-pass LSD radix sort — sorted data lands back in the A side.
+    sort_pass_->sort_record(cmd,
+        r_keys_a_,           r_vals_a_,
+        r_keys_b_->handle(), r_vals_b_->handle(),
+        r_hist_cnt_->handle(), r_hist_scn_->handle(),
+        r_wg_sums_->handle(),
+        R);
+
+    // Barrier: tile_range.comp reads keys_sorted (which is r_keys_a_).
+    insert_compute_barrier(cmd);
+
+    // Tile-range sweep over sorted keys (A side).
+    range_pass_->bind_buffers(r_keys_a_, r_ranges_->handle());
+    range_pass_->dispatch_record(cmd, R, num_tiles);
+}
+
+VkBuffer SorterVulkan::keys_sorted_buf()   const { return r_keys_a_; }
+VkBuffer SorterVulkan::values_sorted_buf() const { return r_vals_a_; }
+VkBuffer SorterVulkan::tile_ranges_buf()   const {
+    return r_ranges_ ? r_ranges_->handle() : VK_NULL_HANDLE;
+}

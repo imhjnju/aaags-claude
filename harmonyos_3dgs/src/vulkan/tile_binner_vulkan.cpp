@@ -188,3 +188,90 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
 
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// Layer-2 record-mode: prepare_record() + record() + buffer getters.
+// ---------------------------------------------------------------------------
+void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
+                                      uint32_t num_tiles_x,
+                                      uint32_t num_tiles_y,
+                                      VkBuffer tiles_touched,
+                                      VkBuffer means2D,
+                                      VkBuffer depths,
+                                      VkBuffer radii) {
+    if (N == 0u)
+        throw std::runtime_error(
+            "TileBinnerVulkan::prepare_record: N must be > 0");
+    if (R_max == 0u)
+        throw std::runtime_error(
+            "TileBinnerVulkan::prepare_record: R_max must be > 0");
+
+    // Release old buffers first.
+    r_po_buf_.reset();
+    r_ws_buf_.reset();
+    r_keys_buf_.reset();
+    r_vals_buf_.reset();
+
+    // point_offsets[N]: exclusive scan output.
+    r_po_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // workgroup_sums: one uint per phase-0 workgroup, min 1.
+    const uint32_t num_wgs = (N + 255u) / 256u;
+    const uint32_t wg_sums_count = num_wgs == 0u ? 1u : num_wgs;
+    r_ws_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(wg_sums_count) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // keys_unsorted[R_max] + values_unsorted[R_max].
+    r_keys_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint64_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_vals_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // Bind scan (input=tiles_touched, output=point_offsets, wg_sums).
+    scan_pass_->bind_buffers(tiles_touched,
+                             r_po_buf_->handle(),
+                             r_ws_buf_->handle());
+
+    // Bind scatter (inputs + outputs).
+    ScatterPass::Buffers sb{};
+    sb.means2D         = means2D;
+    sb.depths          = depths;
+    sb.radii           = radii;
+    sb.point_offsets   = r_po_buf_->handle();
+    sb.tiles_touched   = tiles_touched;
+    sb.keys_unsorted   = r_keys_buf_->handle();
+    sb.values_unsorted = r_vals_buf_->handle();
+    scatter_pass_->bind_buffers(sb);
+
+    // num_tiles_x/_y are used only at record() time (push constant) — nothing
+    // else to stash here.
+    (void)num_tiles_x;
+    (void)num_tiles_y;
+}
+
+void TileBinnerVulkan::record(VkCommandBuffer cmd,
+                              uint32_t N, uint32_t num_tiles_x,
+                              uint32_t num_tiles_y) {
+    if (!r_po_buf_)
+        throw std::runtime_error(
+            "TileBinnerVulkan::record called before prepare_record()");
+
+    // Scan writes point_offsets; scatter reads point_offsets (+tiles_touched,
+    // which is unmodified). Barrier between the two is a RAW compute→compute
+    // dependency.
+    scan_pass_->record(cmd, N);
+    insert_compute_barrier(cmd);
+    scatter_pass_->record(cmd, N, num_tiles_x, num_tiles_y);
+}
+
+VkBuffer TileBinnerVulkan::keys_unsorted_buf() const {
+    return r_keys_buf_ ? r_keys_buf_->handle() : VK_NULL_HANDLE;
+}
+VkBuffer TileBinnerVulkan::values_unsorted_buf() const {
+    return r_vals_buf_ ? r_vals_buf_->handle() : VK_NULL_HANDLE;
+}

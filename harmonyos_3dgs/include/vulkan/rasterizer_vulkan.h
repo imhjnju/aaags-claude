@@ -1,33 +1,32 @@
-// rasterizer_vulkan.h -- SP-2 T17: Rasterizer adapter driving rasterize.comp.
+// rasterizer_vulkan.h -- SP-2 T17/T19: Rasterizer adapter driving rasterize.comp.
 //
-// Implements the Rasterizer interface by (1) repacking per-Gaussian inputs
-// into the shader's expected layouts, (2) uploading them plus the sorted
-// binning pair stream + tile ranges to host-visible SSBOs, (3) dispatching
-// rasterize.comp via RasterizePass, and (4) downloading the CHW output image
-// (plus optional T_final / n_contrib cache entries).
+// Supports two usage patterns:
 //
-// Input from PreprocessOutput:
-//   means2D               — interleaved [x,y] per Gaussian
-//   conics + opacities_2d — repacked inline into conic_opacity_packed[N*4]
-//   rgb                   — [N*3]
-// Input from BinningOutput:
-//   values_sorted[R], tile_ranges[num_tiles*2]
-// Input from Camera:
-//   width, height
-// Input from RenderConfig:
-//   bg_color[3], tile_w, tile_h
-// Output to `output_image`:   float[3*H*W] (CHW layout — written by shader)
-// Output to `cache` (opt):    T_final[H*W], n_contrib[H*W]
+//   1) Layer-1 rasterize() — sync, self-contained. Uploads CPU-side inputs
+//      (PreprocessOutput/BinningOutput) to fresh SSBOs, dispatches, downloads.
+//   2) Layer-2 prepare_record() + record() — chained forward pipeline (T19).
+//      Inputs (values_sorted/tile_ranges/means2D/conic_opacity_packed/rgb) are
+//      EXTERNAL handles from Sorter+Preprocessor; the adapter allocates the
+//      output image + T_final + n_contrib + RasterizeUBO buffers, binds, and
+//      records the dispatch. Outputs are downloaded via download_image()
+//      (+ optional download_cache()) after the caller submits and waits.
 //
-// Phase 1 limitations: fresh VulkanBuffers per frame, no persistent pool,
-// empty-scene fast path writes background into output_image on the CPU.
+// Input buffer sources:
+//   values_sorted        : SorterVulkan
+//   tile_ranges          : SorterVulkan
+//   means2D              : PreprocessorVulkan
+//   conic_opacity_packed : PreprocessorVulkan   (already packed N*4)
+//   rgb                  : PreprocessorVulkan
 #pragma once
 
 #include "rasterizer.h"
 #include "vulkan/vk_context.h"
 #include "vulkan/rasterize_pass.h"
 
+#include <cstdint>
 #include <memory>
+
+class VulkanBuffer;
 
 class RasterizerVulkan : public Rasterizer {
 public:
@@ -46,7 +45,53 @@ public:
                    ForwardCache* cache = nullptr,
                    FrameAllocator* allocator = nullptr) override;
 
+    // -- Layer-2 record-mode API -------------------------------------------
+    //
+    // Allocate output image + T_final + n_contrib + RasterizeUBO. Upload the
+    // UBO payload. Bind all external inputs + internal outputs to the pass.
+    // N_eff is the number of Gaussians the caller uploaded into means2D /
+    // conic_opacity_packed / rgb — used only for push-constant bookkeeping
+    // (the shader reads per-Gaussian data by values_sorted index, not by
+    // linear sweep).
+    //
+    // bg_color is a 3-float array — channel layout matches RasterizeUBO.
+    // Buffers persist until the next prepare_record() call or destruction.
+    void prepare_record(uint32_t N_eff, uint32_t W, uint32_t H,
+                        uint32_t num_tiles_x, uint32_t num_tiles_y,
+                        const float bg_color[3],
+                        VkBuffer values_sorted,
+                        VkBuffer tile_ranges,
+                        VkBuffer means2D,
+                        VkBuffer conic_opacity_packed,
+                        VkBuffer rgb);
+
+    // Record the rasterize dispatch into cmd. prepare_record() must have
+    // been called. No internal barrier — caller submits after this returns.
+    void record(VkCommandBuffer cmd,
+                uint32_t N_eff, uint32_t W, uint32_t H,
+                uint32_t num_tiles_x, uint32_t num_tiles_y);
+
+    // Post-record download helpers. Must be called AFTER the caller has
+    // submitted + waited on the command buffer that contained record().
+    void download_image(float* dst, uint32_t W, uint32_t H);
+    void download_cache(float* T_final, int* n_contrib, uint32_t HW);
+
+    // Output handles valid after prepare_record().
+    VkBuffer out_image_buf()     const;
+    VkBuffer transmittance_buf() const;
+    VkBuffer n_contrib_buf()     const;
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RasterizePass> pass_;
+
+    // Layer-2 persistent buffers.
+    std::unique_ptr<VulkanBuffer> r_img_;       // [3*H*W]   f32 CHW
+    std::unique_ptr<VulkanBuffer> r_tfinal_;    // [H*W]     f32
+    std::unique_ptr<VulkanBuffer> r_ncontrib_;  // [H*W]     u32
+    std::unique_ptr<VulkanBuffer> r_ubo_;       // RasterizeUBO (16 bytes std140)
+    uint32_t r_W_   = 0;
+    uint32_t r_H_   = 0;
+    uint32_t r_ntx_ = 0;
+    uint32_t r_nty_ = 0;
 };

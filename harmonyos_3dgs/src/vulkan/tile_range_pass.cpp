@@ -68,3 +68,26 @@ void TileRangePass::dispatch_sync(uint32_t num_elements, uint32_t num_tiles) {
                              groups, 1u, 1u,
                              &pc, sizeof(pc));
 }
+
+void TileRangePass::dispatch_record(VkCommandBuffer cmd,
+                                    uint32_t num_elements, uint32_t num_tiles) {
+    if (descriptor_set_ == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "TileRangePass::dispatch_record called before bind_buffers()");
+    if (num_elements == 0u) return;
+    if (num_tiles == 0u)
+        throw std::runtime_error(
+            "TileRangePass: num_tiles must be > 0 when num_elements > 0");
+
+    TileRangePushConstants pc{};
+    pc.num_elements = num_elements;
+    pc.num_tiles    = num_tiles;
+    pc._pad0        = 0u;
+    pc._pad1        = 0u;
+
+    const uint32_t groups =
+        (num_elements + kTileRangeLocalSize - 1u) / kTileRangeLocalSize;
+    pipeline_->record(cmd, descriptor_set_,
+                      groups, 1u, 1u,
+                      &pc, sizeof(pc));
+}

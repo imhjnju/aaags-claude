@@ -1,14 +1,20 @@
-// tile_binner_vulkan.h -- SP-2 T10: Vulkan TileBinner adapter.
+// tile_binner_vulkan.h -- SP-2 T10/T19: Vulkan TileBinner adapter.
 //
 // Implements the TileBinner interface using PrefixScanPass + ScatterPass.
-// Phase 1 sync path: upload preprocess.tiles_touched + related arrays to
-// Vulkan SSBOs, run exclusive prefix scan into point_offsets, scatter into
-// (key, value) pairs, and download to host-visible BinningOutput fields.
+// Supports two usage patterns:
 //
-// BinningOutput fields populated here:
-//   total_pairs, keys_unsorted, values_unsorted, num_tiles
-// Left null for downstream SorterVulkan (T14):
-//   keys_sorted, values_sorted, tile_ranges
+//   1) Layer-1 bin()          — sync, self-contained. Allocates / uploads /
+//                                dispatches / downloads within one call.
+//   2) Layer-2 prepare_record() + record() — chained forward pipeline (T19).
+//      Inputs (tiles_touched / means2D / depths / radii) are EXTERNAL handles
+//      already produced by PreprocessorVulkan::record(); this adapter allocates
+//      its own point_offsets, wg_sums, keys_unsorted, values_unsorted buffers
+//      and binds both passes. record() records the scan+scatter dispatches.
+//
+// BinningOutput fields populated by bin() (Layer-1 path):
+//   total_pairs, keys_unsorted, values_unsorted, num_tiles.
+// Layer-2 path does not produce a BinningOutput — callers read the handles
+// via keys_unsorted_buf() / values_unsorted_buf().
 
 #pragma once
 
@@ -17,6 +23,8 @@
 #include "vulkan/tile_binner_passes.h"
 
 #include <memory>
+
+class VulkanBuffer;
 
 class TileBinnerVulkan : public TileBinner {
 public:
@@ -32,8 +40,45 @@ public:
                       const RenderConfig& config,
                       FrameAllocator& allocator) override;
 
+    // -- Layer-2 record-mode API -------------------------------------------
+    //
+    // Allocate internal GPU buffers for the chained forward pipeline and bind
+    // both passes (scan + scatter). External input handles come from
+    // PreprocessorVulkan's buffer getters. R_max is an upper bound on the
+    // number of (Gaussian, tile) pairs; the actual R is not known until after
+    // scan runs, but the keys_unsorted / values_unsorted buffers must be
+    // pre-allocated before we record the scatter. Callers that know R from
+    // golden data can pass R exactly; otherwise N * num_tiles_x * num_tiles_y
+    // is a safe over-estimate.
+    //
+    // Buffers persist until the next prepare_record() call or destruction.
+    void prepare_record(uint32_t N, uint32_t R_max,
+                        uint32_t num_tiles_x, uint32_t num_tiles_y,
+                        VkBuffer tiles_touched,
+                        VkBuffer means2D,
+                        VkBuffer depths,
+                        VkBuffer radii);
+
+    // Record prefix-scan + scatter into cmd. prepare_record() must have been
+    // called. Inserts an internal barrier between scan and scatter (scatter
+    // reads scan's point_offsets output).
+    void record(VkCommandBuffer cmd,
+                uint32_t N, uint32_t num_tiles_x, uint32_t num_tiles_y);
+
+    // Output handles valid after prepare_record(). Used by SorterVulkan::
+    // prepare_record() to thread the chain. Return VK_NULL_HANDLE before
+    // the first prepare_record() call.
+    VkBuffer keys_unsorted_buf()   const;
+    VkBuffer values_unsorted_buf() const;
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<PrefixScanPass> scan_pass_;
     std::unique_ptr<ScatterPass>    scatter_pass_;
+
+    // Layer-2 persistent buffers (owned by this adapter).
+    std::unique_ptr<VulkanBuffer> r_po_buf_;      // point_offsets [N]
+    std::unique_ptr<VulkanBuffer> r_ws_buf_;      // workgroup sums [ceil(N/256)]
+    std::unique_ptr<VulkanBuffer> r_keys_buf_;    // keys_unsorted [R_max] u64
+    std::unique_ptr<VulkanBuffer> r_vals_buf_;    // values_unsorted [R_max] u32
 };

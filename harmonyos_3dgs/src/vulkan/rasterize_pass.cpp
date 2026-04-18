@@ -83,3 +83,24 @@ void RasterizePass::dispatch_sync(uint32_t num_gaussians,
                              num_tiles_x, num_tiles_y, 1u,
                              &pc, sizeof(pc));
 }
+
+void RasterizePass::record(VkCommandBuffer cmd,
+                           uint32_t num_gaussians,
+                           uint32_t image_width, uint32_t image_height,
+                           uint32_t num_tiles_x, uint32_t num_tiles_y) {
+    if (descriptor_set_ == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "RasterizePass::record called before bind_buffers()");
+    if (num_tiles_x == 0u || num_tiles_y == 0u) return;
+
+    RasterizePushConstants pc{};
+    pc.num_gaussians = num_gaussians;
+    pc.image_width   = image_width;
+    pc.image_height  = image_height;
+    pc.num_tiles_x   = num_tiles_x;
+    pc.num_tiles_y   = num_tiles_y;
+
+    pipeline_->record(cmd, descriptor_set_,
+                      num_tiles_x, num_tiles_y, 1u,
+                      &pc, sizeof(pc));
+}

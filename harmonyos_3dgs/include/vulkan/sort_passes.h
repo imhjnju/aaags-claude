@@ -78,6 +78,20 @@ public:
                    VkBuffer wg_sums_buf,
                    uint32_t num_elements);
 
+    /// Layer 2: record the 16-pass LSD radix sort into an external command
+    /// buffer. Semantics match sort_sync() — on return, sorted data lives in
+    /// `keys_in_buf` / `values_in_buf` (the "A" side, 16 even swaps).
+    /// Inserts compute-to-compute barriers between count → scan → scatter
+    /// (internal dependencies of the radix algorithm). The caller is
+    /// responsible for the barrier BEFORE this call (producer → keys_in_buf)
+    /// and AFTER the last scatter (consumer reading sorted keys).
+    void sort_record(VkCommandBuffer cmd,
+                     VkBuffer keys_in_buf, VkBuffer values_in_buf,
+                     VkBuffer keys_out_buf, VkBuffer values_out_buf,
+                     VkBuffer hist_count_buf, VkBuffer hist_scan_buf,
+                     VkBuffer wg_sums_buf,
+                     uint32_t num_elements);
+
 private:
     VulkanContext& ctx_;
 
@@ -86,8 +100,17 @@ private:
     std::unique_ptr<VulkanComputePipeline> count_pipeline_;
     std::unique_ptr<VulkanComputePipeline> scatter_pipeline_;
     std::unique_ptr<PrefixScanPass>        scan_pass_;
+    // Single descriptor sets for the sync path (each pass is fully
+    // serialized by submit+wait, so reusing one DS per pipeline is safe).
     VkDescriptorSet count_ds_   = VK_NULL_HANDLE;
     VkDescriptorSet scatter_ds_ = VK_NULL_HANDLE;
+    // Per-pass descriptor sets for the record path. sort_record() records
+    // all 16 radix passes into one cmd buffer, so updating the same DS in
+    // place between dispatches is a Vulkan UB. We allocate one DS per
+    // (pipeline × pass) and update each DS exactly once in prepare, then
+    // bind + dispatch without further mutation during the record.
+    std::vector<VkDescriptorSet> count_ds_per_pass_;    // size 16
+    std::vector<VkDescriptorSet> scatter_ds_per_pass_;  // size 16
 };
 
 // ---------------------------------------------------------------------------
@@ -109,6 +132,13 @@ public:
     /// contain at least one sorted key, and relies on the pre-zero to leave
     /// empty tiles as [0, 0).
     void dispatch_sync(uint32_t num_elements, uint32_t num_tiles);
+
+    /// Layer 2: record dispatch into an external command buffer. bind_buffers()
+    /// must have been called. No internal barriers — the caller inserts a
+    /// barrier both BEFORE (producer → keys_sorted) and AFTER (consumer
+    /// reading tile_ranges).
+    void dispatch_record(VkCommandBuffer cmd,
+                         uint32_t num_elements, uint32_t num_tiles);
 
 private:
     VulkanContext& ctx_;
