@@ -192,6 +192,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(radix_sort_scatter _hdr_radix_scatter)
         gs3d_compile_glsl(tile_range _spv_tile_range)
         gs3d_embed_spirv(tile_range _hdr_tile_range)
+        gs3d_compile_glsl(rasterize _spv_rasterize)
+        gs3d_embed_spirv(rasterize _hdr_rasterize)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello}
@@ -200,7 +202,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_scatter} ${_hdr_scatter}
                     ${_spv_radix_count} ${_hdr_radix_count}
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
-                    ${_spv_tile_range} ${_hdr_tile_range})
+                    ${_spv_tile_range} ${_hdr_tile_range}
+                    ${_spv_rasterize} ${_hdr_rasterize})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp

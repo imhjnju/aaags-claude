@@ -127,3 +127,12 @@ struct RasterizePushConstants {
     uint32_t num_tiles_y;
 };
 static_assert(sizeof(RasterizePushConstants) == 20, "RasterizePushConstants must be 20 bytes per spec §4.8.7");
+
+// --- RasterizeUBO (std140, 16 bytes) — background colour for rasterize.comp ---
+struct alignas(16) RasterizeUBO {
+    float bg_r = 0.f;
+    float bg_g = 0.f;
+    float bg_b = 0.f;
+    float _pad = 0.f;
+};
+static_assert(sizeof(RasterizeUBO) == 16, "RasterizeUBO must be 16 bytes (std140)");
