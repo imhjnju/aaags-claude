@@ -206,6 +206,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_compute.cpp
                 tests/test_vk_capabilities.cpp
                 tests/test_vk_device_selection.cpp
+                tests/test_vk_pipeline_dispatch.cpp
                 tests/test_preprocessor_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
