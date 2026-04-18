@@ -177,12 +177,11 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         endfunction()
 
         gs3d_compile_glsl(add_one    _spv_add_one)
-        gs3d_compile_glsl(preprocess _spv_preprocess)
         gs3d_embed_spirv(add_one _hdr_add_one)
         gs3d_compile_glsl(hello _spv_hello)
         gs3d_embed_spirv(hello _hdr_hello)
         add_custom_target(gs3d_vulkan_shaders
-            DEPENDS ${_spv_add_one} ${_spv_preprocess} ${_hdr_add_one}
+            DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello})
 
         add_library(gs3d_vk_core STATIC
@@ -190,8 +189,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/vk_capabilities.cpp
             src/vulkan/vk_buffer.cpp
             src/vulkan/vk_shader.cpp
-            src/vulkan/vk_pipeline.cpp
-            src/vulkan/preprocessor_vk.cpp)
+            src/vulkan/vk_pipeline.cpp)
         target_include_directories(gs3d_vk_core PUBLIC include)
         target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan)
 
@@ -207,8 +205,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_capabilities.cpp
                 tests/test_vk_device_selection.cpp
                 tests/test_vk_pipeline_dispatch.cpp
-                tests/test_vk_hello.cpp
-                tests/test_preprocessor_vk.cpp)
+                tests/test_vk_hello.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
@@ -221,7 +218,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 SHADER_DIR="${_vk_shader_dir}")
             gtest_discover_tests(gs3d_vk_tests)
         endif()
-        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, preprocess)")
+        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello)")
     else()
         message(STATUS "Vulkan SKIPPED (Vulkan=${Vulkan_FOUND}, glslangValidator=${GLSLANG_VALIDATOR})")
     endif()
