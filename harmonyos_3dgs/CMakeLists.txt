@@ -200,7 +200,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/vk_shader.cpp
             src/vulkan/vk_pipeline.cpp
             src/vulkan/preprocess_pass.cpp
-            src/vulkan/preprocessor_vulkan.cpp)
+            src/vulkan/preprocessor_vulkan.cpp
+            src/vulkan/prefix_scan_pass.cpp
+            src/vulkan/scatter_pass.cpp
+            src/vulkan/tile_binner_vulkan.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
@@ -223,7 +226,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_device_selection.cpp
                 tests/test_vk_pipeline_dispatch.cpp
                 tests/test_vk_hello.cpp
-                tests/test_preprocess_pass_vk.cpp)
+                tests/test_preprocess_pass_vk.cpp
+                tests/test_prefix_scan_pass_vk.cpp
+                tests/test_scatter_pass_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
