@@ -64,6 +64,14 @@ if(BUILD_TESTS)
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
+
+    FetchContent_Declare(
+        nlohmann_json
+        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+
     enable_testing()
 
     add_executable(gs3d_tests
@@ -91,8 +99,13 @@ if(BUILD_TESTS)
         tests/test_preprocessor_backward_gpu.cpp
         tests/test_trainer_gpu.cpp
         tests/test_density_controller.cpp
+        tests/test_npy_reader.cpp
+        tests/test_compare.cpp
+        tests/test_manifest.cpp
+        tests/test_golden_roundtrip.cpp
     )
-    target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main)
+    target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
+    target_include_directories(gs3d_tests PRIVATE tests)
     target_compile_definitions(gs3d_tests PRIVATE
         TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
     include(GoogleTest)
