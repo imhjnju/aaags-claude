@@ -1,6 +1,6 @@
 // preprocess_pass.h -- Thin owner of the preprocess.comp compute pipeline
-// (spec §4.8.1). Holds the shader module, compute pipeline (with the 14
-// bindings: 13 SSBO + 1 UBO mixed binding layout), and one descriptor set. Provides two
+// (spec §4.8.1). Holds the shader module, compute pipeline (with the 17
+// bindings: 16 SSBO + 1 UBO mixed binding layout), and one descriptor set. Provides two
 // dispatch entry points:
 //   * dispatch_sync(): Layer 1 sync dispatch (used by tests/bring-up).
 //   * record():        Layer 2 external cmd buffer recording (used by the
