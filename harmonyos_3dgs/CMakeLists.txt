@@ -243,7 +243,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_scatter_pass_vk.cpp
                 tests/test_tile_binner_vulkan.cpp
                 tests/test_radix_sort_pass_vk.cpp
-                tests/test_tile_range_pass_vk.cpp)
+                tests/test_tile_range_pass_vk.cpp
+                tests/test_sorter_vulkan.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
