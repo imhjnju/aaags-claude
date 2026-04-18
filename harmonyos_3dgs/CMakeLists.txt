@@ -196,6 +196,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
         gs3d_compile_glsl(rasterize_backward _spv_rasterize_backward)
         gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
+        gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
+        gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello}
@@ -206,7 +208,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
                     ${_spv_tile_range} ${_hdr_tile_range}
                     ${_spv_rasterize} ${_hdr_rasterize}
-                    ${_spv_rasterize_backward} ${_hdr_rasterize_backward})
+                    ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
+                    ${_spv_preprocess_backward} ${_hdr_preprocess_backward})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
@@ -225,7 +228,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/rasterize_pass.cpp
             src/vulkan/rasterizer_vulkan.cpp
             src/vulkan/rasterize_backward_pass.cpp
-            src/vulkan/rasterizer_backward_vulkan.cpp)
+            src/vulkan/rasterizer_backward_vulkan.cpp
+            src/vulkan/preprocess_backward_pass.cpp
+            src/vulkan/preprocessor_backward_vulkan.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
@@ -258,7 +263,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_rasterize_pass_vk.cpp
                 tests/test_forward_pipeline_vk.cpp
                 tests/test_rasterize_backward_pass_vk.cpp
-                tests/test_rasterizer_backward_vulkan.cpp)
+                tests/test_rasterizer_backward_vulkan.cpp
+                tests/test_preprocess_backward_pass_vk.cpp
+                tests/test_preprocessor_backward_vulkan.cpp
+                tests/test_backward_pipeline_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
