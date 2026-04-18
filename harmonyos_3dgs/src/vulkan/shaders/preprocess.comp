@@ -53,8 +53,8 @@ layout(std430, set = 0, binding = 7)  writeonly buffer BufDepths    { float dept
 // Packed {conic.a, conic.b, conic.c, opacity} per Gaussian (stride 4 floats)
 layout(std430, set = 0, binding = 8)  writeonly buffer BufConicOp   { float conic_opacity_packed[]; };
 layout(std430, set = 0, binding = 9)  writeonly buffer BufRGB       { float rgb[];        };
-layout(std430, set = 0, binding = 10)          buffer BufRadii      { int   radii[];       };
-layout(std430, set = 0, binding = 11)          buffer BufTiles      { int   tiles_touched[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer BufRadii      { int   radii[];       };
+layout(std430, set = 0, binding = 11) writeonly buffer BufTiles      { int   tiles_touched[]; };
 
 // ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
 layout(std140, set = 0, binding = 12) uniform CameraUBO {
@@ -153,11 +153,18 @@ void computeCov3D(vec3 scale, float mod_, vec4 rot, out float cov3D[6]) {
 
 // -----------------------------------------------------------------------------
 // computeCov2D: project 3D covariance into 2D screen cov via Jacobian.
-// Matches math_utils.cpp::computeCov2D (which mirrors CUDA forward.cu).
+// Matches math_utils.cpp::computeCov2D (which mirrors CUDA forward.cu /
+// forward_common.h:93).
 //
-// View matrix in CPU is column-major flat vm[16]: vm[col*4+row].
-// GLSL mat4 viewmatrix uses [col][row] indexing identically, so:
-//   W[col][row] = viewmatrix[col][row]  (for col,row in 0..2)
+// W convention (important — easy to get wrong):
+//   The CPU reference (math_utils.cpp:96-100) and CUDA forward_common.h:93 use
+//   a row-vector/left-multiply formulation where `W` is the TRANSPOSE of the
+//   upper-left 3x3 of the column-major viewmatrix. Equivalently, W's rows are
+//   the viewmatrix's column vectors. We therefore construct W as
+//     transpose(mat3(cam.viewmatrix))
+//   because mat3(mat4) in GLSL extracts the viewmatrix's first three columns
+//   as the new mat3's columns (preserving column-major storage); transpose()
+//   turns those columns into rows to match the math derivation.
 //
 // J[col][row] (column-major), CPU convention:
 //   col0 = (fx/z, 0, -fx*tx/z^2)
@@ -165,9 +172,7 @@ void computeCov3D(vec3 scale, float mod_, vec4 rot, out float cov3D[6]) {
 //   col2 = (0, 0, 0)
 //
 // T = W * J      (mat3 multiply, both column-major)
-// tmp = Vrk * T  using Vrk[row][k] * T[col][k]
-//    (i.e. tmp[col][row] = sum_k Vrk[row][k] * T[col][k])
-// result = T^T * tmp      (cov2D = tranpose(T) * Vrk * T, Vrk symmetric)
+// result = transpose(T) * Vrk * T   (Vrk symmetric, so Vrk^T = Vrk)
 // -----------------------------------------------------------------------------
 void computeCov2D(vec3 mean3d, float cov3D[6],
                   float focal_x, float focal_y,
@@ -192,8 +197,10 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
         vec3(0.0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z)),  // col 1
         vec3(0.0, 0.0, 0.0));                                       // col 2
 
-    // W = upper-left 3x3 of viewmatrix.
-    mat3 W = mat3(cam.viewmatrix);
+    // W = transpose(upper-left 3x3 of viewmatrix) — matches CUDA forward_common.h:93
+    // and CPU math_utils.cpp:96-100. mat3(mat4) extracts columns; transpose() gives
+    // the math-transposed upper 3x3 that the Jacobian derivation requires.
+    mat3 W = transpose(mat3(cam.viewmatrix));
 
     // T = W * J
     mat3 T = W * J;
