@@ -49,6 +49,7 @@ void DensityController::densify_and_clone(OwnedRawParams& params,
                                            float threshold, float extent) {
     int N = params.count();
     float size_threshold = 0.01f * extent;  // percent_dense * extent
+    int mc3 = params.max_coeffs * 3;
 
     for (int i = 0; i < N; i++) {
         if (avg_grads[i] < threshold) continue;
@@ -59,12 +60,18 @@ void DensityController::densify_and_clone(OwnedRawParams& params,
             max_scale = std::max(max_scale, std::exp(params.scales[i * 3 + j]));
         if (max_scale > size_threshold) continue;
 
-        // Clone: append exact copy
-        params.append(&params.positions[i * 3],
-                      &params.scales[i * 3],
-                      &params.rotations[i * 4],
-                      &params.sh_coeffs[i * params.max_coeffs * 3],
-                      params.opacities[i]);
+        // Copy source into local stack-safe buffers BEFORE append, to prevent
+        // dangling-pointer UB if push_back inside append reallocates any of
+        // the OwnedRawParams vectors.
+        float pos_copy[3], scale_copy[3], rot_copy[4];
+        for (int j = 0; j < 3; j++) pos_copy[j]   = params.positions[i * 3 + j];
+        for (int j = 0; j < 3; j++) scale_copy[j] = params.scales[i * 3 + j];
+        for (int j = 0; j < 4; j++) rot_copy[j]   = params.rotations[i * 4 + j];
+        std::vector<float> sh_copy(params.sh_coeffs.begin() + i * mc3,
+                                   params.sh_coeffs.begin() + (i + 1) * mc3);
+        float op_copy = params.opacities[i];
+
+        params.append(pos_copy, scale_copy, rot_copy, sh_copy.data(), op_copy);
     }
 }
 
@@ -112,6 +119,17 @@ void DensityController::densify_and_split(OwnedRawParams& params,
 
         int mc3 = params.max_coeffs * 3;
 
+        // Copy source rotation and SH coefficients BEFORE appending, to prevent
+        // dangling-pointer UB if push_back inside append reallocates.
+        // Also snapshot position and opacity so the k-loop reads stable values.
+        float rot_copy[4];
+        for (int j = 0; j < 4; j++) rot_copy[j] = params.rotations[i * 4 + j];
+        std::vector<float> sh_copy(params.sh_coeffs.begin() + i * mc3,
+                                   params.sh_coeffs.begin() + (i + 1) * mc3);
+        float op_copy = params.opacities[i];
+        float pos_src[3];
+        for (int j = 0; j < 3; j++) pos_src[j] = params.positions[i * 3 + j];
+
         for (int k = 0; k < 2; k++) {
             // Sample offset from N(0, scale) in local coords, rotate to world
             float sample[3] = {randn() * scale[0], randn() * scale[1], randn() * scale[2]};
@@ -122,12 +140,9 @@ void DensityController::densify_and_split(OwnedRawParams& params,
 
             float new_pos[3];
             for (int j = 0; j < 3; j++)
-                new_pos[j] = params.positions[i * 3 + j] + offset[j];
+                new_pos[j] = pos_src[j] + offset[j];
 
-            params.append(new_pos, new_scale_log,
-                          &params.rotations[i * 4],
-                          &params.sh_coeffs[i * mc3],
-                          params.opacities[i]);
+            params.append(new_pos, new_scale_log, rot_copy, sh_copy.data(), op_copy);
         }
 
         to_remove[i] = true;
