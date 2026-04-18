@@ -81,6 +81,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     const VkDeviceSize bytes_d_sh    = static_cast<VkDeviceSize>(N) * K * 3u * sizeof(float);
     const VkDeviceSize bytes_d_sc    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
     const VkDeviceSize bytes_d_rot   = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_N_float = static_cast<VkDeviceSize>(N) * sizeof(float);
 
     // --- Allocate GPU buffers (host-visible coherent) -----------------------
     auto pos_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_pos,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -102,6 +103,9 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     auto dsc_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_d_sc,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto drot_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_rot, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+    auto opa_in_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto d_raw_opa_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
     auto ubo_buf    = std::make_unique<VulkanBuffer>(ctx_,
                           static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -117,6 +121,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     rot_buf ->upload(g.rotations,                    static_cast<std::size_t>(bytes_rot));
     drgb_buf->upload(rgrad.d_rgb,                    static_cast<std::size_t>(bytes_d_rgb));
     dm2d_buf->upload(rgrad.d_means2D,               static_cast<std::size_t>(bytes_d_m2d));
+    opa_in_buf->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
 
     // Zero-fill gradient output buffers.
     {
@@ -131,6 +136,9 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
 
         const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
         drot_buf->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
+
+        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
+        d_raw_opa_buf->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
     }
 
     // Upload UBO.
@@ -165,22 +173,20 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     pb.rotations   = rot_buf ->handle();
     pb.d_rgb       = drgb_buf->handle();
     pb.d_means2D   = dm2d_buf->handle();
-    pb.d_means3D   = dm3d_buf->handle();
-    pb.d_sh        = dsh_buf ->handle();
-    pb.d_scales    = dsc_buf ->handle();
-    pb.d_rotations = drot_buf->handle();
+    pb.d_means3D       = dm3d_buf   ->handle();
+    pb.d_sh            = dsh_buf    ->handle();
+    pb.d_scales        = dsc_buf    ->handle();
+    pb.d_rotations     = drot_buf   ->handle();
+    pb.opacities       = opa_in_buf ->handle();
+    pb.d_raw_opacities = d_raw_opa_buf->handle();
 
     pass_->bind_buffers(pb, ubo_buf->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));
 
     // --- Download gradients into grads arrays --------------------------------
-    dm3d_buf->download(grads.d_raw_positions, static_cast<std::size_t>(bytes_d_m3d));
-    dsh_buf ->download(grads.d_raw_sh_coeffs, static_cast<std::size_t>(bytes_d_sh));
-    dsc_buf ->download(grads.d_raw_scales,    static_cast<std::size_t>(bytes_d_sc));
-    drot_buf->download(grads.d_raw_rotations, static_cast<std::size_t>(bytes_d_rot));
-    // Note: d_raw_opacities is computed on CPU by the rasterizer backward chain;
-    // the Vulkan preprocess backward does not compute opacity gradients since
-    // the sigmoid backward (d_opacity -> d_raw_opacity) is a simple scalar multiply
-    // not requiring the GPU preprocessor. The opacity gradient can be added
-    // to grads by the caller or left to zero.
+    dm3d_buf    ->download(grads.d_raw_positions,  static_cast<std::size_t>(bytes_d_m3d));
+    dsh_buf     ->download(grads.d_raw_sh_coeffs,  static_cast<std::size_t>(bytes_d_sh));
+    dsc_buf     ->download(grads.d_raw_scales,     static_cast<std::size_t>(bytes_d_sc));
+    drot_buf    ->download(grads.d_raw_rotations,  static_cast<std::size_t>(bytes_d_rot));
+    d_raw_opa_buf->download(grads.d_raw_opacities, static_cast<std::size_t>(bytes_N_float));
 }

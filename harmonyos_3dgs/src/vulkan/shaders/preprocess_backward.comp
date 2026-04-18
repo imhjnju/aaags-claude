@@ -10,6 +10,7 @@
 //   Part B: d_cov3D -> d_M -> d_raw_scales, d_raw_rotations
 //   Part C: d_rgb -> d_sh (SH backward)
 //   Part D: d_means2D -> d_means3D (projection path)
+//   Part E: d_opacity_2d -> d_raw_opacity (sigmoid backward)
 //
 // Key conventions (match preprocessor_backward_cpu.cpp exactly):
 //   - Quaternion order: (r, x, y, z)  (rotations[i*4+0..3])
@@ -39,9 +40,11 @@ layout(std430, set = 0, binding = 10) writeonly buffer BufDMeans3D   { float d_m
 layout(std430, set = 0, binding = 11) writeonly buffer BufDSH        { float d_sh[];       };
 layout(std430, set = 0, binding = 12) writeonly buffer BufDScales    { float d_scales[];   };
 layout(std430, set = 0, binding = 13) writeonly buffer BufDRotations { float d_rotations[];};
+layout(std430, set = 0, binding = 14) readonly  buffer BufOpacities     { float opacities[];     };
+layout(std430, set = 0, binding = 15) writeonly buffer BufDRawOpacities { float d_raw_opacities[];};
 
-// ---- UBO (std140, binding 14) ----------------------------------------------
-layout(std140, set = 0, binding = 14) uniform PreprocessBwdUBO {
+// ---- UBO (std140, binding 16) ----------------------------------------------
+layout(std140, set = 0, binding = 16) uniform PreprocessBwdUBO {
     mat4     view_matrix;     // column-major 4x4
     mat4     proj_matrix;     // column-major 4x4 (viewproj)
     uint     num_gaussians;
@@ -124,6 +127,7 @@ void main() {
         d_rotations[base4 + 1u] = 0.0;
         d_rotations[base4 + 2u] = 0.0;
         d_rotations[base4 + 3u] = 0.0;
+        d_raw_opacities[i] = 0.0;
         return;
     }
 
@@ -227,6 +231,7 @@ void main() {
         d_rotations[base4 + 1u] = 0.0;
         d_rotations[base4 + 2u] = 0.0;
         d_rotations[base4 + 3u] = 0.0;
+        d_raw_opacities[i] = 0.0;
         return;
     }
 
@@ -656,4 +661,9 @@ void main() {
     d_means3D[base3 + 0u] = d_pos_x;
     d_means3D[base3 + 1u] = d_pos_y;
     d_means3D[base3 + 2u] = d_pos_z;
+
+    // Part E: d_opacity_2d -> d_raw_opacity (sigmoid backward)
+    // CPU ref: grads.d_raw_opacities[i] = rgrad.d_opacities_2d[i] * sigma * (1 - sigma)
+    float sigma = opacities[i];
+    d_raw_opacities[i] = d_opacity[i] * sigma * (1.0 - sigma);
 }

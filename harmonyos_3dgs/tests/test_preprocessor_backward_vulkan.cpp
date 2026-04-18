@@ -203,6 +203,14 @@ TEST(PreprocessorBackwardVulkan, MatchesCPU_TinyGolden) {
             << "d_raw_rotations[" << k << "]: vk=" << grads_vk.d_raw_rotations[k]
             << " cpu=" << grads_cpu.d_raw_rotations[k];
     }
+
+    // d_raw_opacities (binding 15) — added in SP-4 Task 3
+    // CPU: grads.d_raw_opacities[i] = rgrad.d_opacities_2d[i] * sigma * (1 - sigma)
+    for (int i = 0; i < N; ++i) {
+        EXPECT_NEAR(grads_vk.d_raw_opacities[i], grads_cpu.d_raw_opacities[i], tol)
+            << "d_raw_opacities[" << i << "]: vk=" << grads_vk.d_raw_opacities[i]
+            << " cpu=" << grads_cpu.d_raw_opacities[i];
+    }
 }
 
 // ============================================================================
@@ -331,6 +339,9 @@ TEST(PreprocessorBackwardVulkan, CulledGaussianZeroGrad) {
         EXPECT_EQ(grads_vk.d_raw_rotations[1*4+k], 0.0f)
             << "Culled Gaussian 1 d_rotations[" << k << "] should be zero";
     }
+    // d_raw_opacities for culled Gaussian must be zero
+    EXPECT_EQ(grads_vk.d_raw_opacities[1], 0.0f)
+        << "Culled Gaussian 1 d_raw_opacities should be zero";
 
     // Active Gaussian 0: d_sh should be nonzero
     bool sh0_nonzero = false;

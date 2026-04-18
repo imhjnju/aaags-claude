@@ -41,28 +41,31 @@ struct alignas(16) RasterizeBackwardUBO {
 static_assert(sizeof(RasterizeBackwardUBO) == 32,
               "RasterizeBackwardUBO must be 32 bytes (std140)");
 
-// ---- preprocess_backward.comp binding layout (15 total: 14 SSBOs + 1 UBO) ----
+// ---- preprocess_backward.comp binding layout (17 total: 16 SSBOs + 1 UBO) ----
 //
 // Binding layout:
 //   0..9   read-only input SSBOs
 //   10..13 read-write output SSBOs
-//   14     uniform buffer (PreprocessBackwardUBO)
+//   14..15 new: opacities input + d_raw_opacities output
+//   16     uniform buffer (PreprocessBackwardUBO)
 namespace preprocess_backward_bind {
-constexpr uint32_t POSITIONS   = 0;   // RO float[N*3]          world-space xyz
-constexpr uint32_t RADII       = 1;   // RO int[N]              int-ceiled radius; 0=culled
-constexpr uint32_t COV3D       = 2;   // RO float[N*6]          from ForwardCache.cov3D
-constexpr uint32_t D_CONICS    = 3;   // RO float[N*3]          from rasterizer backward (a,b,c)
-constexpr uint32_t D_OPACITY   = 4;   // RO float[N]            from rasterizer backward
-constexpr uint32_t SH_COEFFS   = 5;   // RO float[N*max_coeffs*3]
-constexpr uint32_t SCALES      = 6;   // RO float[N*3]          exp-activated
-constexpr uint32_t ROTATIONS   = 7;   // RO float[N*4]          normalized quaternion (r,x,y,z)
-constexpr uint32_t D_RGB       = 8;   // RO float[N*3]          from rasterizer backward
-constexpr uint32_t D_MEANS2D   = 9;   // RO float[N*2]          from rasterizer backward
-constexpr uint32_t D_MEANS3D   = 10;  // RW float[N*3]          output (write, not atomic)
-constexpr uint32_t D_SH        = 11;  // RW float[N*max_coeffs*3] output
-constexpr uint32_t D_SCALES    = 12;  // RW float[N*3]          output
-constexpr uint32_t D_ROTATIONS = 13;  // RW float[N*4]          output
-constexpr uint32_t PREPROCESS_BACKWARD_UBO = 14;
+constexpr uint32_t POSITIONS        = 0;   // RO float[N*3]          world-space xyz
+constexpr uint32_t RADII            = 1;   // RO int[N]              int-ceiled radius; 0=culled
+constexpr uint32_t COV3D            = 2;   // RO float[N*6]          from ForwardCache.cov3D
+constexpr uint32_t D_CONICS         = 3;   // RO float[N*3]          from rasterizer backward (a,b,c)
+constexpr uint32_t D_OPACITY        = 4;   // RO float[N]            from rasterizer backward
+constexpr uint32_t SH_COEFFS        = 5;   // RO float[N*max_coeffs*3]
+constexpr uint32_t SCALES           = 6;   // RO float[N*3]          exp-activated
+constexpr uint32_t ROTATIONS        = 7;   // RO float[N*4]          normalized quaternion (r,x,y,z)
+constexpr uint32_t D_RGB            = 8;   // RO float[N*3]          from rasterizer backward
+constexpr uint32_t D_MEANS2D        = 9;   // RO float[N*2]          from rasterizer backward
+constexpr uint32_t D_MEANS3D        = 10;  // RW float[N*3]          output (write, not atomic)
+constexpr uint32_t D_SH             = 11;  // RW float[N*max_coeffs*3] output
+constexpr uint32_t D_SCALES         = 12;  // RW float[N*3]          output
+constexpr uint32_t D_ROTATIONS      = 13;  // RW float[N*4]          output
+constexpr uint32_t OPACITIES        = 14;  // RO float[N]            activated sigmoid values
+constexpr uint32_t D_RAW_OPACITIES  = 15;  // RW float[N]            output
+constexpr uint32_t PREPROCESS_BACKWARD_UBO = 16;
 }  // namespace preprocess_backward_bind
 
 // PreprocessBackwardUBO (std140).
