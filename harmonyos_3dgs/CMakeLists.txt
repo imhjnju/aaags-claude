@@ -218,7 +218,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/tile_binner_vulkan.cpp
             src/vulkan/radix_sort_pass.cpp
             src/vulkan/tile_range_pass.cpp
-            src/vulkan/sorter_vulkan.cpp)
+            src/vulkan/sorter_vulkan.cpp
+            src/vulkan/rasterize_pass.cpp
+            src/vulkan/rasterizer_vulkan.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
