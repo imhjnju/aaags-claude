@@ -41,8 +41,8 @@ layout(std430, set = 0, binding = 2)          buffer WorkgroupSums { uint workgr
 layout(push_constant) uniform PC {
     uint num_elements;   // phase 0/2: total input length; phase 1: num workgroups
     uint phase;          // 0 = local scan, 1 = WG-sum scan, 2 = add-back
-    uint stride;         // reserved (unused — kept for 16-byte alignment)
-    uint _pad;
+    uint stride;         // reserved — intended for T12 radix histogram (per-bucket stride)
+    uint _pad;           // 16-byte PC alignment
 } pc;
 
 shared uint s_data[256];
@@ -72,7 +72,7 @@ uint blelloch_exclusive_scan_256() {
 
     // Down-sweep (distribute). Same predicate as up-sweep; at each level,
     // the participating pair (lid, lid-d) swaps-and-adds.
-    for (uint d = 128u; d >= 1u; d >>= 1) {
+    for (uint d = 128u; d > 0u; d >>= 1) {
         if (((lid + 1u) & (2u*d - 1u)) == 0u) {
             uint t            = s_data[lid - d];
             s_data[lid - d]   = s_data[lid];
@@ -105,6 +105,8 @@ void main() {
     } else if (pc.phase == 1u) {
         // Phase 1: scan workgroup_sums in-place.
         // num_elements here == number of workgroups from phase 0.
+        // REQUIRES: pc.num_elements <= 256 (single-workgroup constraint).
+        // Host caller must enforce this — no runtime check here.
         s_data[lid] = (lid < pc.num_elements) ? workgroup_sums[lid] : 0u;
         barrier();
 
