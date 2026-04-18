@@ -6,6 +6,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BUILD_TESTS "Build unit tests" ON)
 option(ENABLE_OPENCL "Build with OpenCL GPU backend" OFF)
+option(ENABLE_VULKAN "Build Vulkan GPU backend" ON)
 
 if(CMAKE_CROSSCOMPILING)
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -134,11 +135,11 @@ target_link_libraries(gs3d_train_compare gs3d_core)
 #   gs3d_vk_tests      -- gtest TDD gate (uses gs3d_vk_core)
 # Skipped when cross-compiling, or when Vulkan/glslangValidator is missing.
 # ---------------------------------------------------------------------------
-if(NOT CMAKE_CROSSCOMPILING)
-    find_package(Vulkan QUIET)
+if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
+    find_package(Vulkan REQUIRED)
     find_program(GLSLANG_VALIDATOR
         NAMES glslangValidator
-        HINTS $ENV{VULKAN_SDK}/bin ~/.local/bin)
+        HINTS $ENV{VULKAN_SDK}/bin ~/.local/bin REQUIRED)
 
     if(Vulkan_FOUND AND GLSLANG_VALIDATOR)
         set(_vk_shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
