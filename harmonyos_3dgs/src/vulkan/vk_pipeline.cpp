@@ -181,6 +181,46 @@ VkDescriptorSet VulkanComputePipeline::allocateDescriptorSet(
     return dset;
 }
 
+VkDescriptorSet VulkanComputePipeline::allocate_empty_descriptor_set() {
+    if (pool_ == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "allocate_empty_descriptor_set: no descriptor pool (empty binding list)");
+
+    VkDescriptorSetAllocateInfo dsai{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = pool_;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &dsl_;
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateDescriptorSets(ctx_.device(), &dsai, &dset));
+    // Intentionally no vkUpdateDescriptorSets here — caller populates via
+    // update_ssbo() / update_ubo().
+    return dset;
+}
+
+void VulkanComputePipeline::update_ssbo(VkDescriptorSet ds,
+                                        uint32_t binding,
+                                        VkBuffer buffer) {
+    if (binding >= binding_types_.size())
+        throw std::runtime_error(
+            "update_ssbo: binding=" + std::to_string(binding) +
+            " out of range (layout has " +
+            std::to_string(binding_types_.size()) + " bindings)");
+    if (binding_types_[binding] != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+        throw std::runtime_error(
+            "update_ssbo: binding=" + std::to_string(binding) +
+            " is not VK_DESCRIPTOR_TYPE_STORAGE_BUFFER");
+
+    VkDescriptorBufferInfo dbi{buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = ds;
+    w.dstBinding = binding;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(ctx_.device(), 1, &w, 0, nullptr);
+}
+
 void VulkanComputePipeline::update_ubo(VkDescriptorSet ds,
                                        uint32_t binding,
                                        VkBuffer buffer,

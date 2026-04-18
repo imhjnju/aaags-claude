@@ -66,27 +66,31 @@ PreprocessPass::PreprocessPass(VulkanContext& ctx,
         /*push_constant_bytes=*/sizeof(PreprocessPushConstants),
         /*max_descriptor_sets=*/4,
         /*spec_info=*/&spec_info);
+
+    // --- 4. Allocate the descriptor set once ------------------------------
+    // The pool was created without VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+    // and sized for only 4 sets, so re-allocating in bind_buffers() would
+    // exhaust the pool on the 5th frame. Instead we allocate once here and
+    // let bind_buffers() update the set in-place per frame.
+    descriptor_set_ = pipeline_->allocate_empty_descriptor_set();
 }
 
 void PreprocessPass::bind_buffers(const Buffers& b) {
-    // Assemble SSBO list in binding order 0..11 (mirrors preprocess_bind::).
-    std::vector<VkBuffer> ssbos{
-        b.positions,               // 0: POSITIONS
-        b.scales,                  // 1: SCALES
-        b.rotations,               // 2: ROTATIONS
-        b.opacities,               // 3: OPACITIES
-        b.sh,                      // 4: SH
-        b.filter_3D,               // 5: FILTER_3D
-        b.means2D,                 // 6: MEANS2D
-        b.depths,                  // 7: DEPTHS
-        b.conic_opacity_packed,    // 8: CONIC_OPACITY_PACKED
-        b.rgb,                     // 9: RGB
-        b.radii,                   // 10: RADII
-        b.tiles_touched,           // 11: TILES_TOUCHED
-    };
-    descriptor_set_ = pipeline_->allocateDescriptorSet(ssbos);
-    // UBO binding 12 is populated separately (allocateDescriptorSet leaves
-    // UBO bindings unwritten by design).
+    // Update the 12 SSBO bindings in-place on the pre-allocated descriptor
+    // set. Ordering mirrors preprocess_bind::.
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::POSITIONS,            b.positions);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::SCALES,               b.scales);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::ROTATIONS,            b.rotations);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::OPACITIES,            b.opacities);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::SH,                   b.sh);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::FILTER_3D,            b.filter_3D);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::MEANS2D,              b.means2D);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::DEPTHS,               b.depths);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::CONIC_OPACITY_PACKED, b.conic_opacity_packed);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::RGB,                  b.rgb);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::RADII,                b.radii);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::TILES_TOUCHED,        b.tiles_touched);
+    // UBO binding 12.
     pipeline_->update_ubo(descriptor_set_,
                           preprocess_bind::CAMERA_UBO,
                           b.camera_ubo,

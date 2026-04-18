@@ -60,6 +60,20 @@ public:
     /// unbound; the caller must invoke update_ubo() to populate them.
     VkDescriptorSet allocateDescriptorSet(const std::vector<VkBuffer>& ssbos);
 
+    /// Allocate one descriptor set from the pool without binding any buffers.
+    /// Use update_ssbo() and update_ubo() to populate it. This is the
+    /// preferred path for callers that need to re-bind buffers per-frame:
+    /// allocate once, update in-place on each frame, so the pool never
+    /// exhausts.
+    VkDescriptorSet allocate_empty_descriptor_set();
+
+    /// Update binding `binding` (SSBO type) on `ds` to reference `buffer`.
+    /// The binding must refer to a VK_DESCRIPTOR_TYPE_STORAGE_BUFFER binding
+    /// declared in the layout.
+    void update_ssbo(VkDescriptorSet ds,
+                     uint32_t binding,
+                     VkBuffer buffer);
+
     /// Update a single UBO binding on an already-allocated descriptor set.
     /// The binding index must refer to a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
     /// binding declared in the layout.

@@ -52,9 +52,10 @@ public:
     PreprocessPass(const PreprocessPass&)            = delete;
     PreprocessPass& operator=(const PreprocessPass&) = delete;
 
-    /// Allocate (or replace) the internal descriptor set and bind the given
-    /// buffers. Call once per set of backing allocations; cheap to call again
-    /// if allocations change (new set allocated from the pool).
+    /// Update buffer bindings on the pre-allocated descriptor set. Safe to
+    /// call multiple times per-frame — uses vkUpdateDescriptorSets in-place
+    /// rather than allocating a fresh set, so the descriptor pool is never
+    /// exhausted regardless of how often buffers are rewired.
     void bind_buffers(const Buffers& b);
 
     /// Layer 1: allocate a cmd buffer, record, submit, wait. Convenience.
