@@ -116,3 +116,29 @@ VkDescriptorSet VulkanComputePipeline::allocateDescriptorSet(
                            writes.data(), 0, nullptr);
     return dset;
 }
+
+void VulkanComputePipeline::dispatch_sync(VkDescriptorSet desc_set,
+                                          uint32_t gx, uint32_t gy, uint32_t gz,
+                                          const void* push_constants,
+                                          uint32_t push_size)
+{
+    VkCommandBuffer cmd = ctx_.allocatePrimary();
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
+                             0, 1, &desc_set, 0, nullptr);
+    if (push_size > 0 && push_constants != nullptr) {
+        vkCmdPushConstants(cmd, layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push_constants);
+    }
+    vkCmdDispatch(cmd, gx, gy, gz);
+
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    ctx_.submitAndWait(cmd);
+    ctx_.freePrimary(cmd);
+}

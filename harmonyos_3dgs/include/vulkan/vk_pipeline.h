@@ -36,6 +36,14 @@ public:
     /// passed to the constructor.
     VkDescriptorSet allocateDescriptorSet(const std::vector<VkBuffer>& ssbos);
 
+    /// Layer 1 dispatch (sync, bring-up). Allocates an internal command buffer,
+    /// binds this pipeline + the given descriptor set, pushes constants if any,
+    /// dispatches, submits, and vkQueueWaitIdles. Use for tests and smoke runs.
+    void dispatch_sync(VkDescriptorSet descriptor_set,
+                       uint32_t gx, uint32_t gy, uint32_t gz,
+                       const void* push_constants = nullptr,
+                       uint32_t push_size = 0);
+
 private:
     VulkanContext&        ctx_;
     uint32_t              num_ssbo_bindings_;
