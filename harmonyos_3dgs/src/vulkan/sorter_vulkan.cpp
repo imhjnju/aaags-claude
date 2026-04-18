@@ -201,6 +201,11 @@ void SorterVulkan::prepare_record(uint32_t R, uint32_t num_tiles,
     // the binner's buffers alive across record + submit.
     r_keys_a_ = keys_unsorted;
     r_vals_a_ = values_unsorted;
+
+    // Bind TileRangePass descriptor sets here (pure DS mutation). record()
+    // is "pure" — only GPU command recording. All vkUpdateDescriptorSets
+    // calls must happen before record() is invoked.
+    range_pass_->bind_buffers(r_keys_a_, r_ranges_->handle());
 }
 
 void SorterVulkan::record(VkCommandBuffer cmd,
@@ -221,7 +226,7 @@ void SorterVulkan::record(VkCommandBuffer cmd,
     insert_compute_barrier(cmd);
 
     // Tile-range sweep over sorted keys (A side).
-    range_pass_->bind_buffers(r_keys_a_, r_ranges_->handle());
+    // bind_buffers() was already called in prepare_record() — record() is pure.
     range_pass_->dispatch_record(cmd, R, num_tiles);
 }
 

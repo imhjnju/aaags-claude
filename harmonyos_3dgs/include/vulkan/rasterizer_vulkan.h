@@ -49,14 +49,13 @@ public:
     //
     // Allocate output image + T_final + n_contrib + RasterizeUBO. Upload the
     // UBO payload. Bind all external inputs + internal outputs to the pass.
-    // N_eff is the number of Gaussians the caller uploaded into means2D /
-    // conic_opacity_packed / rgb — used only for push-constant bookkeeping
-    // (the shader reads per-Gaussian data by values_sorted index, not by
-    // linear sweep).
+    //
+    // N_eff is NOT needed at prepare time — it is passed to record() as a
+    // push constant. Only record() needs it.
     //
     // bg_color is a 3-float array — channel layout matches RasterizeUBO.
     // Buffers persist until the next prepare_record() call or destruction.
-    void prepare_record(uint32_t N_eff, uint32_t W, uint32_t H,
+    void prepare_record(uint32_t W, uint32_t H,
                         uint32_t num_tiles_x, uint32_t num_tiles_y,
                         const float bg_color[3],
                         VkBuffer values_sorted,

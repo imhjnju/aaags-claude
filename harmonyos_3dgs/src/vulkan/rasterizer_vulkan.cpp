@@ -220,7 +220,7 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
 // ---------------------------------------------------------------------------
 // Layer-2 record-mode: prepare_record / record / download_* / getters.
 // ---------------------------------------------------------------------------
-void RasterizerVulkan::prepare_record(uint32_t N_eff, uint32_t W, uint32_t H,
+void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
                                       uint32_t num_tiles_x,
                                       uint32_t num_tiles_y,
                                       const float bg_color[3],
@@ -232,10 +232,6 @@ void RasterizerVulkan::prepare_record(uint32_t N_eff, uint32_t W, uint32_t H,
     if (W == 0u || H == 0u)
         throw std::runtime_error(
             "RasterizerVulkan::prepare_record: W/H must be > 0");
-
-    // Silence unused-parameter warning — N_eff is only meaningful for the
-    // push constant at record() time. Left in the API to match the plan.
-    (void)N_eff;
 
     // Release any previously held buffers up front.
     r_img_.reset();

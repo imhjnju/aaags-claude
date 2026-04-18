@@ -217,7 +217,7 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
         prep.prepare_record(g, cam, cfg);
         binner.prepare_record(
             /*N=*/static_cast<uint32_t>(N),
-            /*R_max=*/R_ours,                 // exact R from the sync run
+            /*R_max=*/static_cast<uint32_t>(N) * num_tiles, // safe upper bound: N*num_tiles
             num_tiles_x, num_tiles_y,
             prep.tiles_touched_buffer(),
             prep.means2D_buffer(),
@@ -226,7 +226,7 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
         sorter.prepare_record(R_ours, num_tiles,
             binner.keys_unsorted_buf(),
             binner.values_unsorted_buf());
-        raster.prepare_record(N_eff,
+        raster.prepare_record(
             static_cast<uint32_t>(W), static_cast<uint32_t>(H),
             num_tiles_x, num_tiles_y,
             cfg.bg_color,
