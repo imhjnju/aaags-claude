@@ -42,6 +42,7 @@ void main() {
     if (i >= pc.num_elements) return;
 
     uint tile_id_cur = uint(keys_sorted[i] >> 32u);
+    if (tile_id_cur >= pc.num_tiles) return;  // malformed key guard — prevent OOB write
 
     // Is this element the first in its tile?
     bool is_start = (i == 0u) ||

@@ -67,6 +67,10 @@ void main() {
     // Out-of-range lanes leave s_bucket[lid] undefined — phase 2 only
     // reads s_bucket[k] for k < num_elements, and phase 3 only writes for
     // tid < num_elements.
+    // INVARIANT (single-WG only): tid == lid (wg_id == 0, GlobalInvID == LocalInvID).
+    // Phase 2's read range k < num_elements is safe because s_bucket[lid] was
+    // written iff tid < num_elements, and tid == lid. Breaking this assumption
+    // (e.g. multi-WG dispatch) requires rewriting phases 1-3 together.
     if (tid < pc.num_elements) {
         s_bucket[lid] = uint((keys_in[tid] >> pc.current_bit) & uint64_t(0xFu));
     }
