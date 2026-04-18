@@ -20,6 +20,9 @@ constexpr uint32_t RADII               = 10;
 constexpr uint32_t TILES_TOUCHED       = 11;
 constexpr uint32_t CAMERA_UBO          = 12;
 constexpr uint32_t RADIUS_F            = 13;  // float eigenvalue radius (scatter fix)
+constexpr uint32_t COV3D_CACHE         = 14;  // [N*6] 3D covariance cache for backward
+constexpr uint32_t P_VIEW_CACHE        = 15;  // [N*3] view-space position cache for backward
+constexpr uint32_t P_HOM_W_CACHE       = 16;  // [N]   clip-space w cache for backward
 }  // namespace preprocess_bind
 
 // Push constants (24 bytes, spec §4.8.1)

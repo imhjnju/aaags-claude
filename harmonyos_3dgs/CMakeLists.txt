@@ -266,7 +266,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_rasterizer_backward_vulkan.cpp
                 tests/test_preprocess_backward_pass_vk.cpp
                 tests/test_preprocessor_backward_vulkan.cpp
-                tests/test_backward_pipeline_vk.cpp)
+                tests/test_backward_pipeline_vk.cpp
+                tests/test_forward_cache_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

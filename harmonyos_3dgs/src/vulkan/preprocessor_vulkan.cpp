@@ -54,7 +54,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
                                              const Camera& cam,
                                              const RenderConfig& cfg,
                                              FrameAllocator& alloc,
-                                             ForwardCache* /*cache*/) {
+                                             ForwardCache* cache) {
     // --- SP-2 hard errors (spec §4.4) ----------------------------------------
     if (cfg.eval_3D)
         throw std::runtime_error(
@@ -117,6 +117,17 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     auto cam_buf = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    // ForwardCache output buffers (bindings 14..16).
+    // Always allocated so the shader descriptor set is always fully bound.
+    cov3d_buf_   = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 6 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    p_view_buf_  = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    p_hom_w_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // --- 2. Upload inputs ----------------------------------------------------
     pos_buf->upload(g.positions, static_cast<std::size_t>(N) * 3 * sizeof(float));
@@ -181,6 +192,9 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     b.tiles_touched         = tt_buf ->handle();
     b.camera_ubo            = cam_buf->handle();
     b.radius_f              = rf_buf ->handle();
+    b.cov3D_cache           = cov3d_buf_  ->handle();
+    b.p_view_cache          = p_view_buf_ ->handle();
+    b.p_hom_w_cache         = p_hom_w_buf_->handle();
     pass_->bind_buffers(b);
 
     PreprocessPushConstants pc{};
@@ -226,7 +240,29 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         out.opacities_2d[i]   = packed[i * 4 + 3];
     }
 
+    // Populate ForwardCache if requested.
+    if (cache) {
+        download_cache(N, *cache, alloc);
+    }
+
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// download_cache(): download ForwardCache fields populated during process().
+// Must be called after process(); throws if process() hasn't run yet.
+// ---------------------------------------------------------------------------
+void PreprocessorVulkan::download_cache(int N, ForwardCache& cache,
+                                        FrameAllocator& alloc) {
+    if (!cov3d_buf_ || !p_view_buf_ || !p_hom_w_buf_)
+        throw std::runtime_error(
+            "PreprocessorVulkan::download_cache: process() not yet called");
+    cache.cov3D   = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 6);
+    cache.p_view  = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    cache.p_hom_w = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    cov3d_buf_  ->download(cache.cov3D,   static_cast<std::size_t>(N) * 6 * sizeof(float));
+    p_view_buf_ ->download(cache.p_view,  static_cast<std::size_t>(N) * 3 * sizeof(float));
+    p_hom_w_buf_->download(cache.p_hom_w, static_cast<std::size_t>(N) * sizeof(float));
 }
 
 // ---------------------------------------------------------------------------

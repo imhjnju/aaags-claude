@@ -59,6 +59,11 @@ layout(std430, set = 0, binding = 11) writeonly buffer BufTiles      { int   til
 // ---- Float radius SSBO (binding 13, after UBO at 12) -----------------------
 layout(std430, set = 0, binding = 13) writeonly buffer BufRadiusF    { float radius_f_arr[]; };
 
+// ---- ForwardCache SSBOs for backward pass (bindings 14..16) ----------------
+layout(std430, set = 0, binding = 14) writeonly buffer BufCov3DCache  { float cov3D_cache[];  };  // [N*6]
+layout(std430, set = 0, binding = 15) writeonly buffer BufPViewCache  { float p_view_cache[]; };  // [N*3]
+layout(std430, set = 0, binding = 16) writeonly buffer BufPHomWCache  { float p_hom_w_cache[];};  // [N]
+
 // ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
 layout(std140, set = 0, binding = 12) uniform CameraUBO {
     mat4 viewmatrix;           // 64B
@@ -335,6 +340,12 @@ void main() {
     tiles_touched[i] = 0;
     radius_f_arr[i]  = 0.0;
 
+    // Zero-fill ForwardCache fields for culled paths.
+    cov3D_cache[i*6u+0u]=0.0; cov3D_cache[i*6u+1u]=0.0; cov3D_cache[i*6u+2u]=0.0;
+    cov3D_cache[i*6u+3u]=0.0; cov3D_cache[i*6u+4u]=0.0; cov3D_cache[i*6u+5u]=0.0;
+    p_view_cache[i*3u+0u]=0.0; p_view_cache[i*3u+1u]=0.0; p_view_cache[i*3u+2u]=0.0;
+    p_hom_w_cache[i]=0.0;
+
     vec3 position = vec3(positions[i*3u + 0u],
                          positions[i*3u + 1u],
                          positions[i*3u + 2u]);
@@ -445,4 +456,19 @@ void main() {
     radii[i]         = my_radius;
     tiles_touched[i] = n_tiles;
     radius_f_arr[i]  = radius_f;  // exact float radius for scatter.comp (binding 13)
+
+    // Cache intermediates for backward pass (bindings 14..16).
+    // cov3D: 6-element upper triangle computed by computeCov3D().
+    cov3D_cache[i*6u+0u] = cov3D[0];
+    cov3D_cache[i*6u+1u] = cov3D[1];
+    cov3D_cache[i*6u+2u] = cov3D[2];
+    cov3D_cache[i*6u+3u] = cov3D[3];
+    cov3D_cache[i*6u+4u] = cov3D[4];
+    cov3D_cache[i*6u+5u] = cov3D[5];
+    // p_view: view-space position (xyz).
+    p_view_cache[i*3u+0u] = p_view.x;
+    p_view_cache[i*3u+1u] = p_view.y;
+    p_view_cache[i*3u+2u] = p_view.z;
+    // p_hom_w: raw clip-space w (NOT 1/w — matches CPU cache->p_hom_w = p_hom[3]).
+    p_hom_w_cache[i] = p_hom.w;
 }

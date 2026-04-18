@@ -42,6 +42,10 @@ public:
         VkBuffer camera_ubo;
         // Float radius SSBO (binding 13)
         VkBuffer radius_f;
+        // Cache SSBOs for backward pass (bindings 14..16)
+        VkBuffer cov3D_cache;    // binding 14, [N*6] floats
+        VkBuffer p_view_cache;   // binding 15, [N*3] floats
+        VkBuffer p_hom_w_cache;  // binding 16, [N]   floats
     };
 
     /// @param spec_training 1=training (skip SH RGB clamp), 0=inference (clamp)
