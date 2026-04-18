@@ -126,3 +126,73 @@ target_link_libraries(gs3d_verify_grads gs3d_core)
 
 add_executable(gs3d_train_compare src/train_compare_cpp.cpp)
 target_link_libraries(gs3d_train_compare gs3d_core)
+
+# ---------------------------------------------------------------------------
+# Vulkan Phase 1: abstractions + TDD gate.
+#   gs3d_vk_core       -- RAII wrappers (VulkanContext/Buffer/Shader/Pipeline)
+#   gs3d_vulkan_hello  -- standalone compute smoke binary (uses gs3d_vk_core)
+#   gs3d_vk_tests      -- gtest TDD gate (uses gs3d_vk_core)
+# Skipped when cross-compiling, or when Vulkan/glslangValidator is missing.
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_CROSSCOMPILING)
+    find_package(Vulkan QUIET)
+    find_program(GLSLANG_VALIDATOR
+        NAMES glslangValidator
+        HINTS $ENV{VULKAN_SDK}/bin ~/.local/bin)
+
+    if(Vulkan_FOUND AND GLSLANG_VALIDATOR)
+        set(_vk_shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+        set(_vk_shader_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/shaders)
+
+        function(gs3d_compile_glsl SHADER_NAME OUT_SPV_VAR)
+            set(_src ${_vk_shader_src_dir}/${SHADER_NAME}.comp)
+            set(_spv ${_vk_shader_dir}/${SHADER_NAME}.spv)
+            add_custom_command(
+                OUTPUT ${_spv}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${_vk_shader_dir}
+                COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+                        ${_src} -o ${_spv}
+                DEPENDS ${_src}
+                COMMENT "Compiling ${SHADER_NAME}.comp -> SPIR-V (vulkan1.1)"
+                VERBATIM)
+            set(${OUT_SPV_VAR} ${_spv} PARENT_SCOPE)
+        endfunction()
+
+        gs3d_compile_glsl(add_one    _spv_add_one)
+        gs3d_compile_glsl(preprocess _spv_preprocess)
+        add_custom_target(gs3d_vulkan_shaders
+            DEPENDS ${_spv_add_one} ${_spv_preprocess})
+
+        add_library(gs3d_vk_core STATIC
+            src/vulkan/vk_context.cpp
+            src/vulkan/vk_buffer.cpp
+            src/vulkan/vk_shader.cpp
+            src/vulkan/vk_pipeline.cpp
+            src/vulkan/preprocessor_vk.cpp)
+        target_include_directories(gs3d_vk_core PUBLIC include)
+        target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan)
+
+        add_executable(gs3d_vulkan_hello src/vulkan/hello_vulkan_main.cpp)
+        add_dependencies(gs3d_vulkan_hello gs3d_vulkan_shaders)
+        target_link_libraries(gs3d_vulkan_hello PRIVATE gs3d_vk_core)
+        target_compile_definitions(gs3d_vulkan_hello PRIVATE
+            ADD_ONE_SPV_PATH="${_spv_add_one}")
+
+        if(BUILD_TESTS)
+            add_executable(gs3d_vk_tests
+                tests/test_vk_compute.cpp
+                tests/test_preprocessor_vk.cpp)
+            add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
+            # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
+            target_link_libraries(gs3d_vk_tests PRIVATE
+                gs3d_vk_core gs3d_core GTest::gtest_main)
+            target_compile_definitions(gs3d_vk_tests PRIVATE
+                ADD_ONE_SPV_PATH="${_spv_add_one}"
+                SHADER_DIR="${_vk_shader_dir}")
+            gtest_discover_tests(gs3d_vk_tests)
+        endif()
+        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, preprocess)")
+    else()
+        message(STATUS "Vulkan SKIPPED (Vulkan=${Vulkan_FOUND}, glslangValidator=${GLSLANG_VALIDATOR})")
+    endif()
+endif()
