@@ -182,10 +182,13 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(hello _hdr_hello)
         gs3d_compile_glsl(preprocess _spv_preprocess)
         gs3d_embed_spirv(preprocess _hdr_preprocess)
+        gs3d_compile_glsl(prefix_sum _spv_prefix_sum)
+        gs3d_embed_spirv(prefix_sum _hdr_prefix_sum)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello}
-                    ${_spv_preprocess} ${_hdr_preprocess})
+                    ${_spv_preprocess} ${_hdr_preprocess}
+                    ${_spv_prefix_sum} ${_hdr_prefix_sum})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp

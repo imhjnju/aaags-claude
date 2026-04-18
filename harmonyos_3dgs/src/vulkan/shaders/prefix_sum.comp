@@ -1,0 +1,129 @@
+#version 450
+
+// SP-2 prefix_sum.comp — 3-level Blelloch exclusive scan on uint arrays.
+// Spec §4.8.2.
+//
+// Used as a generic primitive by the forward pipeline:
+//   - tiles_touched[N] -> point_offsets[N]   (scatter needs exclusive offsets)
+//   - radix histogram scans (later in T12)
+//
+// Contract: output_array[i] = sum(input_array[0..i-1]) (exclusive).
+// sum(input_array[0..N-1]) is equivalent to output_array[N-1] + input_array[N-1].
+//
+// Three phases, controlled by push constant `phase`:
+//   phase=0: per-workgroup local scan. Each 256-thread WG scans its slice of
+//            input_array into output_array, and writes its TOTAL SUM to
+//            workgroup_sums[gl_WorkGroupID.x].
+//   phase=1: scan workgroup_sums in-place (single workgroup, up to 256 WGs).
+//            After this, workgroup_sums[i] = exclusive prefix of WG totals.
+//   phase=2: add workgroup_sums[wg_id] (the exclusive WG prefix) to every
+//            element of output_array owned by wg_id.
+//
+// For N_total = N gaussians, the caller issues:
+//   num_wg = (N + 255) / 256
+//   phase=0 dispatch (num_wg, 1, 1)  num_elements = N
+//   phase=1 dispatch (1, 1, 1)       num_elements = num_wg
+//   phase=2 dispatch (num_wg, 1, 1)  num_elements = N
+//
+// This supports N up to 256*256 = 65536 Gaussians with a single phase-1 pass.
+// Larger N would need recursion (not needed for SP-0 tiny fixture or SP-2).
+//
+// Blelloch algorithm references:
+//   - GPU Gems 3, Chapter 39 (Harris, Sengupta, Owens, 2008).
+//   - CUDA CUB DeviceScan implements a similar three-level pattern.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputArray    { uint input_array[];    };
+layout(std430, set = 0, binding = 1)          buffer OutputArray   { uint output_array[];   };
+layout(std430, set = 0, binding = 2)          buffer WorkgroupSums { uint workgroup_sums[]; };
+
+layout(push_constant) uniform PC {
+    uint num_elements;   // phase 0/2: total input length; phase 1: num workgroups
+    uint phase;          // 0 = local scan, 1 = WG-sum scan, 2 = add-back
+    uint stride;         // reserved (unused — kept for 16-byte alignment)
+    uint _pad;
+} pc;
+
+shared uint s_data[256];
+
+// Standard Blelloch exclusive scan on s_data[0..255].
+// Assumes `s_data` is loaded and a `barrier()` has been issued by the caller.
+// After this function, s_data[i] = exclusive prefix sum of its original values,
+// and the return value is the total sum (original s_data[255] before reduce).
+uint blelloch_exclusive_scan_256() {
+    // Up-sweep (reduce). Predicate ((lid+1) & (2d-1)) == 0 selects lids
+    // 2d-1, 4d-1, 6d-1, ..., 256-1. For d=128 only lid=255 participates,
+    // accumulating s_data[255] = sum of all 256 originals.
+    uint lid = gl_LocalInvocationID.x;
+    for (uint d = 1u; d < 256u; d <<= 1) {
+        if (((lid + 1u) & (2u*d - 1u)) == 0u)
+            s_data[lid] += s_data[lid - d];
+        barrier();
+    }
+
+    // Save total, then clear root for down-sweep.
+    uint total = 0u;
+    if (lid == 255u) {
+        total = s_data[255];
+        s_data[255] = 0u;
+    }
+    barrier();
+
+    // Down-sweep (distribute). Same predicate as up-sweep; at each level,
+    // the participating pair (lid, lid-d) swaps-and-adds.
+    for (uint d = 128u; d >= 1u; d >>= 1) {
+        if (((lid + 1u) & (2u*d - 1u)) == 0u) {
+            uint t            = s_data[lid - d];
+            s_data[lid - d]   = s_data[lid];
+            s_data[lid]       = s_data[lid] + t;
+        }
+        barrier();
+    }
+    return total; // only valid on lid==255
+}
+
+void main() {
+    uint gid   = gl_GlobalInvocationID.x;
+    uint lid   = gl_LocalInvocationID.x;
+    uint wg_id = gl_WorkGroupID.x;
+
+    if (pc.phase == 0u) {
+        // Phase 0: local scan on input_array slice -> output_array slice.
+        s_data[lid] = (gid < pc.num_elements) ? input_array[gid] : 0u;
+        barrier();
+
+        uint total = blelloch_exclusive_scan_256();
+        if (lid == 255u) {
+            workgroup_sums[wg_id] = total;
+        }
+
+        if (gid < pc.num_elements) {
+            output_array[gid] = s_data[lid];
+        }
+
+    } else if (pc.phase == 1u) {
+        // Phase 1: scan workgroup_sums in-place.
+        // num_elements here == number of workgroups from phase 0.
+        s_data[lid] = (lid < pc.num_elements) ? workgroup_sums[lid] : 0u;
+        barrier();
+
+        // We don't care about the total sum here (caller can recover via
+        // workgroup_sums[num_wg-1] + tiles_touched[N-1] if needed).
+        blelloch_exclusive_scan_256();
+
+        if (lid < pc.num_elements) {
+            workgroup_sums[lid] = s_data[lid];
+        }
+
+    } else {
+        // Phase 2: add workgroup offset back.
+        // After phase 1, workgroup_sums[wg_id] is the exclusive prefix of
+        // WG totals -- i.e., the sum of all elements in WGs 0..wg_id-1.
+        // This is exactly the offset we need to add to output_array[gid].
+        if (gid < pc.num_elements) {
+            uint wg_offset = workgroup_sums[wg_id];
+            output_array[gid] += wg_offset;
+        }
+    }
+}
