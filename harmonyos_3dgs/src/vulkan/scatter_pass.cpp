@@ -26,8 +26,8 @@ ScatterPass::ScatterPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(scatter_spv),
         static_cast<std::size_t>(scatter_spv_len));
 
-    // 7 SSBOs, all storage buffers. No specialization constants.
-    std::vector<VkDescriptorType> binding_types(7,
+    // 8 SSBOs, all storage buffers. No specialization constants.
+    std::vector<VkDescriptorType> binding_types(8,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
     pipeline_ = std::make_unique<VulkanComputePipeline>(
@@ -48,6 +48,7 @@ void ScatterPass::bind_buffers(const Buffers& b) {
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::TILES_TOUCHED,   b.tiles_touched);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::KEYS_UNSORTED,   b.keys_unsorted);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::VALUES_UNSORTED, b.values_unsorted);
+    pipeline_->update_ssbo(descriptor_set_, scatter_bind::RADIUS_F,        b.radius_f);
 }
 
 void ScatterPass::dispatch_sync(uint32_t num_gaussians,

@@ -89,6 +89,7 @@ public:
         VkBuffer tiles_touched;   // RO int[N]
         VkBuffer keys_unsorted;   // WO uint64[R]
         VkBuffer values_unsorted; // WO uint[R]
+        VkBuffer radius_f;        // RO float[N]  — float eigenvalue radius from preprocess
     };
 
     explicit ScatterPass(VulkanContext& ctx);

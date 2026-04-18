@@ -53,8 +53,8 @@ PreprocessPass::PreprocessPass(VulkanContext& ctx,
     spec_info.dataSize      = sizeof(SpecData);
     spec_info.pData         = &spec_data;
 
-    // --- 3. Descriptor layout: 12 SSBOs + 1 UBO (binding 12) --------------
-    std::vector<VkDescriptorType> binding_types(13,
+    // --- 3. Descriptor layout: 13 SSBOs + 1 UBO (binding 12) + 1 SSBO (binding 13)
+    std::vector<VkDescriptorType> binding_types(14,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[preprocess_bind::CAMERA_UBO] =
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -95,6 +95,8 @@ void PreprocessPass::bind_buffers(const Buffers& b) {
                           preprocess_bind::CAMERA_UBO,
                           b.camera_ubo,
                           sizeof(CameraUBO));
+    // SSBO binding 13: float radius_f output.
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::RADIUS_F, b.radius_f);
 }
 
 void PreprocessPass::dispatch_sync(const PreprocessPushConstants& pc) {

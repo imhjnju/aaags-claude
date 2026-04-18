@@ -111,6 +111,9 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     auto tt_buf  = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rf_buf  = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto cam_buf = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -177,6 +180,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     b.radii                 = rad_buf->handle();
     b.tiles_touched         = tt_buf ->handle();
     b.camera_ubo            = cam_buf->handle();
+    b.radius_f              = rf_buf ->handle();
     pass_->bind_buffers(b);
 
     PreprocessPushConstants pc{};
@@ -202,12 +206,14 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     out.cov3D_inv     = nullptr;
     out.mean_offset   = nullptr;
     out.eval_3D       = false;
+    out.radius_f      = alloc.allocate_array<float>(static_cast<std::size_t>(N));
 
     m2d_buf->download(out.means2D,       static_cast<std::size_t>(N) * 2 * sizeof(float));
     dep_buf->download(out.depths,        static_cast<std::size_t>(N) * sizeof(float));
     rgb_buf->download(out.rgb,           static_cast<std::size_t>(N) * 3 * sizeof(float));
     rad_buf->download(out.radii,         static_cast<std::size_t>(N) * sizeof(int32_t));
     tt_buf ->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
+    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * sizeof(float));
 
     // Deinterleave packed {conic.a, conic.b, conic.c, opacity} (stride-4 per
     // Gaussian) into the CPU-reference layout: conics[N*3] and opacities_2d[N].
@@ -249,6 +255,7 @@ enum RecBufIdx : size_t {
     kRadii,
     kTilesTouched,
     kCameraUBO,
+    kRadiusF,    // binding 13: float eigenvalue radius (scatter fix)
     kRecBufCount,
 };
 }  // namespace
@@ -312,6 +319,8 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
         mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(int32_t));
     record_bufs_[kCameraUBO]           = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    record_bufs_[kRadiusF]             =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
 
     // --- 2. Upload inputs ----------------------------------------------------
     record_bufs_[kPositions]->upload(g.positions,
@@ -369,6 +378,7 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     b.radii                = record_bufs_[kRadii]               ->handle();
     b.tiles_touched        = record_bufs_[kTilesTouched]        ->handle();
     b.camera_ubo           = record_bufs_[kCameraUBO]           ->handle();
+    b.radius_f             = record_bufs_[kRadiusF]             ->handle();
     pass_->bind_buffers(b);
 }
 
@@ -415,4 +425,8 @@ VkBuffer PreprocessorVulkan::radii_buffer() const {
 VkBuffer PreprocessorVulkan::tiles_touched_buffer() const {
     return record_bufs_.empty() ? VK_NULL_HANDLE
                                 : record_bufs_[kTilesTouched]->handle();
+}
+VkBuffer PreprocessorVulkan::radius_f_buffer() const {
+    if (record_bufs_.size() <= kRadiusF) return VK_NULL_HANDLE;
+    return record_bufs_[kRadiusF] ? record_bufs_[kRadiusF]->handle() : VK_NULL_HANDLE;
 }

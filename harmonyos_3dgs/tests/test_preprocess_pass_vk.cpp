@@ -240,6 +240,43 @@ struct MinimalScene {
     float sh[3]   = {0, 0, 0};          // sh_degree=0 → 1 coeff * 3 = 3 floats
     float f3d[1]  = {0.0f};
 };
+
+// 64×64 camera looking down +Z (identity view, 60° FOV perspective).
+// Matches makeTestCamera() convention in test_preprocessor.cpp.
+Camera makePerspCamera() {
+    Camera cam{};
+    const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    std::memcpy(cam.view_matrix, id, sizeof(id));
+    // tan(30°) — half of 60° FOV
+    const float tfov = 0.57735027f;
+    cam.tan_fovx = tfov;
+    cam.tan_fovy = tfov;
+    cam.width  = 64;
+    cam.height = 64;
+    cam.cam_pos[0] = cam.cam_pos[1] = cam.cam_pos[2] = 0.0f;
+    // Column-major perspective (n=0.01, f=100). Layout matches GLSL mat4
+    // column-major: M[col][row]. viewproj_matrix[i] = element at col=(i/4), row=(i%4).
+    const float n = 0.01f, f = 100.0f;
+    const float nr = 1.0f / tfov;          // n/r = 1/tan_fov
+    std::memset(cam.viewproj_matrix, 0, sizeof(cam.viewproj_matrix));
+    cam.viewproj_matrix[0]  = nr;           // col0 row0
+    cam.viewproj_matrix[5]  = nr;           // col1 row1
+    cam.viewproj_matrix[10] = f / (f - n); // col2 row2
+    cam.viewproj_matrix[11] = 1.0f;        // col2 row3 (perspective w=z)
+    cam.viewproj_matrix[14] = -(f*n)/(f-n);// col3 row2
+    return cam;
+}
+
+RenderConfig makeBasicCfg() {
+    RenderConfig cfg{};
+    cfg.sh_degree     = 0;
+    cfg.training      = true;
+    cfg.eval_3D       = false;
+    cfg.tile_w        = 16;
+    cfg.tile_h        = 16;
+    cfg.scale_modifier = 1.0f;
+    return cfg;
+}
 }  // namespace
 
 TEST(PreprocessPass, RejectsEval3D) {
@@ -296,4 +333,108 @@ TEST(PreprocessPass, RejectsNon16Tile) {
     FrameAllocator alloc(1u * 1024u * 1024u);
     PreprocessorVulkan pp(ctx);
     EXPECT_THROW(pp.process(g, cam, cfg, alloc), std::runtime_error);
+}
+
+// =============================================================================
+// Cull-path tests (P1): for each early-return path in preprocess.comp, verify
+// that culled Gaussians produce radii=0, tiles_touched=0, and radius_f=0.0.
+// The radius_f assertion exercises the P0 scatter-fix invariant: culled
+// Gaussians must not leave a non-zero float radius in the SSBO (scatter.comp
+// reads radius_f to compute tile rects; a stale non-zero value would be UB).
+// =============================================================================
+
+// Near-plane cull (p_view.z ≤ 0.2).
+// G0 at world z=0.1 → p_view.z=0.1 with identity view → culled.
+// G1 at world z=5.0 → visible → radii>0, radius_f>0 (control Gaussian).
+TEST(PreprocessPass, CullPaths_NearPlane) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan device";
+
+    constexpr int N = 2;
+    float pos[N*3] = { 0,0,0.1f,  0,0,5.0f };
+    float scl[N*3] = { 1,1,1,     1,1,1 };
+    float rot[N*4] = { 1,0,0,0,   1,0,0,0 };
+    float opa[N]   = { 0.5f, 0.5f };
+    float sh[N*3]  = { 0,0,0,     0,0,0 };  // 1 coeff × 3 channels per Gaussian
+    float f3d[N]   = { 0.0f, 0.0f };
+
+    GaussianData g{};
+    g.count = N; g.sh_degree = 0; g.max_coeffs = 1;
+    g.positions = pos; g.scales = scl; g.rotations = rot;
+    g.opacities = opa; g.sh_coeffs = sh; g.filter_3D = f3d;
+
+    FrameAllocator alloc(4u * 1024u * 1024u);
+    PreprocessorVulkan pp(ctx);
+    auto out = pp.process(g, makePerspCamera(), makeBasicCfg(), alloc);
+
+    // G0: culled — near-plane.
+    EXPECT_EQ(out.radii[0], 0)         << "G0 (near-plane) radii != 0";
+    EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (near-plane) tiles_touched != 0";
+    ASSERT_NE(out.radius_f, nullptr);
+    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (near-plane) radius_f != 0.0";
+
+    // G1: visible — control check.
+    EXPECT_GT(out.radii[1], 0)         << "G1 (visible) radii should be > 0";
+    EXPECT_GT(out.tiles_touched[1], 0) << "G1 (visible) tiles_touched should be > 0";
+    EXPECT_GT(out.radius_f[1], 0.0f)   << "G1 (visible) radius_f should be > 0";
+}
+
+// Radius cull (my_radius > max(W, H)).
+// G0 at center screen (z=5) with scale=(1000,1000,1000).
+// Projected radius ≫ max(W=64, H=64) → radius_cull triggers.
+TEST(PreprocessPass, CullPaths_RadiusCull) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan device";
+
+    float pos[3] = { 0.0f, 0.0f, 5.0f };
+    float scl[3] = { 1000.0f, 1000.0f, 1000.0f };
+    float rot[4] = { 1,0,0,0 };
+    float opa[1] = { 0.5f };
+    float sh[3]  = { 0,0,0 };
+    float f3d[1] = { 0.0f };
+
+    GaussianData g{};
+    g.count = 1; g.sh_degree = 0; g.max_coeffs = 1;
+    g.positions = pos; g.scales = scl; g.rotations = rot;
+    g.opacities = opa; g.sh_coeffs = sh; g.filter_3D = f3d;
+
+    FrameAllocator alloc(4u * 1024u * 1024u);
+    PreprocessorVulkan pp(ctx);
+    auto out = pp.process(g, makePerspCamera(), makeBasicCfg(), alloc);
+
+    EXPECT_EQ(out.radii[0], 0)         << "G0 (radius-culled) radii != 0";
+    EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (radius-culled) tiles_touched != 0";
+    ASSERT_NE(out.radius_f, nullptr);
+    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (radius-culled) radius_f != 0.0";
+}
+
+// Zero-tiles cull (n_tiles == 0).
+// G0 at world (100, 0, 5): z=5 > 0.2 (passes near-plane), tiny scale → small radius
+// (passes radius_cull), but projected pixel_x ≈ 1140 >> screen width 64
+// → tile rect is entirely outside [0, grid_x=4) → n_tiles=0.
+TEST(PreprocessPass, CullPaths_ZeroTiles) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan device";
+
+    float pos[3] = { 100.0f, 0.0f, 5.0f };
+    float scl[3] = { 0.01f, 0.01f, 0.01f };
+    float rot[4] = { 1,0,0,0 };
+    float opa[1] = { 0.5f };
+    float sh[3]  = { 0,0,0 };
+    float f3d[1] = { 0.0f };
+
+    GaussianData g{};
+    g.count = 1; g.sh_degree = 0; g.max_coeffs = 1;
+    g.positions = pos; g.scales = scl; g.rotations = rot;
+    g.opacities = opa; g.sh_coeffs = sh; g.filter_3D = f3d;
+
+    FrameAllocator alloc(4u * 1024u * 1024u);
+    PreprocessorVulkan pp(ctx);
+    auto out = pp.process(g, makePerspCamera(), makeBasicCfg(), alloc);
+
+    // All tiles are outside the tile grid → zero-tiles cull.
+    EXPECT_EQ(out.radii[0], 0)         << "G0 (zero-tiles) radii != 0";
+    EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (zero-tiles) tiles_touched != 0";
+    ASSERT_NE(out.radius_f, nullptr);
+    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (zero-tiles) radius_f != 0.0";
 }

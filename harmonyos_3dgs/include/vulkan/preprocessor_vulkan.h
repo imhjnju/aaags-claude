@@ -70,6 +70,7 @@ public:
     VkBuffer rgb_buffer() const;
     VkBuffer radii_buffer() const;
     VkBuffer tiles_touched_buffer() const;
+    VkBuffer radius_f_buffer() const;
 
 private:
     VulkanContext& ctx_;
@@ -79,7 +80,7 @@ private:
     // re-allocated on the next prepare_record(). Index into this vector:
     //   0 positions, 1 scales, 2 rotations, 3 opacities, 4 sh, 5 filter_3D
     //   6 means2D,   7 depths, 8 conic_opacity_packed,
-    //   9 rgb,      10 radii, 11 tiles_touched, 12 camera_ubo
+    //   9 rgb,      10 radii, 11 tiles_touched, 12 camera_ubo, 13 radius_f
     // The mapping mirrors preprocess_bind:: for readability at call sites.
     std::vector<std::unique_ptr<VulkanBuffer>> record_bufs_;
 };

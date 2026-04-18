@@ -1,7 +1,7 @@
 #version 450
 
 // SP-2 preprocess.comp — per-Gaussian projection + 2D covariance + SH color.
-// Spec §4.8.1 (13 bindings + packed conic_opacity + training SH).
+// Spec §4.8.1 (14 bindings: 13 SSBO+1 UBO + 1 radius_f SSBO at binding 13).
 //
 // Numerical target: match the CPU reference in
 //   harmonyos_3dgs/src/cpu/preprocessor_cpu.cpp   (eval_3D=false, antialiasing=false)
@@ -55,6 +55,9 @@ layout(std430, set = 0, binding = 8)  writeonly buffer BufConicOp   { float coni
 layout(std430, set = 0, binding = 9)  writeonly buffer BufRGB       { float rgb[];        };
 layout(std430, set = 0, binding = 10) writeonly buffer BufRadii      { int   radii[];       };
 layout(std430, set = 0, binding = 11) writeonly buffer BufTiles      { int   tiles_touched[]; };
+
+// ---- Float radius SSBO (binding 13, after UBO at 12) -----------------------
+layout(std430, set = 0, binding = 13) writeonly buffer BufRadiusF    { float radius_f_arr[]; };
 
 // ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
 layout(std140, set = 0, binding = 12) uniform CameraUBO {
@@ -330,6 +333,7 @@ void main() {
     // Default outputs for culled paths.
     radii[i]         = 0;
     tiles_touched[i] = 0;
+    radius_f_arr[i]  = 0.0;
 
     vec3 position = vec3(positions[i*3u + 0u],
                          positions[i*3u + 1u],
@@ -440,4 +444,5 @@ void main() {
 
     radii[i]         = my_radius;
     tiles_touched[i] = n_tiles;
+    radius_f_arr[i]  = radius_f;  // exact float radius for scatter.comp (binding 13)
 }

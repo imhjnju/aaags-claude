@@ -147,6 +147,8 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         ctx_, bytes_float_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto rad_buf = std::make_unique<VulkanBuffer>(
         ctx_, bytes_int_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rf_buf  = std::make_unique<VulkanBuffer>(
+        ctx_, bytes_float_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     auto keys_buf = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(R) * sizeof(uint64_t),
@@ -158,6 +160,14 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     m2d_buf->upload(pre.means2D, static_cast<std::size_t>(bytes_float_N2));
     dep_buf->upload(pre.depths,  static_cast<std::size_t>(bytes_float_N));
     rad_buf->upload(pre.radii,   static_cast<std::size_t>(bytes_int_N));
+    if (pre.radius_f != nullptr) {
+        rf_buf->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N));
+    } else {
+        std::vector<float> rf_host(static_cast<std::size_t>(N));
+        for (int k = 0; k < N; ++k)
+            rf_host[static_cast<std::size_t>(k)] = static_cast<float>(pre.radii[k]);
+        rf_buf->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N));
+    }
 
     ScatterPass::Buffers sb{};
     sb.means2D         = m2d_buf->handle();
@@ -167,6 +177,7 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     sb.tiles_touched   = tt_buf ->handle();
     sb.keys_unsorted   = keys_buf->handle();
     sb.values_unsorted = vals_buf->handle();
+    sb.radius_f        = rf_buf ->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
@@ -198,7 +209,8 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
                                       VkBuffer tiles_touched,
                                       VkBuffer means2D,
                                       VkBuffer depths,
-                                      VkBuffer radii) {
+                                      VkBuffer radii,
+                                      VkBuffer radius_f) {
     if (N == 0u)
         throw std::runtime_error(
             "TileBinnerVulkan::prepare_record: N must be > 0");
@@ -246,6 +258,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     sb.tiles_touched   = tiles_touched;
     sb.keys_unsorted   = r_keys_buf_->handle();
     sb.values_unsorted = r_vals_buf_->handle();
+    sb.radius_f        = radius_f;
     scatter_pass_->bind_buffers(sb);
 
     // num_tiles_x/_y are used only at record() time (push constant) — nothing

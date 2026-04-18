@@ -19,6 +19,7 @@ constexpr uint32_t RGB                 = 9;
 constexpr uint32_t RADII               = 10;
 constexpr uint32_t TILES_TOUCHED       = 11;
 constexpr uint32_t CAMERA_UBO          = 12;
+constexpr uint32_t RADIUS_F            = 13;  // float eigenvalue radius (scatter fix)
 }  // namespace preprocess_bind
 
 // Push constants (24 bytes, spec §4.8.1)
@@ -62,6 +63,7 @@ constexpr uint32_t POINT_OFFSETS   = 3;
 constexpr uint32_t TILES_TOUCHED   = 4;
 constexpr uint32_t KEYS_UNSORTED   = 5;
 constexpr uint32_t VALUES_UNSORTED = 6;
+constexpr uint32_t RADIUS_F        = 7;  // float eigenvalue radius (read-only)
 }
 struct ScatterPushConstants {
     uint32_t num_gaussians;

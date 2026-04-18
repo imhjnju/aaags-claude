@@ -222,7 +222,8 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
             prep.tiles_touched_buffer(),
             prep.means2D_buffer(),
             prep.depths_buffer(),
-            prep.radii_buffer());
+            prep.radii_buffer(),
+            prep.radius_f_buffer());
         sorter.prepare_record(R_ours, num_tiles,
             binner.keys_unsorted_buf(),
             binner.values_unsorted_buf());

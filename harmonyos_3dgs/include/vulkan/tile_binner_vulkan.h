@@ -57,7 +57,8 @@ public:
                         VkBuffer tiles_touched,
                         VkBuffer means2D,
                         VkBuffer depths,
-                        VkBuffer radii);
+                        VkBuffer radii,
+                        VkBuffer radius_f);
 
     // Record prefix-scan + scatter into cmd. prepare_record() must have been
     // called. Inserts an internal barrier between scan and scatter (scatter

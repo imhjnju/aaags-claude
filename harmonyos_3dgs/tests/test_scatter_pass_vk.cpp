@@ -113,6 +113,13 @@ TEST(ScatterPassVk, TinyFixture) {
     VulkanBuffer keys_buf(ctx, static_cast<VkDeviceSize>(R) * sizeof(uint64_t));
     VulkanBuffer vals_buf(ctx, static_cast<VkDeviceSize>(R) * sizeof(uint32_t));
 
+    // radius_f: best approximation from int radii (no GPU preprocess output here)
+    std::vector<float> rf_host(N);
+    for (uint32_t k = 0; k < N; ++k)
+        rf_host[k] = static_cast<float>(rad_npy.i32()[k]);
+    VulkanBuffer rf_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    rf_buf.upload(rf_host.data(), static_cast<std::size_t>(N) * sizeof(float));
+
     m2d_buf.upload(m2d_npy.f32(), static_cast<std::size_t>(N) * 2 * sizeof(float));
     dep_buf.upload(dep_npy.f32(), static_cast<std::size_t>(N) * sizeof(float));
     rad_buf.upload(rad_npy.i32(), static_cast<std::size_t>(N) * sizeof(int32_t));
@@ -139,6 +146,7 @@ TEST(ScatterPassVk, TinyFixture) {
     sb.tiles_touched   = tt_buf .handle();
     sb.keys_unsorted   = keys_buf.handle();
     sb.values_unsorted = vals_buf.handle();
+    sb.radius_f        = rf_buf.handle();
     scatter.bind_buffers(sb);
     scatter.dispatch_sync(N, num_tiles_x, num_tiles_y);
 
@@ -222,22 +230,30 @@ TEST(ScatterPassVk, TinyFixture) {
         }
     }
 
-    // Report golden-comparison status for CI log visibility. A mismatch is
-    // NOT a hard failure — scatter.comp documents sub-pixel edge-case
-    // divergence from CUDA (see NUMERICAL CONTRACT comment in the shader),
-    // so the golden's R may differ from our R by a handful of pairs. The
-    // structural invariants above are the enforced contract.
+    // Report golden-comparison status for CI log visibility.
+    //
+    // This unit test passes radius_f = float(r_int) — the int-ceiled radius —
+    // because the only golden available is preprocess_radii.npy (int), not
+    // the true float eigenvalue radius emitted by the P0 scatter fix. When
+    // float(r_int) != true_radius_f (fractional edge cases), scatter's tile
+    // rect may differ from CUDA's, causing key-byte divergence even with a
+    // matching R. This is expected and is NOT a hard failure here.
+    //
+    // The definitive CUDA-match check is ForwardPipeline.FullChain_TinyFixture,
+    // which chains true GPU preprocess (emitting float radius) → scatter and
+    // confirms byte-exact match against rasterize_image.npy.
     if (!golden_available) {
         SUCCEED() << "No sort_{keys,values}_unsorted golden present — "
                      "structural checks are the only gate.";
     } else if (!golden_size_matches) {
         SUCCEED() << "Golden pair-count mismatch: golden_R=" << golden_R
                   << " vs host R=" << R
-                  << " (expected sub-pixel divergence — structural checks pass)";
+                  << " (float(r_int) proxy — ForwardPipeline test is authoritative)";
     } else if (golden_bytes_match) {
         SUCCEED() << "sort_{keys,values}_unsorted matched CUDA golden exactly";
     } else {
         SUCCEED() << "sort_{keys,values}_unsorted differs from CUDA golden "
-                     "(expected in sub-pixel edge cases — structural checks pass)";
+                     "(float(r_int) proxy — expected for fractional-radius Gaussians; "
+                     "ForwardPipeline.FullChain_TinyFixture is the authoritative check)";
     }
 }

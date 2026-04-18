@@ -27,32 +27,22 @@
 //   binding 4 = tiles_touched  (RO)   int[N]      — authoritative per-Gaussian count
 //   binding 5 = keys_unsorted  (WO)   uint64_t[R]
 //   binding 6 = values_unsorted(WO)   uint[R]
+//   binding 7 = radius_f       (RO)   float[N]    — float eigenvalue radius from preprocess
 // where R = sum(tiles_touched[0..N-1]).
 //
-// NUMERICAL CONTRACT (IMPORTANT — divergence from preprocess.comp):
+// NUMERICAL CONTRACT (P0 scatter float-radius fix applied):
 // ------------------------------------------------------------------
-// preprocess.comp stores ONLY the int-ceiled `my_radius = ceil(radius_f)` in
-// binding RADII, but computes `tiles_touched[i]` using the FLOAT `radius_f`.
-// This scatter shader only has access to the int radius, so it recomputes the
-// tile rect using `float(radii[i]) = ceil(radius_f)`, which can be STRICTLY
-// LARGER than the true float radius. When that happens, the rect computed
-// here may overlap MORE tiles than `tiles_touched[i]` reports.
+// preprocess.comp now exports the exact float `radius_f` at binding 13 (SSBO)
+// in addition to the int-ceiled `my_radius = ceil(radius_f)` in binding RADII.
+// This shader reads `radius_f_arr[i]` (binding 7) so the tile rect is computed
+// with the same float extent that preprocess used for tiles_touched[i].
+// This eliminates the divergence described below — the rect here is now
+// bit-exact with the preprocess rect, and slot == cap is guaranteed.
 //
-// Example divergence (pix.x=15.9, radius_f=0.05, tile_w=16):
+// Previous divergence (now fixed):
 //   preprocess: floor((15.9-0.05)/16)=0, ceil((15.9+0.05)/16)=1  -> 1 tile
-//   scatter    (r=1): floor((15.9-1)/16)=0, ceil((15.9+1)/16)=2  -> 2 tiles  (!)
-//
-// Safeguard in this shader: we iterate the full scatter-computed rect but cap
-// the number of pairs written at `tiles_touched[i]` so we NEVER overflow the
-// slot space reserved for this Gaussian by point_offsets. The extra tiles are
-// silently dropped — this slightly under-paints rather than corrupting memory.
-//
-// This is NOT bit-exact vs CUDA for those fractional edge cases, but keeps
-// memory safety and matches the tiles_touched/point_offsets math. Making it
-// bit-exact requires exporting `radius_f` as a new SSBO from preprocess; see
-// dev_notes/sp2 task T9 FOLLOWUP — deferred for now to keep T9 scope to the
-// shader + CMake (extending preprocess's 13-binding layout is a T10/follow-on
-// change).
+//   old scatter (r=1): floor((15.9-1)/16)=0, ceil((15.9+1)/16)=2 -> 2 tiles (!)
+//   new scatter (radius_f=0.05): same as preprocess -> 1 tile (correct)
 //
 // Iteration order must match preprocess.comp rect conventions:
 //   - floor((p - r)/tile) for min, ceil((p + r)/tile) for max
@@ -68,6 +58,7 @@ layout(std430, set = 0, binding = 3) readonly  buffer OffsetsIn     { uint     p
 layout(std430, set = 0, binding = 4) readonly  buffer TilesIn       { int      tiles_touched[];    };
 layout(std430, set = 0, binding = 5) writeonly buffer KeysOut       { uint64_t keys_unsorted[];    };
 layout(std430, set = 0, binding = 6) writeonly buffer ValuesOut     { uint     values_unsorted[];  };
+layout(std430, set = 0, binding = 7) readonly  buffer RadiusFIn     { float    radius_f_arr[];     };
 
 layout(push_constant) uniform PC {
     uint num_gaussians;
@@ -107,7 +98,7 @@ void main() {
     if (n_slots == 0) return;
 
     vec2  pix = vec2(means2D[i*2u + 0u], means2D[i*2u + 1u]);
-    float r   = float(r_int);  // see NUMERICAL CONTRACT note above
+    float r   = radius_f_arr[i];  // float eigenvalue radius from preprocess (binding 7)
 
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);

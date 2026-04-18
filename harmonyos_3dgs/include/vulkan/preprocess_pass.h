@@ -1,6 +1,6 @@
 // preprocess_pass.h -- Thin owner of the preprocess.comp compute pipeline
-// (spec §4.8.1). Holds the shader module, compute pipeline (with the 13
-// SSBO+UBO mixed binding layout), and one descriptor set. Provides two
+// (spec §4.8.1). Holds the shader module, compute pipeline (with the 14
+// bindings: 13 SSBO + 1 UBO mixed binding layout), and one descriptor set. Provides two
 // dispatch entry points:
 //   * dispatch_sync(): Layer 1 sync dispatch (used by tests/bring-up).
 //   * record():        Layer 2 external cmd buffer recording (used by the
@@ -21,7 +21,8 @@
 class PreprocessPass {
 public:
     /// Input + output buffers wired to bindings 0..11, plus the CameraUBO
-    /// at binding 12. Names mirror preprocess_bind:: indices exactly.
+    /// at binding 12 and radius_f SSBO at binding 13. Names mirror
+    /// preprocess_bind:: indices exactly.
     struct Buffers {
         // Inputs (SSBO, bindings 0..5)
         VkBuffer positions;
@@ -39,6 +40,8 @@ public:
         VkBuffer tiles_touched;
         // UBO (binding 12)
         VkBuffer camera_ubo;
+        // Float radius SSBO (binding 13)
+        VkBuffer radius_f;
     };
 
     /// @param spec_training 1=training (skip SH RGB clamp), 0=inference (clamp)
