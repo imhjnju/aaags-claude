@@ -180,9 +180,12 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(add_one _hdr_add_one)
         gs3d_compile_glsl(hello _spv_hello)
         gs3d_embed_spirv(hello _hdr_hello)
+        gs3d_compile_glsl(preprocess _spv_preprocess)
+        gs3d_embed_spirv(preprocess _hdr_preprocess)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
-                    ${_spv_hello} ${_hdr_hello})
+                    ${_spv_hello} ${_hdr_hello}
+                    ${_spv_preprocess} ${_hdr_preprocess})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
@@ -218,7 +221,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 SHADER_DIR="${_vk_shader_dir}")
             gtest_discover_tests(gs3d_vk_tests)
         endif()
-        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello)")
+        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello, preprocess)")
     else()
         message(STATUS "Vulkan SKIPPED (Vulkan=${Vulkan_FOUND}, glslangValidator=${GLSLANG_VALIDATOR})")
     endif()

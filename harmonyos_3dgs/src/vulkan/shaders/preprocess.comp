@@ -1,0 +1,419 @@
+#version 450
+
+// SP-2 preprocess.comp — per-Gaussian projection + 2D covariance + SH color.
+// Spec §4.8.1 (13 bindings + packed conic_opacity + training SH).
+//
+// Numerical target: match the CPU reference in
+//   harmonyos_3dgs/src/cpu/preprocessor_cpu.cpp   (eval_3D=false, antialiasing=false)
+//   harmonyos_3dgs/src/math_utils.cpp             (computeCov3D / computeCov2D)
+//   harmonyos_3dgs/src/sh_eval.cpp                (computeColorFromSH)
+//
+// Key numerical conventions we intentionally replicate:
+//   - GaussianData.scales     are already exp()-activated (ply_loader.cpp:exp)
+//     -> shader consumes them directly; do NOT apply exp() here.
+//   - GaussianData.opacities  are already sigmoid()-activated (ply_loader.cpp:sigmoid)
+//     -> shader writes `opacity_activated = opacities[i]` directly; NO sigmoid here.
+//     (Plan Task 4 step 10 says "sigmoid(raw_opacity)" but that contradicts CPU
+//      reference + types.h; matching CPU is required for golden parity.)
+//   - Quaternion order (r, x, y, z) per math_utils.cpp:quat2mat.
+//   - Pixel coordinate: ndc2Pix(v, S) = ((v+1)*S - 1) * 0.5
+//     (includes the -0.5 half-pixel offset; matches ndc2Pix in math_utils.h).
+//   - cov2D frustum clamp to 1.3x tan_fov (limx/limy) before Jacobian.
+//   - +0.3 low-pass dilation to cov2D diagonal.
+//   - eigenvalue floor: max(0.1, mid*mid - det).
+//   - radius cull: if radius > max(W,H) -> cull.
+//   - tile rect computed with getRect logic (clamp to grid bounds).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ---- Specialization constants -----------------------------------------------
+layout(constant_id = 0) const uint spec_training = 1u;  // 1 = training (no SH clamp upper)
+layout(constant_id = 1) const uint spec_eval_3D  = 0u;  // always 0 in SP-2
+
+// ---- Push constants (24 bytes, spec §4.8.1) --------------------------------
+layout(push_constant) uniform PC {
+    uint  num_gaussians;
+    uint  sh_degree;
+    uint  sh_coeffs_per_g;   // (sh_degree+1)^2
+    uint  num_tiles_x;
+    uint  num_tiles_y;
+    float scale_modifier;
+} pc;
+
+// ---- SSBOs (bindings 0..11) -------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly buffer BufPositions  { float positions[];  };
+layout(std430, set = 0, binding = 1)  readonly buffer BufScales     { float scales[];     };
+layout(std430, set = 0, binding = 2)  readonly buffer BufRotations  { float rotations[];  };
+layout(std430, set = 0, binding = 3)  readonly buffer BufOpacities  { float opacities[];  };
+layout(std430, set = 0, binding = 4)  readonly buffer BufSH         { float sh[];         };
+layout(std430, set = 0, binding = 5)  readonly buffer BufFilter3D   { float filter_3D[];  };
+
+layout(std430, set = 0, binding = 6)  writeonly buffer BufMeans2D   { float means2D[];    };
+layout(std430, set = 0, binding = 7)  writeonly buffer BufDepths    { float depths[];     };
+// Packed {conic.a, conic.b, conic.c, opacity} per Gaussian (stride 4 floats)
+layout(std430, set = 0, binding = 8)  writeonly buffer BufConicOp   { float conic_opacity_packed[]; };
+layout(std430, set = 0, binding = 9)  writeonly buffer BufRGB       { float rgb[];        };
+layout(std430, set = 0, binding = 10)          buffer BufRadii      { int   radii[];       };
+layout(std430, set = 0, binding = 11)          buffer BufTiles      { int   tiles_touched[]; };
+
+// ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
+layout(std140, set = 0, binding = 12) uniform CameraUBO {
+    mat4 viewmatrix;           // 64B
+    mat4 projmatrix;           // 64B (full view*proj)
+    mat4 inv_viewprojmatrix;   // 64B
+    vec4 campos_pad;           // 16B: xyz=campos, w=0
+    vec4 fov_size;             // 16B: x=tan_fovx, y=tan_fovy, z=width, w=height
+} cam;
+
+// ---- SH constants (from harmonyos_3dgs/src/sh_eval.cpp) ---------------------
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2_0 =  1.0925484305920792;
+const float SH_C2_1 = -1.0925484305920792;
+const float SH_C2_2 =  0.31539156525252005;
+const float SH_C2_3 = -1.0925484305920792;
+const float SH_C2_4 =  0.5462742152960396;
+const float SH_C3_0 = -0.5900435899266435;
+const float SH_C3_1 =  2.890611442640554;
+const float SH_C3_2 = -0.4570457994644658;
+const float SH_C3_3 =  0.3731763325901154;
+const float SH_C3_4 = -0.4570457994644658;
+const float SH_C3_5 =  1.445305721320277;
+const float SH_C3_6 = -0.5900435899266435;
+
+// -----------------------------------------------------------------------------
+// ndc2Pix: matches math_utils.h::ndc2Pix = ((v + 1) * S - 1) * 0.5
+// -----------------------------------------------------------------------------
+float ndc2Pix(float v, float S) {
+    return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+// -----------------------------------------------------------------------------
+// Build rotation matrix R (row-major conceptual: R[row][col])
+// from quaternion (r, x, y, z). Matches math_utils.cpp::quat2mat.
+// Returns 9 floats as mat3 stored so that R_mat[row][col] = out[row][col].
+// NOTE: GLSL mat3 is column-major, so to load "R[row][col]" semantically we
+// construct it column-by-column with R(col,row) = quat_rotation(row,col).
+// To keep the math clear we pass it around as a plain float[3][3] layout
+// using row-indexing from CPU code. We pack it into a mat3 whose operators
+// do not get used directly; instead we index it explicitly.
+// -----------------------------------------------------------------------------
+void quat2mat(vec4 rot, out float R[9]) {
+    // rot = (r, x, y, z)
+    float r = rot.x;
+    float x = rot.y;
+    float y = rot.z;
+    float z = rot.w;
+    // Row 0
+    R[0] = 1.0 - 2.0 * (y * y + z * z);
+    R[1] = 2.0 * (x * y + r * z);
+    R[2] = 2.0 * (x * z - r * y);
+    // Row 1
+    R[3] = 2.0 * (x * y - r * z);
+    R[4] = 1.0 - 2.0 * (x * x + z * z);
+    R[5] = 2.0 * (y * z + r * x);
+    // Row 2
+    R[6] = 2.0 * (x * z + r * y);
+    R[7] = 2.0 * (y * z - r * x);
+    R[8] = 1.0 - 2.0 * (x * x + y * y);
+}
+
+// R[row][col] access helper (row-major linearization)
+#define RMC(R_, r_, c_) R_[(r_) * 3 + (c_)]
+
+// -----------------------------------------------------------------------------
+// computeCov3D: Sigma = M^T * M, where M[i][j] = s[i] * R[i][j]
+// Matches math_utils.cpp::computeCov3D.
+// Output: cov3D[0..5] = [xx, xy, xz, yy, yz, zz] (upper triangle).
+// -----------------------------------------------------------------------------
+void computeCov3D(vec3 scale, float mod_, vec4 rot, out float cov3D[6]) {
+    float sx = mod_ * scale.x;
+    float sy = mod_ * scale.y;
+    float sz = mod_ * scale.z;
+
+    float R[9];
+    quat2mat(rot, R);
+
+    // M[i][j] = s[i] * R[i][j]
+    float M[9];
+    for (int j = 0; j < 3; j++) {
+        M[0 * 3 + j] = sx * R[0 * 3 + j];
+        M[1 * 3 + j] = sy * R[1 * 3 + j];
+        M[2 * 3 + j] = sz * R[2 * 3 + j];
+    }
+
+    // Sigma = M^T * M (symmetric). Sigma[r][c] = sum_k M[k][r] * M[k][c].
+    cov3D[0] = M[0]*M[0] + M[3]*M[3] + M[6]*M[6]; // [0][0]
+    cov3D[1] = M[0]*M[1] + M[3]*M[4] + M[6]*M[7]; // [0][1]
+    cov3D[2] = M[0]*M[2] + M[3]*M[5] + M[6]*M[8]; // [0][2]
+    cov3D[3] = M[1]*M[1] + M[4]*M[4] + M[7]*M[7]; // [1][1]
+    cov3D[4] = M[1]*M[2] + M[4]*M[5] + M[7]*M[8]; // [1][2]
+    cov3D[5] = M[2]*M[2] + M[5]*M[5] + M[8]*M[8]; // [2][2]
+}
+
+// -----------------------------------------------------------------------------
+// computeCov2D: project 3D covariance into 2D screen cov via Jacobian.
+// Matches math_utils.cpp::computeCov2D (which mirrors CUDA forward.cu).
+//
+// View matrix in CPU is column-major flat vm[16]: vm[col*4+row].
+// GLSL mat4 viewmatrix uses [col][row] indexing identically, so:
+//   W[col][row] = viewmatrix[col][row]  (for col,row in 0..2)
+//
+// J[col][row] (column-major), CPU convention:
+//   col0 = (fx/z, 0, -fx*tx/z^2)
+//   col1 = (0, fy/z, -fy*ty/z^2)
+//   col2 = (0, 0, 0)
+//
+// T = W * J      (mat3 multiply, both column-major)
+// tmp = Vrk * T  using Vrk[row][k] * T[col][k]
+//    (i.e. tmp[col][row] = sum_k Vrk[row][k] * T[col][k])
+// result = T^T * tmp      (cov2D = tranpose(T) * Vrk * T, Vrk symmetric)
+// -----------------------------------------------------------------------------
+void computeCov2D(vec3 mean3d, float cov3D[6],
+                  float focal_x, float focal_y,
+                  float tan_fovx, float tan_fovy,
+                  out vec3 cov2D_out)
+{
+    // mean3d -> view space. viewmatrix is column-major mat4.
+    vec4 t4 = cam.viewmatrix * vec4(mean3d, 1.0);
+    vec3 t = t4.xyz;
+
+    // Clamp to 1.3x frustum boundary (CPU lines 73-79).
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    t.x = min(limx, max(-limx, txtz)) * t.z;
+    t.y = min(limy, max(-limy, tytz)) * t.z;
+
+    // J (column-major, mat3).
+    mat3 J = mat3(
+        vec3(focal_x / t.z, 0.0, -(focal_x * t.x) / (t.z * t.z)),  // col 0
+        vec3(0.0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z)),  // col 1
+        vec3(0.0, 0.0, 0.0));                                       // col 2
+
+    // W = upper-left 3x3 of viewmatrix.
+    mat3 W = mat3(cam.viewmatrix);
+
+    // T = W * J
+    mat3 T = W * J;
+
+    // Vrk from upper-triangle cov3D.
+    mat3 Vrk = mat3(
+        vec3(cov3D[0], cov3D[1], cov3D[2]),  // col 0 (symmetric cov)
+        vec3(cov3D[1], cov3D[3], cov3D[4]),  // col 1
+        vec3(cov3D[2], cov3D[4], cov3D[5])); // col 2
+
+    // cov = transpose(T) * Vrk * T  (Vrk symmetric, so Vrk^T = Vrk)
+    mat3 result = transpose(T) * Vrk * T;
+
+    cov2D_out.x = result[0][0];   // a
+    cov2D_out.y = result[1][0];   // b  (column 1, row 0)
+    cov2D_out.z = result[1][1];   // c
+}
+
+// -----------------------------------------------------------------------------
+// Compute tile AABB using CPU getRect semantics (math_utils.cpp::getRect).
+//   rect_min.x = clamp((pix.x - r) / tile_w,                0, grid_x)
+//   rect_min.y = clamp((pix.y - r) / tile_h,                0, grid_y)
+//   rect_max.x = clamp((pix.x + r + tile_w-1) / tile_w,    0, grid_x)
+//   rect_max.y = clamp((pix.y + r + tile_h-1) / tile_h,    0, grid_y)
+// Tiles touched = (max.x - min.x) * (max.y - min.y).
+// Note: CPU uses integer division (truncating toward zero for positive ops;
+//       negative inputs floor differently, but rect is post-clamp to 0).
+// -----------------------------------------------------------------------------
+ivec2 rectMin(vec2 p, int r, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int((p.x - float(r)) / float(tile_w));
+    int my = int((p.y - float(r)) / float(tile_h));
+    // CPU uses std::min(grid, std::max(0, ...)) applied to (possibly negative) int.
+    // Emulate: clamp to [0, grid].
+    mx = min(grid_x, max(0, mx));
+    my = min(grid_y, max(0, my));
+    return ivec2(mx, my);
+}
+
+ivec2 rectMax(vec2 p, int r, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int((p.x + float(r) + float(tile_w) - 1.0) / float(tile_w));
+    int my = int((p.y + float(r) + float(tile_h) - 1.0) / float(tile_h));
+    mx = min(grid_x, max(0, mx));
+    my = min(grid_y, max(0, my));
+    return ivec2(mx, my);
+}
+
+// -----------------------------------------------------------------------------
+// SH evaluation — matches harmonyos_3dgs/src/sh_eval.cpp::computeColorFromSH.
+// sh layout: sh[i * K * 3 + k*3 + ch] where K = sh_coeffs_per_g.
+//
+// Training mode: only lower-clamp rgb+0.5 to 0; do NOT clamp upper (kills grad).
+// Inference mode (spec_training == 0): clamp to [0, 1].
+// -----------------------------------------------------------------------------
+vec3 shToRGB(uint i, vec3 pos, vec3 cam_pos, uint sh_degree, uint K) {
+    // normalized view dir (from camera to Gaussian center)
+    vec3 dir = pos - cam_pos;
+    dir = normalize(dir);
+    float x = dir.x, y = dir.y, z = dir.z;
+
+    uint base = i * K * 3u;
+
+    // Degree 0
+    vec3 result = SH_C0 * vec3(sh[base + 0u*3u + 0u],
+                               sh[base + 0u*3u + 1u],
+                               sh[base + 0u*3u + 2u]);
+
+    if (sh_degree > 0u) {
+        vec3 sh1 = vec3(sh[base + 1u*3u + 0u], sh[base + 1u*3u + 1u], sh[base + 1u*3u + 2u]);
+        vec3 sh2 = vec3(sh[base + 2u*3u + 0u], sh[base + 2u*3u + 1u], sh[base + 2u*3u + 2u]);
+        vec3 sh3 = vec3(sh[base + 3u*3u + 0u], sh[base + 3u*3u + 1u], sh[base + 3u*3u + 2u]);
+        result += -SH_C1 * y * sh1 + SH_C1 * z * sh2 - SH_C1 * x * sh3;
+
+        if (sh_degree > 1u) {
+            float xx = x*x, yy = y*y, zz = z*z;
+            float xy = x*y, yz = y*z, xz = x*z;
+            vec3 sh4 = vec3(sh[base + 4u*3u + 0u], sh[base + 4u*3u + 1u], sh[base + 4u*3u + 2u]);
+            vec3 sh5 = vec3(sh[base + 5u*3u + 0u], sh[base + 5u*3u + 1u], sh[base + 5u*3u + 2u]);
+            vec3 sh6 = vec3(sh[base + 6u*3u + 0u], sh[base + 6u*3u + 1u], sh[base + 6u*3u + 2u]);
+            vec3 sh7 = vec3(sh[base + 7u*3u + 0u], sh[base + 7u*3u + 1u], sh[base + 7u*3u + 2u]);
+            vec3 sh8 = vec3(sh[base + 8u*3u + 0u], sh[base + 8u*3u + 1u], sh[base + 8u*3u + 2u]);
+            result += SH_C2_0 * xy * sh4
+                   +  SH_C2_1 * yz * sh5
+                   +  SH_C2_2 * (2.0*zz - xx - yy) * sh6
+                   +  SH_C2_3 * xz * sh7
+                   +  SH_C2_4 * (xx - yy) * sh8;
+
+            if (sh_degree > 2u) {
+                vec3 sh9  = vec3(sh[base +  9u*3u + 0u], sh[base +  9u*3u + 1u], sh[base +  9u*3u + 2u]);
+                vec3 sh10 = vec3(sh[base + 10u*3u + 0u], sh[base + 10u*3u + 1u], sh[base + 10u*3u + 2u]);
+                vec3 sh11 = vec3(sh[base + 11u*3u + 0u], sh[base + 11u*3u + 1u], sh[base + 11u*3u + 2u]);
+                vec3 sh12 = vec3(sh[base + 12u*3u + 0u], sh[base + 12u*3u + 1u], sh[base + 12u*3u + 2u]);
+                vec3 sh13 = vec3(sh[base + 13u*3u + 0u], sh[base + 13u*3u + 1u], sh[base + 13u*3u + 2u]);
+                vec3 sh14 = vec3(sh[base + 14u*3u + 0u], sh[base + 14u*3u + 1u], sh[base + 14u*3u + 2u]);
+                vec3 sh15 = vec3(sh[base + 15u*3u + 0u], sh[base + 15u*3u + 1u], sh[base + 15u*3u + 2u]);
+                result += SH_C3_0 * y * (3.0*xx - yy) * sh9
+                       +  SH_C3_1 * xy * z * sh10
+                       +  SH_C3_2 * y * (4.0*zz - xx - yy) * sh11
+                       +  SH_C3_3 * z * (2.0*zz - 3.0*xx - 3.0*yy) * sh12
+                       +  SH_C3_4 * x * (4.0*zz - xx - yy) * sh13
+                       +  SH_C3_5 * z * (xx - yy) * sh14
+                       +  SH_C3_6 * x * (xx - 3.0*yy) * sh15;
+            }
+        }
+    }
+
+    result += vec3(0.5);
+    result = max(result, vec3(0.0));
+    if (spec_training == 0u) {
+        result = min(result, vec3(1.0));
+    }
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_gaussians) return;
+
+    // Default outputs for culled paths.
+    radii[i]         = 0;
+    tiles_touched[i] = 0;
+
+    vec3 position = vec3(positions[i*3u + 0u],
+                         positions[i*3u + 1u],
+                         positions[i*3u + 2u]);
+
+    // 3. World -> view (near-plane cull).
+    vec4 p_view4 = cam.viewmatrix * vec4(position, 1.0);
+    vec3 p_view  = p_view4.xyz;
+    if (p_view.z <= 0.2) return;   // CPU uses <= 0.2 in the 2D path.
+
+    // 4. View -> clip -> NDC -> pixel using ndc2Pix (matches CPU).
+    vec4 p_hom = cam.projmatrix * vec4(position, 1.0);
+    float p_w  = 1.0 / (p_hom.w + 1e-7);
+    vec3 p_ndc = vec3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
+
+    float width  = cam.fov_size.z;
+    float height = cam.fov_size.w;
+    float pixel_x = ndc2Pix(p_ndc.x, width);
+    float pixel_y = ndc2Pix(p_ndc.y, height);
+
+    // 5. cov3D.
+    vec3 scale = vec3(scales[i*3u + 0u], scales[i*3u + 1u], scales[i*3u + 2u]);
+    vec4 rot   = vec4(rotations[i*4u + 0u], rotations[i*4u + 1u],
+                      rotations[i*4u + 2u], rotations[i*4u + 3u]);
+    float cov3D[6];
+    computeCov3D(scale, pc.scale_modifier, rot, cov3D);
+
+    // 6. cov2D via Jacobian.
+    float tan_fovx = cam.fov_size.x;
+    float tan_fovy = cam.fov_size.y;
+    float focal_x = width  / (2.0 * tan_fovx);
+    float focal_y = height / (2.0 * tan_fovy);
+    vec3 cov2D;
+    computeCov2D(position, cov3D, focal_x, focal_y, tan_fovx, tan_fovy, cov2D);
+
+    // 7. Dilate cov2D (AAA 0.3 low-pass filter; antialiasing=false for SP-2).
+    cov2D.x += 0.3;
+    cov2D.z += 0.3;
+
+    // 8. Determinant.
+    float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    if (det == 0.0) return;  // CPU tests `det == 0.0f`.
+
+    // 9. Conic = inverse(cov2D) upper triangle.
+    float det_inv = 1.0 / det;
+    vec3 conic = vec3(cov2D.z * det_inv,  // a
+                      -cov2D.y * det_inv, // b
+                      cov2D.x * det_inv); // c
+
+    // 12. Radius from eigenvalues (CPU uses max(0.1f, mid*mid - det)).
+    float mid = 0.5 * (cov2D.x + cov2D.z);
+    float disc = max(0.1, mid * mid - det);
+    float sq   = sqrt(disc);
+    float lambda1 = mid + sq;
+    float lambda2 = mid - sq;
+    int my_radius = int(ceil(3.0 * sqrt(max(lambda1, lambda2))));
+
+    // Radius cull: if radius > max(W,H), drop (matches CPU).
+    int max_screen_dim = int(max(width, height));
+    if (my_radius > max_screen_dim) return;
+
+    // 13. Tile AABB.
+    // tile_w/tile_h fixed to 16 per spec §4.4 SP-2. Grid comes from push consts.
+    const int TILE_W = 16;
+    const int TILE_H = 16;
+    int grid_x = int(pc.num_tiles_x);
+    int grid_y = int(pc.num_tiles_y);
+    vec2 pix  = vec2(pixel_x, pixel_y);
+    ivec2 rmn = rectMin(pix, my_radius, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmx = rectMax(pix, my_radius, grid_x, grid_y, TILE_W, TILE_H);
+    int n_tiles = (rmx.x - rmn.x) * (rmx.y - rmn.y);
+    if (n_tiles == 0) return;
+
+    // 15. SH → RGB.
+    vec3 cam_pos = cam.campos_pad.xyz;
+    vec3 color = shToRGB(i, position, cam_pos, pc.sh_degree, pc.sh_coeffs_per_g);
+
+    // 10. Opacity — GaussianData.opacities is already sigmoid-activated.
+    //     CPU: out.opacities_2d[i] = g.opacities[i] * h_conv_scaling
+    //          with antialiasing=false ⇒ h_conv_scaling = 1.0
+    float opacity_activated = opacities[i];
+
+    // ---- Writes ----
+    // 11. Packed conic_opacity.
+    conic_opacity_packed[i*4u + 0u] = conic.x;
+    conic_opacity_packed[i*4u + 1u] = conic.y;
+    conic_opacity_packed[i*4u + 2u] = conic.z;
+    conic_opacity_packed[i*4u + 3u] = opacity_activated;
+
+    // 14. Per-Gaussian outputs.
+    means2D[i*2u + 0u] = pixel_x;
+    means2D[i*2u + 1u] = pixel_y;
+    depths[i]          = p_view.z;
+    rgb[i*3u + 0u]     = color.x;
+    rgb[i*3u + 1u]     = color.y;
+    rgb[i*3u + 2u]     = color.z;
+
+    radii[i]         = my_radius;
+    tiles_touched[i] = n_tiles;
+}
