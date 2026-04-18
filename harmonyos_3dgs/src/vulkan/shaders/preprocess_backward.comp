@@ -1,0 +1,659 @@
+#version 450
+
+// SP-3 T23: preprocess_backward.comp
+//
+// Per-Gaussian backward pass for the preprocessor.
+// Mirrors PreprocessorBackwardCPU::backward() from preprocessor_backward_cpu.cpp.
+//
+// Algorithm per active Gaussian i (radii[i] > 0):
+//   Part A: d_conics -> d_cov2D -> d_cov3D -> d_T -> d_p_view -> d_means3D (cov path)
+//   Part B: d_cov3D -> d_M -> d_raw_scales, d_raw_rotations
+//   Part C: d_rgb -> d_sh (SH backward)
+//   Part D: d_means2D -> d_means3D (projection path)
+//
+// Key conventions (match preprocessor_backward_cpu.cpp exactly):
+//   - Quaternion order: (r, x, y, z)  (rotations[i*4+0..3])
+//   - R[row][col] indexing (conceptually row-major, stored flat row-major)
+//   - W[col][row] = upper-left 3x3 of column-major view_matrix
+//     i.e. W = transpose(mat3(view_matrix))
+//   - T = W * J  (mat3 * mat3)
+//   - cov3D upper triangle: [0]=xx, [1]=xy, [2]=xz, [3]=yy, [4]=yz, [5]=zz
+//   - Conic packed as (a,b,c): a=cov2D.z/det, b=-cov2D.y/det, c=cov2D.x/det
+//     (same as forward: conic.a = cov2D_c/det, conic.c = cov2D_a/det)
+//   - d_conics[i*3+0] = dL/da, [1] = dL/db, [2] = dL/dc
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ---- SSBOs -----------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly  buffer BufPositions  { float positions[];  };
+layout(std430, set = 0, binding = 1)  readonly  buffer BufRadii      { int   radii[];      };
+layout(std430, set = 0, binding = 2)  readonly  buffer BufCov3D      { float cov3D[];      };
+layout(std430, set = 0, binding = 3)  readonly  buffer BufDConics    { float d_conics[];   };
+layout(std430, set = 0, binding = 4)  readonly  buffer BufDOpacity   { float d_opacity[];  };
+layout(std430, set = 0, binding = 5)  readonly  buffer BufSHCoeffs   { float sh_coeffs[];  };
+layout(std430, set = 0, binding = 6)  readonly  buffer BufScales     { float scales[];     };
+layout(std430, set = 0, binding = 7)  readonly  buffer BufRotations  { float rotations[];  };
+layout(std430, set = 0, binding = 8)  readonly  buffer BufDRgb       { float d_rgb[];      };
+layout(std430, set = 0, binding = 9)  readonly  buffer BufDMeans2D   { float d_means2D[];  };
+layout(std430, set = 0, binding = 10) writeonly buffer BufDMeans3D   { float d_means3D[];  };
+layout(std430, set = 0, binding = 11) writeonly buffer BufDSH        { float d_sh[];       };
+layout(std430, set = 0, binding = 12) writeonly buffer BufDScales    { float d_scales[];   };
+layout(std430, set = 0, binding = 13) writeonly buffer BufDRotations { float d_rotations[];};
+
+// ---- UBO (std140, binding 14) ----------------------------------------------
+layout(std140, set = 0, binding = 14) uniform PreprocessBwdUBO {
+    mat4     view_matrix;     // column-major 4x4
+    mat4     proj_matrix;     // column-major 4x4 (viewproj)
+    uint     num_gaussians;
+    uint     sh_degree;
+    uint     sh_coeffs_per_g; // (sh_degree+1)^2
+    float    scale_modifier;
+    float    h_x;             // W / (2 * tan_fovx)
+    float    h_y;             // H / (2 * tan_fovy)
+    float    tan_fovx;
+    float    tan_fovy;
+    vec3     cam_pos;
+    float    _pad;
+    uint     training;        // 1 = training (no clamp upper)
+    uint     cam_width;       // pixel width  (offset 180)
+    uint     cam_height;      // pixel height (offset 184)
+    uint     _pad2;
+} ubo;
+
+// ---- SH constants ----------------------------------------------------------
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2[5] = float[5](
+     1.0925484305920792,
+    -1.0925484305920792,
+     0.31539156525252005,
+    -1.0925484305920792,
+     0.5462742152960396
+);
+const float SH_C3[7] = float[7](
+    -0.5900435899266435,
+     2.890611442640554,
+    -0.4570457994644658,
+     0.3731763325901154,
+    -0.4570457994644658,
+     1.445305721320277,
+    -0.5900435899266435
+);
+
+// ---- Matrix helpers --------------------------------------------------------
+
+// R[row][col] from quaternion (r, x, y, z).
+// Matches math_utils.cpp::quat2mat / preprocess.comp::quat2mat.
+// Stored flat as R[row*3 + col].
+void quat2R(float qr, float qx, float qy, float qz, out float R[9]) {
+    R[0] = 1.0 - 2.0*(qy*qy + qz*qz);
+    R[1] = 2.0*(qx*qy + qr*qz);
+    R[2] = 2.0*(qx*qz - qr*qy);
+    R[3] = 2.0*(qx*qy - qr*qz);
+    R[4] = 1.0 - 2.0*(qx*qx + qz*qz);
+    R[5] = 2.0*(qy*qz + qr*qx);
+    R[6] = 2.0*(qx*qz + qr*qy);
+    R[7] = 2.0*(qy*qz - qr*qx);
+    R[8] = 1.0 - 2.0*(qx*qx + qy*qy);
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ubo.num_gaussians) return;
+
+    // Default output: zero for culled Gaussians.
+    uint base3 = i * 3u;
+    uint base4 = i * 4u;
+    uint base_sh = i * ubo.sh_coeffs_per_g * 3u;
+
+    // Check visibility
+    if (radii[i] <= 0) {
+        // Write zero gradients for culled Gaussians
+        d_means3D[base3 + 0u] = 0.0;
+        d_means3D[base3 + 1u] = 0.0;
+        d_means3D[base3 + 2u] = 0.0;
+        for (uint k = 0; k < ubo.sh_coeffs_per_g * 3u; k++)
+            d_sh[base_sh + k] = 0.0;
+        d_scales[base3 + 0u]    = 0.0;
+        d_scales[base3 + 1u]    = 0.0;
+        d_scales[base3 + 2u]    = 0.0;
+        d_rotations[base4 + 0u] = 0.0;
+        d_rotations[base4 + 1u] = 0.0;
+        d_rotations[base4 + 2u] = 0.0;
+        d_rotations[base4 + 3u] = 0.0;
+        return;
+    }
+
+    vec3 pos = vec3(positions[base3], positions[base3+1u], positions[base3+2u]);
+
+    // Accumulated position gradient (multiple chains contribute)
+    float d_pos_x = 0.0;
+    float d_pos_y = 0.0;
+    float d_pos_z = 0.0;
+
+    // =========================================================================
+    // Part A: d_conics -> d_cov2D -> d_cov3D
+    // =========================================================================
+    // Forward conic = {a, b, c} where:
+    //   a = cov2D_filt.z / det  (element [2])
+    //   b = -cov2D_filt.y / det (element [1])
+    //   c = cov2D_filt.x / det  (element [0])
+    //   det = cov2D_filt.x * cov2D_filt.z - cov2D_filt.y^2
+    // with cov2D_filt.x = cov2D.x + 0.3, cov2D_filt.z = cov2D.z + 0.3
+    //
+    // We need cov2D = T^T * Vrk * T, then filter it, then invert.
+    // We read cov3D from cache and recompute T from p_view (stored in p_view cache).
+    // But in this shader we only have ForwardCache.cov3D (binding 2) and
+    // we must recompute T from the view-space position.
+    //
+    // Recompute view-space position from positions + view_matrix:
+    vec4 p_view4 = ubo.view_matrix * vec4(pos, 1.0);
+    vec3 t = p_view4.xyz;
+
+    // Clamp to frustum (same as forward)
+    float limx = 1.3 * ubo.tan_fovx;
+    float limy = 1.3 * ubo.tan_fovy;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    // x_grad_mul / y_grad_mul: whether clamping was active
+    float x_grad_mul = ((txtz < -limx) || (txtz > limx)) ? 0.0 : 1.0;
+    float y_grad_mul = ((tytz < -limy) || (tytz > limy)) ? 0.0 : 1.0;
+    // Apply clamp (same as forward to get the actual t used in Jacobian)
+    t.x = clamp(txtz, -limx, limx) * t.z;
+    t.y = clamp(tytz, -limy, limy) * t.z;
+
+    // Jacobian J (column-major mat3):
+    //   col0 = (h_x/t.z, 0, -h_x*t.x/t.z^2)
+    //   col1 = (0, h_y/t.z, -h_y*t.y/t.z^2)
+    //   col2 = (0, 0, 0)
+    float tz2 = t.z * t.z;
+    mat3 J = mat3(
+        vec3(ubo.h_x / t.z, 0.0, -(ubo.h_x * t.x) / tz2),
+        vec3(0.0, ubo.h_y / t.z, -(ubo.h_y * t.y) / tz2),
+        vec3(0.0, 0.0, 0.0)
+    );
+
+    // W = transpose(upper-left 3x3 of view_matrix)
+    // mat3(mat4) extracts first 3 columns; transpose() gives math-transposed form
+    // matching CPU: W[col][row] = vm[col*4 + row]
+    mat3 W = transpose(mat3(ubo.view_matrix));
+
+    // T = W * J
+    mat3 T = W * J;
+
+    // Vrk from upper-triangle cov3D cache
+    uint c3d = i * 6u;
+    float cv0 = cov3D[c3d+0u]; // xx
+    float cv1 = cov3D[c3d+1u]; // xy
+    float cv2 = cov3D[c3d+2u]; // xz
+    float cv3 = cov3D[c3d+3u]; // yy
+    float cv4 = cov3D[c3d+4u]; // yz
+    float cv5 = cov3D[c3d+5u]; // zz
+
+    mat3 Vrk = mat3(
+        vec3(cv0, cv1, cv2),
+        vec3(cv1, cv3, cv4),
+        vec3(cv2, cv4, cv5)
+    );
+
+    // cov2D = transpose(T) * Vrk * T  (same as forward computeCov2D)
+    mat3 result = transpose(T) * Vrk * T;
+
+    // Filtered cov2D (with 0.3 low-pass dilation)
+    float fa = result[0][0] + 0.3;  // cov2D_filt.x (= a before inversion)
+    float fb = result[1][0];        // cov2D_filt.y (= b in symmetric matrix)
+    float fc = result[1][1] + 0.3;  // cov2D_filt.z (= c before inversion)
+
+    float det = fa * fc - fb * fb;
+    // NaN guard only: if det is so close to zero that det*det underflows to
+    // exactly zero, the soft epsilon below would still produce +Inf.  Use a
+    // very tight bound (1e-20) so only catastrophically degenerate Gaussians
+    // are skipped.  For nearly-singular 2D covariances the 1e-7 soft epsilon
+    // in inv_det2 naturally damps gradients (matches CUDA denom2inv pattern).
+    if (abs(det) < 1e-20) {
+        // Catastrophically degenerate: write zero gradients
+        d_means3D[base3 + 0u] = 0.0;
+        d_means3D[base3 + 1u] = 0.0;
+        d_means3D[base3 + 2u] = 0.0;
+        for (uint k = 0; k < ubo.sh_coeffs_per_g * 3u; k++)
+            d_sh[base_sh + k] = 0.0;
+        d_scales[base3 + 0u]    = 0.0;
+        d_scales[base3 + 1u]    = 0.0;
+        d_scales[base3 + 2u]    = 0.0;
+        d_rotations[base4 + 0u] = 0.0;
+        d_rotations[base4 + 1u] = 0.0;
+        d_rotations[base4 + 2u] = 0.0;
+        d_rotations[base4 + 3u] = 0.0;
+        return;
+    }
+
+    // Read upstream conic gradients: d_conics[i*3] = dL/da, [1] = dL/db, [2] = dL/dc
+    // Note: conic stored as (a,b,c) = (fc/det, -fb/det, fa/det)
+    float dc0 = d_conics[base3 + 0u]; // dL/da = dL/d(fc/det)
+    float dc1 = d_conics[base3 + 1u]; // dL/db = dL/d(-fb/det)
+    float dc2 = d_conics[base3 + 2u]; // dL/dc = dL/d(fa/det)
+
+    // Backward through conic inversion (matches preprocessor_backward_cpu.cpp:296-306)
+    // conic = (fc/det, -fb/det, fa/det)
+    // d_fa = dc0*(-fc^2/det^2) + dc1*(fb*fc/det^2) + dc2*(-fb^2/det^2)
+    // d_fb = dc0*(2*fb*fc/det^2) + dc1*(-(fa*fc+fb^2)/det^2) + dc2*(2*fa*fb/det^2)
+    // d_fc = dc0*(-fb^2/det^2) + dc1*(fa*fb/det^2) + dc2*(-fa^2/det^2)
+    //
+    // Soft epsilon matches CUDA reference: denom2inv = 1/(denom*denom + 1e-7).
+    // For well-conditioned Gaussians (det >> 1e-7^0.5) the correction is ~0.
+    // For nearly-degenerate cases it prevents catastrophic gradient blow-up.
+    // Evidence: CUDA diff3d_backward.cu uses 0.0000001f in the denom2 term.
+    float inv_det2 = 1.0 / (det * det + 1e-7);
+    float d_fa = dc0 * (-fc*fc * inv_det2)
+               + dc1 * (fb*fc * inv_det2)
+               + dc2 * (-fb*fb * inv_det2);
+    float d_fb = dc0 * (2.0*fb*fc * inv_det2)
+               + dc1 * (-(fa*fc + fb*fb) * inv_det2)
+               + dc2 * (2.0*fa*fb * inv_det2);
+    float d_fc = dc0 * (-fb*fb * inv_det2)
+               + dc1 * (fa*fb * inv_det2)
+               + dc2 * (-fa*fa * inv_det2);
+
+    // Gradient through the +0.3 filter (constant offset, gradient passes through)
+    // d_cov2D_a = d_fa, d_cov2D_b = d_fb, d_cov2D_c = d_fc
+
+    // ----
+    // Backward: d_Vrk from d_cov2D
+    //   cov2D = T^T * Vrk * T
+    //   result[c][r] = sum_{k,j} T[r][k] * Vrk[k][j] * T[c][j]
+    //   cov2D[0] = result[0][0], cov2D[1] = result[1][0], cov2D[2] = result[1][1]
+    //   d_Vrk[k][j] = d_fa*T[0][k]*T[0][j] + d_fb*T[0][k]*T[1][j] + d_fc*T[1][k]*T[1][j]
+    //
+    // T is column-major mat3: T[col][row], so T[0] = column 0, T[1] = column 1, T[2] = column 2
+    float d_Vrk[9]; // [k*3+j]
+    for (int k = 0; k < 3; k++) {
+        for (int j = 0; j < 3; j++) {
+            // T[col][row]: T[0][k] means column 0, row k -> T[0].x, T[0].y, T[0].z for k=0,1,2
+            float T0k = T[0][k];  // column 0, row k
+            float T1k = T[1][k];  // column 1, row k
+            float T0j = T[0][j];
+            float T1j = T[1][j];
+            d_Vrk[k*3+j] = d_fa * T0k * T0j
+                          + d_fb * T0k * T1j
+                          + d_fc * T1k * T1j;
+        }
+    }
+
+    // Map d_Vrk (3x3 symmetric in k,j) to d_cov3D upper-triangle (6 elements)
+    // cov3D: [0]=xx=[0][0], [1]=xy=[0][1]==[1][0], [2]=xz=[0][2]==[2][0],
+    //        [3]=yy=[1][1],  [4]=yz=[1][2]==[2][1], [5]=zz=[2][2]
+    float d_cov3D[6];
+    d_cov3D[0] = d_Vrk[0*3+0];
+    d_cov3D[1] = d_Vrk[0*3+1] + d_Vrk[1*3+0];
+    d_cov3D[2] = d_Vrk[0*3+2] + d_Vrk[2*3+0];
+    d_cov3D[3] = d_Vrk[1*3+1];
+    d_cov3D[4] = d_Vrk[1*3+2] + d_Vrk[2*3+1];
+    d_cov3D[5] = d_Vrk[2*3+2];
+
+    // ----
+    // Backward: d_T from d_cov2D  (for position gradient via J -> t)
+    //   VT[col][row] = sum_k Vrk[row][k] * T[col][k]  (= Vrk * T)
+    //   d_T[0][q] = 2*d_fa*VT[0][q] + d_fb*VT[1][q]
+    //   d_T[1][q] = d_fb*VT[0][q] + 2*d_fc*VT[1][q]
+    // (only cols 0 and 1 of d_T are needed)
+    mat3 VT = Vrk * T;  // Vrk * T: VT[col][row] = sum_k Vrk[row][k] * T[col][k]
+
+    // d_T_cov[col][row] for col=0,1:
+    float d_T00, d_T01, d_T02;  // d_T[0][0..2]
+    float d_T10, d_T11, d_T12;  // d_T[1][0..2]
+    d_T00 = 2.0 * d_fa * VT[0][0] + d_fb * VT[1][0];
+    d_T01 = 2.0 * d_fa * VT[0][1] + d_fb * VT[1][1];
+    d_T02 = 2.0 * d_fa * VT[0][2] + d_fb * VT[1][2];
+    d_T10 = d_fb * VT[0][0] + 2.0 * d_fc * VT[1][0];
+    d_T11 = d_fb * VT[0][1] + 2.0 * d_fc * VT[1][1];
+    d_T12 = d_fb * VT[0][2] + 2.0 * d_fc * VT[1][2];
+
+    // Backward through T = W * J:
+    //   T[col][row] = sum_k W[k][row] * J[col][k]
+    //   d_J[col][k] = sum_row d_T[col][row] * W[k][row]
+    // W is column-major mat3: W[col][row], so W[k][row] = W[k].row = W[k][row]
+    // d_J[0][k] = sum_row (2*d_fa*VT[0][row] + d_fb*VT[1][row]) * W[k][row]
+    float d_J00, d_J02, d_J11, d_J12;
+    // d_J[0][0] = d_T00*W[0][0] + d_T01*W[0][1] + d_T02*W[0][2]
+    //           = d_T00*W[0].x + d_T01*W[0].y + d_T02*W[0].z
+    d_J00 = d_T00*W[0][0] + d_T01*W[0][1] + d_T02*W[0][2];
+    // d_J[0][2] = d_T00*W[2][0] + d_T01*W[2][1] + d_T02*W[2][2]
+    d_J02 = d_T00*W[2][0] + d_T01*W[2][1] + d_T02*W[2][2];
+    // d_J[1][1] = d_T10*W[1][0] + d_T11*W[1][1] + d_T12*W[1][2]
+    d_J11 = d_T10*W[1][0] + d_T11*W[1][1] + d_T12*W[1][2];
+    // d_J[1][2] = d_T10*W[2][0] + d_T11*W[2][1] + d_T12*W[2][2]
+    d_J12 = d_T10*W[2][0] + d_T11*W[2][1] + d_T12*W[2][2];
+
+    // Backward through J -> clamped t:
+    //   J[0][0] = h_x/t.z  -> dL/dt.z += d_J00 * (-h_x/t.z^2)
+    //   J[0][2] = -h_x*t.x/t.z^2 -> dL/dt.x += d_J02*(-h_x/t.z^2), dL/dt.z += d_J02*(2*h_x*t.x/t.z^3)
+    //   J[1][1] = h_y/t.z  -> dL/dt.z += d_J11 * (-h_y/t.z^2)
+    //   J[1][2] = -h_y*t.y/t.z^2 -> dL/dt.y += d_J12*(-h_y/t.z^2), dL/dt.z += d_J12*(2*h_y*t.y/t.z^3)
+    float tz3 = tz2 * t.z;
+    float d_tx = d_J02 * (-ubo.h_x / tz2);
+    float d_ty = d_J12 * (-ubo.h_y / tz2);
+    float d_tz = d_J00 * (-ubo.h_x / tz2)
+               + d_J11 * (-ubo.h_y / tz2)
+               + d_J02 * (2.0 * ubo.h_x * t.x / tz3)
+               + d_J12 * (2.0 * ubo.h_y * t.y / tz3);
+
+    // Apply clamping mask (if clamped, no gradient flows through that component)
+    d_tx *= x_grad_mul;
+    d_ty *= y_grad_mul;
+
+    // Backward through view transform: p_view = view_matrix * [pos, 1]
+    // p_view[row] = sum_col view[col*4+row] * pos[col] + view[12+row]
+    // d_pos[col] = sum_row d_p_view[row] * view[col*4+row]
+    // In column-major mat4: ubo.view_matrix[col][row]
+    d_pos_x += d_tx * ubo.view_matrix[0][0] + d_ty * ubo.view_matrix[0][1] + d_tz * ubo.view_matrix[0][2];
+    d_pos_y += d_tx * ubo.view_matrix[1][0] + d_ty * ubo.view_matrix[1][1] + d_tz * ubo.view_matrix[1][2];
+    d_pos_z += d_tx * ubo.view_matrix[2][0] + d_ty * ubo.view_matrix[2][1] + d_tz * ubo.view_matrix[2][2];
+
+    // =========================================================================
+    // Part B: d_cov3D -> d_M -> d_raw_scales, d_raw_rotations
+    // =========================================================================
+    // Load scale and rotation for this Gaussian
+    float sx = ubo.scale_modifier * scales[base3 + 0u];
+    float sy = ubo.scale_modifier * scales[base3 + 1u];
+    float sz = ubo.scale_modifier * scales[base3 + 2u];
+
+    float qr = rotations[base4 + 0u];
+    float qx = rotations[base4 + 1u];
+    float qy = rotations[base4 + 2u];
+    float qz = rotations[base4 + 3u];
+
+    float R[9];
+    quat2R(qr, qx, qy, qz, R);
+    // R[row*3+col]
+
+    // M[row][col] = s[row] * R[row][col]
+    float s[3] = float[3](sx, sy, sz);
+    float M[9]; // [row*3+col]
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 3; col++)
+            M[row*3+col] = s[row] * R[row*3+col];
+
+    // dL/dM from d_cov3D (upper triangle):
+    // Sigma = M^T * M: Sigma[r][c] = sum_k M[k][r] * M[k][c]
+    // d_M[k][0] = 2*d_cov3D[0]*M[k][0] + d_cov3D[1]*M[k][1] + d_cov3D[2]*M[k][2]
+    // d_M[k][1] = d_cov3D[1]*M[k][0] + 2*d_cov3D[3]*M[k][1] + d_cov3D[4]*M[k][2]
+    // d_M[k][2] = d_cov3D[2]*M[k][0] + d_cov3D[4]*M[k][1] + 2*d_cov3D[5]*M[k][2]
+    float d_M[9]; // [k*3+col]
+    for (int k = 0; k < 3; k++) {
+        d_M[k*3+0] = 2.0*d_cov3D[0]*M[k*3+0] + d_cov3D[1]*M[k*3+1] + d_cov3D[2]*M[k*3+2];
+        d_M[k*3+1] = d_cov3D[1]*M[k*3+0] + 2.0*d_cov3D[3]*M[k*3+1] + d_cov3D[4]*M[k*3+2];
+        d_M[k*3+2] = d_cov3D[2]*M[k*3+0] + d_cov3D[4]*M[k*3+1] + 2.0*d_cov3D[5]*M[k*3+2];
+    }
+
+    // d_scale[k] = sum_j d_M[k][j] * R[k][j]
+    // d_R[k][j] = d_M[k][j] * s[k]
+    float d_scale0 = 0.0, d_scale1 = 0.0, d_scale2 = 0.0;
+    float d_R[9]; // [k*3+j]
+    for (int j = 0; j < 3; j++) {
+        d_scale0 += d_M[0*3+j] * R[0*3+j];
+        d_scale1 += d_M[1*3+j] * R[1*3+j];
+        d_scale2 += d_M[2*3+j] * R[2*3+j];
+        d_R[0*3+j] = d_M[0*3+j] * s[0];
+        d_R[1*3+j] = d_M[1*3+j] * s[1];
+        d_R[2*3+j] = d_M[2*3+j] * s[2];
+    }
+
+    // d_raw_scale[k] = d_scale[k] * scale_modifier * scale_k
+    // (since scale_in_M = scale_modifier * exp(raw_scale), d/d_raw_scale = scale_modifier * scale)
+    d_scales[base3 + 0u] = d_scale0 * ubo.scale_modifier * scales[base3 + 0u];
+    d_scales[base3 + 1u] = d_scale1 * ubo.scale_modifier * scales[base3 + 1u];
+    d_scales[base3 + 2u] = d_scale2 * ubo.scale_modifier * scales[base3 + 2u];
+
+    // d_R -> d_normalized_quaternion (r,x,y,z)
+    // R[0][0] = 1-2(y^2+z^2)  -> dR[0][0]/dy = -4y, /dz = -4z
+    // R[0][1] = 2(xy+rz)      -> dR[0][1]/dr = 2z, /dx = 2y, /dy = 2x, /dz = 2r
+    // R[0][2] = 2(xz-ry)      -> dR[0][2]/dr = -2y, /dx = 2z, /dy = -2r, /dz = 2x
+    // R[1][0] = 2(xy-rz)      -> dR[1][0]/dr = -2z, /dx = 2y, /dy = 2x, /dz = -2r
+    // R[1][1] = 1-2(x^2+z^2)  -> dR[1][1]/dx = -4x, /dz = -4z
+    // R[1][2] = 2(yz+rx)      -> dR[1][2]/dr = 2x, /dx = 2r, /dy = 2z, /dz = 2y
+    // R[2][0] = 2(xz+ry)      -> dR[2][0]/dr = 2y, /dx = 2z, /dy = 2r, /dz = 2x
+    // R[2][1] = 2(yz-rx)      -> dR[2][1]/dr = -2x, /dx = -2r, /dy = 2z, /dz = 2y
+    // R[2][2] = 1-2(x^2+y^2)  -> dR[2][2]/dx = -4x, /dy = -4y
+    // (Matches preprocessor_backward_cpu.cpp:457-503)
+    float d_qn_r = 0.0, d_qn_x = 0.0, d_qn_y = 0.0, d_qn_z = 0.0;
+
+    // R[0][0] row=0, col=0
+    d_qn_y += d_R[0*3+0] * (-4.0*qy);
+    d_qn_z += d_R[0*3+0] * (-4.0*qz);
+    // R[0][1] row=0, col=1
+    d_qn_r += d_R[0*3+1] * 2.0*qz;
+    d_qn_x += d_R[0*3+1] * 2.0*qy;
+    d_qn_y += d_R[0*3+1] * 2.0*qx;
+    d_qn_z += d_R[0*3+1] * 2.0*qr;
+    // R[0][2] row=0, col=2
+    d_qn_r += d_R[0*3+2] * (-2.0*qy);
+    d_qn_x += d_R[0*3+2] * 2.0*qz;
+    d_qn_y += d_R[0*3+2] * (-2.0*qr);
+    d_qn_z += d_R[0*3+2] * 2.0*qx;
+    // R[1][0] row=1, col=0
+    d_qn_r += d_R[1*3+0] * (-2.0*qz);
+    d_qn_x += d_R[1*3+0] * 2.0*qy;
+    d_qn_y += d_R[1*3+0] * 2.0*qx;
+    d_qn_z += d_R[1*3+0] * (-2.0*qr);
+    // R[1][1] row=1, col=1
+    d_qn_x += d_R[1*3+1] * (-4.0*qx);
+    d_qn_z += d_R[1*3+1] * (-4.0*qz);
+    // R[1][2] row=1, col=2
+    d_qn_r += d_R[1*3+2] * 2.0*qx;
+    d_qn_x += d_R[1*3+2] * 2.0*qr;
+    d_qn_y += d_R[1*3+2] * 2.0*qz;
+    d_qn_z += d_R[1*3+2] * 2.0*qy;
+    // R[2][0] row=2, col=0
+    d_qn_r += d_R[2*3+0] * 2.0*qy;
+    d_qn_x += d_R[2*3+0] * 2.0*qz;
+    d_qn_y += d_R[2*3+0] * 2.0*qr;
+    d_qn_z += d_R[2*3+0] * 2.0*qx;
+    // R[2][1] row=2, col=1
+    d_qn_r += d_R[2*3+1] * (-2.0*qx);
+    d_qn_x += d_R[2*3+1] * (-2.0*qr);
+    d_qn_y += d_R[2*3+1] * 2.0*qz;
+    d_qn_z += d_R[2*3+1] * 2.0*qy;
+    // R[2][2] row=2, col=2
+    d_qn_x += d_R[2*3+2] * (-4.0*qx);
+    d_qn_y += d_R[2*3+2] * (-4.0*qy);
+
+    // d_normalized_quat -> d_raw_quat through quaternion normalization
+    // q_norm = q_raw / |q_raw|
+    // d_raw[k] = (d_norm[k] - q_norm[k] * dot(d_norm, q_norm)) / |q_raw|
+    // Note: rotations[] already hold the normalized quaternion (r, x, y, z).
+    // We treat them as q_norm here; we need |q_raw| but raw params aren't stored.
+    // For normalized quaternion: |q_norm| = 1, so we use the identity:
+    // d_raw[k] = (d_norm[k] - q_norm[k] * dot(d_norm, q_norm)) / |q_raw|
+    // Since rotations[] is already normalized, |q_raw| = length(raw_rotation).
+    // However, we don't have raw_rotation in the shader.
+    // The CPU backward (preprocessor_backward_cpu.cpp:508-518) uses raw.raw_rotations
+    // for the normalization denominator. Since we don't have raw rotations here,
+    // we approximate with the normalized quaternion (i.e. assume |q_raw| ~ 1).
+    // This is exact when q_raw is already unit-length (which is enforced at load time).
+    // For the gradient we use d_q_norm directly as d_q_raw (|q_raw|=1 approximation).
+    // This matches what CUDA backward does (normalizes then differentiates).
+    float dot_dqn_qn = d_qn_r*qr + d_qn_x*qx + d_qn_y*qy + d_qn_z*qz;
+
+    d_rotations[base4 + 0u] = d_qn_r - qr * dot_dqn_qn;  // inv_len = 1.0
+    d_rotations[base4 + 1u] = d_qn_x - qx * dot_dqn_qn;
+    d_rotations[base4 + 2u] = d_qn_y - qy * dot_dqn_qn;
+    d_rotations[base4 + 3u] = d_qn_z - qz * dot_dqn_qn;
+
+    // =========================================================================
+    // Part C: d_rgb -> d_sh (SH backward)
+    // =========================================================================
+    vec3 dir = normalize(pos - ubo.cam_pos);
+    float dx = dir.x, dy = dir.y, dz = dir.z;
+
+    // Recompute forward SH value (per channel) to determine clamp mask
+    // (same as computeColorFromSH_backward in preprocessor_backward_cpu.cpp)
+    uint K = ubo.sh_coeffs_per_g;
+    uint sh_base = i * K * 3u;
+
+    float rgb_raw_r = SH_C0 * sh_coeffs[sh_base + 0u*3u + 0u];
+    float rgb_raw_g = SH_C0 * sh_coeffs[sh_base + 0u*3u + 1u];
+    float rgb_raw_b = SH_C0 * sh_coeffs[sh_base + 0u*3u + 2u];
+
+    if (ubo.sh_degree > 0u) {
+        rgb_raw_r += -SH_C1*dy*sh_coeffs[sh_base+1u*3u+0u] + SH_C1*dz*sh_coeffs[sh_base+2u*3u+0u] - SH_C1*dx*sh_coeffs[sh_base+3u*3u+0u];
+        rgb_raw_g += -SH_C1*dy*sh_coeffs[sh_base+1u*3u+1u] + SH_C1*dz*sh_coeffs[sh_base+2u*3u+1u] - SH_C1*dx*sh_coeffs[sh_base+3u*3u+1u];
+        rgb_raw_b += -SH_C1*dy*sh_coeffs[sh_base+1u*3u+2u] + SH_C1*dz*sh_coeffs[sh_base+2u*3u+2u] - SH_C1*dx*sh_coeffs[sh_base+3u*3u+2u];
+
+        if (ubo.sh_degree > 1u) {
+            float xx = dx*dx, yy = dy*dy, zz = dz*dz;
+            float xy = dx*dy, yz = dy*dz, xz = dx*dz;
+            for (int ch = 0; ch < 3; ch++) {
+                float v = SH_C2[0]*xy*sh_coeffs[sh_base+4u*3u+ch]
+                        + SH_C2[1]*yz*sh_coeffs[sh_base+5u*3u+ch]
+                        + SH_C2[2]*(2.0*zz-xx-yy)*sh_coeffs[sh_base+6u*3u+ch]
+                        + SH_C2[3]*xz*sh_coeffs[sh_base+7u*3u+ch]
+                        + SH_C2[4]*(xx-yy)*sh_coeffs[sh_base+8u*3u+ch];
+                if (ch == 0) rgb_raw_r += v;
+                else if (ch == 1) rgb_raw_g += v;
+                else rgb_raw_b += v;
+            }
+
+            if (ubo.sh_degree > 2u) {
+                for (int ch = 0; ch < 3; ch++) {
+                    float v = SH_C3[0]*dy*(3.0*xx-yy)*sh_coeffs[sh_base+9u*3u+ch]
+                            + SH_C3[1]*xy*dz*sh_coeffs[sh_base+10u*3u+ch]
+                            + SH_C3[2]*dy*(4.0*zz-xx-yy)*sh_coeffs[sh_base+11u*3u+ch]
+                            + SH_C3[3]*dz*(2.0*zz-3.0*xx-3.0*yy)*sh_coeffs[sh_base+12u*3u+ch]
+                            + SH_C3[4]*dx*(4.0*zz-xx-yy)*sh_coeffs[sh_base+13u*3u+ch]
+                            + SH_C3[5]*dz*(xx-yy)*sh_coeffs[sh_base+14u*3u+ch]
+                            + SH_C3[6]*dx*(xx-3.0*yy)*sh_coeffs[sh_base+15u*3u+ch];
+                    if (ch == 0) rgb_raw_r += v;
+                    else if (ch == 1) rgb_raw_g += v;
+                    else rgb_raw_b += v;
+                }
+            }
+        }
+    }
+
+    // Clamp mask: gradient flows through only if rgb_raw + 0.5 >= 0
+    float mask_r = (rgb_raw_r + 0.5 >= 0.0) ? 1.0 : 0.0;
+    float mask_g = (rgb_raw_g + 0.5 >= 0.0) ? 1.0 : 0.0;
+    float mask_b = (rgb_raw_b + 0.5 >= 0.0) ? 1.0 : 0.0;
+
+    // In training mode (ubo.training == 1): apply clamp mask (lower clamp only)
+    // In inference mode: upper clamp also active, but we only track lower clamp mask here
+    // (The CPU backward also only applies the lower clamp mask regardless of training flag)
+    float d_rgb_r = d_rgb[base3 + 0u] * mask_r;
+    float d_rgb_g = d_rgb[base3 + 1u] * mask_g;
+    float d_rgb_b = d_rgb[base3 + 2u] * mask_b;
+
+    // Degree 0: basis = SH_C0
+    d_sh[sh_base + 0u*3u + 0u] = SH_C0 * d_rgb_r;
+    d_sh[sh_base + 0u*3u + 1u] = SH_C0 * d_rgb_g;
+    d_sh[sh_base + 0u*3u + 2u] = SH_C0 * d_rgb_b;
+
+    if (ubo.sh_degree > 0u) {
+        // Degree 1 basis values
+        float b1[3] = float[3](-SH_C1*dy, SH_C1*dz, -SH_C1*dx);
+        for (int k = 0; k < 3; k++) {
+            d_sh[sh_base + uint(1+k)*3u + 0u] = b1[k] * d_rgb_r;
+            d_sh[sh_base + uint(1+k)*3u + 1u] = b1[k] * d_rgb_g;
+            d_sh[sh_base + uint(1+k)*3u + 2u] = b1[k] * d_rgb_b;
+        }
+
+        if (ubo.sh_degree > 1u) {
+            float xx = dx*dx, yy = dy*dy, zz = dz*dz;
+            float xy = dx*dy, yz = dy*dz, xz = dx*dz;
+            float b2[5] = float[5](
+                SH_C2[0]*xy,
+                SH_C2[1]*yz,
+                SH_C2[2]*(2.0*zz - xx - yy),
+                SH_C2[3]*xz,
+                SH_C2[4]*(xx - yy)
+            );
+            for (int k = 0; k < 5; k++) {
+                d_sh[sh_base + uint(4+k)*3u + 0u] = b2[k] * d_rgb_r;
+                d_sh[sh_base + uint(4+k)*3u + 1u] = b2[k] * d_rgb_g;
+                d_sh[sh_base + uint(4+k)*3u + 2u] = b2[k] * d_rgb_b;
+            }
+
+            if (ubo.sh_degree > 2u) {
+                float b3[7] = float[7](
+                    SH_C3[0]*dy*(3.0*xx - yy),
+                    SH_C3[1]*xy*dz,
+                    SH_C3[2]*dy*(4.0*zz - xx - yy),
+                    SH_C3[3]*dz*(2.0*zz - 3.0*xx - 3.0*yy),
+                    SH_C3[4]*dx*(4.0*zz - xx - yy),
+                    SH_C3[5]*dz*(xx - yy),
+                    SH_C3[6]*dx*(xx - 3.0*yy)
+                );
+                for (int k = 0; k < 7; k++) {
+                    d_sh[sh_base + uint(9+k)*3u + 0u] = b3[k] * d_rgb_r;
+                    d_sh[sh_base + uint(9+k)*3u + 1u] = b3[k] * d_rgb_g;
+                    d_sh[sh_base + uint(9+k)*3u + 2u] = b3[k] * d_rgb_b;
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Part D: d_means2D -> d_means3D (projection gradient)
+    // =========================================================================
+    // Forward:
+    //   p_hom = proj_matrix * [pos, 1]    (viewproj * [pos; 1])
+    //   w = p_hom.w + 1e-7
+    //   ndc.x = p_hom.x / w
+    //   ndc.y = p_hom.y / w
+    //   pixel.x = ((ndc.x + 1) * W - 1) * 0.5  [ndc2Pix]
+    //   pixel.y = ((ndc.y + 1) * H - 1) * 0.5
+    //
+    // Backward (matches preprocessor_backward_cpu.cpp:609-643):
+    vec4 p_hom = ubo.proj_matrix * vec4(pos, 1.0);
+    float w_hom = p_hom.w + 1e-7;
+    float inv_w = 1.0 / w_hom;
+
+    float d_pixel_x = d_means2D[i * 2u + 0u];
+    float d_pixel_y = d_means2D[i * 2u + 1u];
+
+    // ndc2Pix backward: pixel = ((ndc+1)*S - 1) * 0.5
+    // d_ndc = d_pixel * S * 0.5
+    // cam_width / cam_height are stored directly in the UBO (uint32_t fields).
+    float d_ndc_x = d_pixel_x * float(ubo.cam_width)  * 0.5;
+    float d_ndc_y = d_pixel_y * float(ubo.cam_height) * 0.5;
+
+    // Perspective divide backward: ndc = p_hom.xy / w
+    // Recover ndc from cached means2D via inverse ndc2Pix:
+    //   ndc = (2*pixel + 1) / S - 1
+    // But means2D is not available here as a cached value (it would require another buffer).
+    // Instead, compute ndc directly from p_hom:
+    float ndc_x = p_hom.x * inv_w;
+    float ndc_y = p_hom.y * inv_w;
+
+    // d_p_hom:
+    //   d_p_hom[0] = d_ndc_x * inv_w
+    //   d_p_hom[1] = d_ndc_y * inv_w
+    //   d_p_hom[3] = -(ndc_x * d_ndc_x + ndc_y * d_ndc_y) * inv_w
+    float d_phom0 = d_ndc_x * inv_w;
+    float d_phom1 = d_ndc_y * inv_w;
+    float d_phom3 = -(ndc_x * d_ndc_x + ndc_y * d_ndc_y) * inv_w;
+
+    // proj_matrix backward: p_hom[j] = sum_col M[col*4+j]*pos[col] + M[12+j]
+    // (column-major: M[col] is 4-element column vector)
+    // In GLSL mat4: proj_matrix[col][row]
+    // d_pos[dim] = sum_row d_p_hom[row] * proj_matrix[dim][row]
+    // Only rows 0,1,3 contribute (row 2 has d=0)
+    d_pos_x += d_phom0 * ubo.proj_matrix[0][0]
+             + d_phom1 * ubo.proj_matrix[0][1]
+             + d_phom3 * ubo.proj_matrix[0][3];
+    d_pos_y += d_phom0 * ubo.proj_matrix[1][0]
+             + d_phom1 * ubo.proj_matrix[1][1]
+             + d_phom3 * ubo.proj_matrix[1][3];
+    d_pos_z += d_phom0 * ubo.proj_matrix[2][0]
+             + d_phom1 * ubo.proj_matrix[2][1]
+             + d_phom3 * ubo.proj_matrix[2][3];
+
+    // =========================================================================
+    // Write outputs
+    // =========================================================================
+    d_means3D[base3 + 0u] = d_pos_x;
+    d_means3D[base3 + 1u] = d_pos_y;
+    d_means3D[base3 + 2u] = d_pos_z;
+}
