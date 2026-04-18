@@ -220,28 +220,34 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
 }
 
 // -----------------------------------------------------------------------------
-// Compute tile AABB using CPU getRect semantics (math_utils.cpp::getRect).
-//   rect_min.x = clamp((pix.x - r) / tile_w,                0, grid_x)
-//   rect_min.y = clamp((pix.y - r) / tile_h,                0, grid_y)
-//   rect_max.x = clamp((pix.x + r + tile_w-1) / tile_w,    0, grid_x)
-//   rect_max.y = clamp((pix.y + r + tile_h-1) / tile_h,    0, grid_y)
+// Compute tile AABB using CUDA getRect semantics (auxiliary.h::getRect).
+//   rect_min.x = clamp(floor((pix.x - extent) / tile_w), 0, grid_x)
+//   rect_min.y = clamp(floor((pix.y - extent) / tile_h), 0, grid_y)
+//   rect_max.x = clamp(ceil ((pix.x + extent) / tile_w), 0, grid_x)
+//   rect_max.y = clamp(ceil ((pix.y + extent) / tile_h), 0, grid_y)
 // Tiles touched = (max.x - min.x) * (max.y - min.y).
-// Note: CPU uses integer division (truncating toward zero for positive ops;
-//       negative inputs floor differently, but rect is post-clamp to 0).
+//
+// Extent is the *float* radius (before ceil-to-int); CUDA forward.cu:256-258
+// stores `rect_dims = (radius, radius)` as float2 and uses it in getRect.
+// Integer-truncation ("+tile-1" ceil trick) breaks on fractional pixel
+// positions — verified against golden in T7 (tiles_touched[8,13] diverged
+// from CUDA until this switched to true floor/ceil on the float extent).
+//
+// CPU reference (preprocessor_cpu.cpp) uses int my_radius (post-ceil) and
+// the "+tile-1" trick; Vulkan intentionally diverges from CPU here so the
+// SP-0 tiny-fixture golden match (T7) is bit-exact.
 // -----------------------------------------------------------------------------
-ivec2 rectMin(vec2 p, int r, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int((p.x - float(r)) / float(tile_w));
-    int my = int((p.y - float(r)) / float(tile_h));
-    // CPU uses std::min(grid, std::max(0, ...)) applied to (possibly negative) int.
-    // Emulate: clamp to [0, grid].
+ivec2 rectMin(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(floor((p.x - extent) / float(tile_w)));
+    int my = int(floor((p.y - extent) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
 }
 
-ivec2 rectMax(vec2 p, int r, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int((p.x + float(r) + float(tile_w) - 1.0) / float(tile_w));
-    int my = int((p.y + float(r) + float(tile_h) - 1.0) / float(tile_h));
+ivec2 rectMax(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(ceil((p.x + extent) / float(tile_w)));
+    int my = int(ceil((p.y + extent) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
@@ -373,27 +379,38 @@ void main() {
                       -cov2D.y * det_inv, // b
                       cov2D.x * det_inv); // c
 
-    // 12. Radius from eigenvalues (CPU uses max(0.1f, mid*mid - det)).
+    // 12. Radius from eigenvalues.
+    //
+    // CUDA reference (AAA-Gaussians forward.cu:239-244):
+    //   extent = 3.33f; lambda = mid + sqrt(max(0.01f, mid*mid - det));
+    //   radius = extent * sqrt(lambda);        // FLOAT
+    //   radii[idx] = (int) ceil(radius);        // int, for host consumer
+    //   rect_dims = (radius, radius);           // FLOAT, used by getRect
+    //
+    // The CPU preprocessor (preprocessor_cpu.cpp:225) uses 3.0f and 0.1f
+    // AND uses the int-ceiled radius for getRect — both divergences from
+    // CUDA. The Vulkan shader follows the CUDA reference so
+    // PreprocessorVulkan matches the SP-0 tiny-fixture golden bit-exactly
+    // (per T7 test MatchesCUDAGolden_Tiny).
     float mid = 0.5 * (cov2D.x + cov2D.z);
-    float disc = max(0.1, mid * mid - det);
-    float sq   = sqrt(disc);
-    float lambda1 = mid + sq;
-    float lambda2 = mid - sq;
-    int my_radius = int(ceil(3.0 * sqrt(max(lambda1, lambda2))));
+    float disc = max(0.01, mid * mid - det);
+    float lambda = mid + sqrt(disc);        // larger eigenvalue
+    float radius_f = 3.33 * sqrt(lambda);   // float radius (used for rect)
+    int   my_radius = int(ceil(radius_f));  // int radius (written to radii[])
 
     // Radius cull: if radius > max(W,H), drop (matches CPU).
     int max_screen_dim = int(max(width, height));
     if (my_radius > max_screen_dim) return;
 
-    // 13. Tile AABB.
+    // 13. Tile AABB — uses the FLOAT radius per CUDA's rect_dims convention.
     // tile_w/tile_h fixed to 16 per spec §4.4 SP-2. Grid comes from push consts.
     const int TILE_W = 16;
     const int TILE_H = 16;
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);
     vec2 pix  = vec2(pixel_x, pixel_y);
-    ivec2 rmn = rectMin(pix, my_radius, grid_x, grid_y, TILE_W, TILE_H);
-    ivec2 rmx = rectMax(pix, my_radius, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmn = rectMin(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmx = rectMax(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
     int n_tiles = (rmx.x - rmn.x) * (rmx.y - rmn.y);
     if (n_tiles == 0) return;
 

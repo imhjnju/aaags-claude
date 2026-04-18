@@ -147,6 +147,31 @@ def run_tiny(output_dir: str, seed: int = 42):
     out["rasterize_image"] = color       # [3, H, W], float32
     out["preprocess_radii"] = radii      # [P], int32
 
+    # --- T7: Input tensors for C++ round-trip reconstruction ---------------
+    # These are the exact inputs fed into rasterize_gaussians above; the
+    # PreprocessorVulkan C++ test rebuilds GaussianData/Camera/RenderConfig
+    # from these npys and compares its outputs against preprocess_*.npy.
+    # Key names must match the `input_<tensor>` convention consumed by
+    # _split_op_tensor (splits on the first '_' → op="input").
+    out["input_positions"]          = s["means3D"]            # [N, 3] float32
+    out["input_scales"]             = s["scales"]             # [N, 3] float32
+    out["input_rotations"]          = s["rotations"]          # [N, 4] float32
+    out["input_opacities"]          = s["opacities"]          # [N, 1] float32
+    out["input_sh"]                 = s["sh"]                 # [N, M, 3] float32
+    out["input_filter_3D"]          = s["filter_3D"]          # [N] float32
+    out["input_viewmatrix"]         = s["viewmatrix"]         # [4, 4] float32
+    out["input_projmatrix"]         = s["projmatrix"]         # [4, 4] float32
+    out["input_inv_viewprojmatrix"] = s["inv_viewprojmatrix"] # [4, 4] float32
+    out["input_campos"]             = s["campos"]             # [3]    float32
+    # [tan_fovx, tan_fovy, W, H] — order matters (matches C++ consumer).
+    out["input_fov_size"] = torch.tensor(
+        [s["tan_fovx"], s["tan_fovy"],
+         float(s["W"]), float(s["H"])], device="cuda")
+    # [sh_degree, sh_coeffs_per_g, H, W] — as floats for uniform dtype.
+    out["input_meta"] = torch.tensor(
+        [float(s["sh_degree"]), float(s["sh_coeffs_per_g"]),
+         float(s["H"]),          float(s["W"])], device="cuda")
+
     # --- Backward --------------------------------------------------------
     # Fixed random gradient mask via torch.manual_seed above — keeps the
     # golden bytes reproducible across dumper runs.
