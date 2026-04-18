@@ -186,12 +186,18 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(prefix_sum _hdr_prefix_sum)
         gs3d_compile_glsl(scatter _spv_scatter)
         gs3d_embed_spirv(scatter _hdr_scatter)
+        gs3d_compile_glsl(radix_sort_count _spv_radix_count)
+        gs3d_embed_spirv(radix_sort_count _hdr_radix_count)
+        gs3d_compile_glsl(radix_sort_scatter _spv_radix_scatter)
+        gs3d_embed_spirv(radix_sort_scatter _hdr_radix_scatter)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello}
                     ${_spv_preprocess} ${_hdr_preprocess}
                     ${_spv_prefix_sum} ${_hdr_prefix_sum}
-                    ${_spv_scatter} ${_hdr_scatter})
+                    ${_spv_scatter} ${_hdr_scatter}
+                    ${_spv_radix_count} ${_hdr_radix_count}
+                    ${_spv_radix_scatter} ${_hdr_radix_scatter})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
