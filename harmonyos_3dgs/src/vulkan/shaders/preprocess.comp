@@ -1,0 +1,199 @@
+#version 450
+// Preprocessor (growing). Slice coverage:
+//   2a: world->view (depth + active-z cull)
+//   2b: viewproj, NDC, pixel position (means2D + p_hom_w)
+//   2c: 3D covariance, 2D covariance, conic, opacities_2d (no AA)
+//
+// Output semantics:
+//   depths, p_hom_w          : written for every Gaussian (even culled).
+//   active_                  : 1 iff Gaussian survives all checks so far
+//                              (near-plane AND cov2D non-singular).
+//   means2D, conics, opacities_2d : valid only when active_==1; zero otherwise.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// --- Per-Gaussian inputs (SoA) ---------------------------------------------
+layout(std430, binding = 0) readonly buffer Positions { float positions[]; };
+
+layout(std430, binding = 1) readonly buffer Camera {
+    mat4  view_matrix;       //   0 ..  63
+    mat4  viewproj_matrix;   //  64 .. 127
+    vec3  cam_pos;           // 128 .. 139 (+4 pad)
+    float _pad_cam_pos;      // 140 .. 143
+    float tan_fovx;          // 144
+    float tan_fovy;          // 148
+    float width;             // 152  (stored as float for std430 alignment)
+    float height;            // 156
+} cam;
+
+// --- Outputs ---------------------------------------------------------------
+layout(std430, binding = 2) writeonly buffer Depths     { float depths[];       };
+layout(std430, binding = 3) writeonly buffer Active     { uint  active_[];      };
+layout(std430, binding = 4) writeonly buffer Means2D    { float means2D[];      };
+layout(std430, binding = 5) writeonly buffer PHomW      { float p_hom_w[];      };
+
+// --- Slice 2c additions ----------------------------------------------------
+layout(std430, binding = 6) readonly  buffer Scales     { float scales[];       };
+layout(std430, binding = 7) readonly  buffer Rotations  { float rotations[];    };
+layout(std430, binding = 8) readonly  buffer Opacities  { float opacities[];    };
+layout(std430, binding = 9) writeonly buffer Conics     { float conics[];       };
+layout(std430, binding = 10) writeonly buffer Opac2D    { float opacities_2d[]; };
+
+layout(push_constant) uniform PC {
+    uint  count;
+    float scale_modifier;
+} pc;
+
+const float NEAR_Z = 0.2;
+const float W_EPS  = 1e-7;
+const float COV_FILTER = 0.3;
+
+float ndc2Pix(float v, float S) {
+    return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+// ---------------------------------------------------------------------------
+// computeCov3D (port of math_utils.cpp:computeCov3D)
+// Quaternion convention: rot = (r, x, y, z), real-first.
+// R[row][col] is constructed to match CUDA's glm::mat3 layout; combined with
+// S row-scale and Σ = Mᵀ·M this yields Σ = R_std · S² · R_stdᵀ (the standard
+// 3DGS form); see math_utils.cpp comment for the R-vs-Rᵀ convention.
+// ---------------------------------------------------------------------------
+void compute_cov3D(vec3 scale, vec4 quat, float mod, out float cov3D[6]) {
+    float sx = mod * scale.x;
+    float sy = mod * scale.y;
+    float sz = mod * scale.z;
+
+    float r = quat.x;   // real
+    float x = quat.y;
+    float y = quat.z;
+    float z = quat.w;
+
+    vec3 R0 = vec3(1.0 - 2.0 * (y*y + z*z),  2.0 * (x*y + r*z),           2.0 * (x*z - r*y));
+    vec3 R1 = vec3(2.0 * (x*y - r*z),        1.0 - 2.0 * (x*x + z*z),     2.0 * (y*z + r*x));
+    vec3 R2 = vec3(2.0 * (x*z + r*y),        2.0 * (y*z - r*x),           1.0 - 2.0 * (x*x + y*y));
+
+    // M[i] = S[i] * R[i]  (row-wise scale, matching CPU)
+    vec3 M0 = sx * R0;
+    vec3 M1 = sy * R1;
+    vec3 M2 = sz * R2;
+
+    // Σ[i][j] = Σ_k M[k][i] * M[k][j]   (i.e. dot products of columns of M)
+    cov3D[0] = M0.x*M0.x + M1.x*M1.x + M2.x*M2.x;  // [0,0]
+    cov3D[1] = M0.x*M0.y + M1.x*M1.y + M2.x*M2.y;  // [0,1]
+    cov3D[2] = M0.x*M0.z + M1.x*M1.z + M2.x*M2.z;  // [0,2]
+    cov3D[3] = M0.y*M0.y + M1.y*M1.y + M2.y*M2.y;  // [1,1]
+    cov3D[4] = M0.y*M0.z + M1.y*M1.z + M2.y*M2.z;  // [1,2]
+    cov3D[5] = M0.z*M0.z + M1.z*M1.z + M2.z*M2.z;  // [2,2]
+}
+
+// ---------------------------------------------------------------------------
+// computeCov2D (port of math_utils.cpp:computeCov2D)
+// Jacobian J and W·J are stored in GLSL mat3 (column-major), which matches
+// the CPU's [col][row] layout. `mat3(mat4)` extracts the upper-left 3x3.
+// ---------------------------------------------------------------------------
+vec3 compute_cov2D(vec3 pos, float cov3D[6],
+                   float focal_x, float focal_y,
+                   float tan_fovx, float tan_fovy) {
+    // View-space position (transformPoint4x3).
+    vec3 t = (cam.view_matrix * vec4(pos, 1.0)).xyz;
+
+    // Clamp ray angle to 1.3x FOV (prevents Jacobian blowup near edges).
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    t.x = clamp(txtz, -limx, limx) * t.z;
+    t.y = clamp(tytz, -limy, limy) * t.z;
+
+    // J — perspective projection Jacobian (column-major)
+    mat3 J = mat3(
+        vec3(focal_x / t.z, 0.0, -(focal_x * t.x) / (t.z * t.z)),  // col 0
+        vec3(0.0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z)),  // col 1
+        vec3(0.0, 0.0, 0.0)                                         // col 2
+    );
+
+    // W — view rotation (upper-left 3x3 of view matrix, column-major)
+    mat3 W = mat3(cam.view_matrix);
+
+    mat3 T = W * J;
+
+    // Reconstruct Σ as a symmetric mat3. Storage in std430 upper-triangle
+    // order: [0,0],[0,1],[0,2],[1,1],[1,2],[2,2]. Since Vrk is symmetric,
+    // each column below lists that column's three entries via symmetry.
+    mat3 Vrk = mat3(
+        vec3(cov3D[0], cov3D[1], cov3D[2]),  // col 0
+        vec3(cov3D[1], cov3D[3], cov3D[4]),  // col 1
+        vec3(cov3D[2], cov3D[4], cov3D[5])   // col 2
+    );
+
+    mat3 result = transpose(T) * Vrk * T;
+
+    // CPU: cov2D[0] = result[0][0], cov2D[1] = result[1][0], cov2D[2] = result[1][1]
+    // GLSL mat3 is [col][row] — matches CPU's result[col][row] convention.
+    return vec3(result[0][0], result[1][0], result[1][1]);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    // ---- Read position; always emit depth + p_hom_w ----
+    vec3 pos = vec3(positions[i * 3u + 0u],
+                    positions[i * 3u + 1u],
+                    positions[i * 3u + 2u]);
+    vec3 p_view = (cam.view_matrix * vec4(pos, 1.0)).xyz;
+    depths[i] = p_view.z;
+
+    vec4 p_hom = cam.viewproj_matrix * vec4(pos, 1.0);
+    p_hom_w[i] = p_hom.w;
+
+    // Default "culled" outputs; overwritten below if Gaussian survives.
+    active_[i]           = 0u;
+    means2D[i * 2u + 0u] = 0.0;
+    means2D[i * 2u + 1u] = 0.0;
+    conics[i * 3u + 0u]  = 0.0;
+    conics[i * 3u + 1u]  = 0.0;
+    conics[i * 3u + 2u]  = 0.0;
+    opacities_2d[i]      = 0.0;
+
+    // ---- Slice 2a: near-plane cull ----
+    if (p_view.z <= NEAR_Z) return;
+
+    // ---- Slice 2b: pixel-space position ----
+    float p_w = 1.0 / (p_hom.w + W_EPS);
+    means2D[i * 2u + 0u] = ndc2Pix(p_hom.x * p_w, cam.width);
+    means2D[i * 2u + 1u] = ndc2Pix(p_hom.y * p_w, cam.height);
+
+    // ---- Slice 2c: 3D cov -> 2D cov -> conic ----
+    vec3 scale = vec3(scales[i * 3u + 0u],
+                      scales[i * 3u + 1u],
+                      scales[i * 3u + 2u]);
+    vec4 quat  = vec4(rotations[i * 4u + 0u],
+                      rotations[i * 4u + 1u],
+                      rotations[i * 4u + 2u],
+                      rotations[i * 4u + 3u]);
+
+    float cov3D[6];
+    compute_cov3D(scale, quat, pc.scale_modifier, cov3D);
+
+    float focal_x = cam.width  / (2.0 * cam.tan_fovx);
+    float focal_y = cam.height / (2.0 * cam.tan_fovy);
+    vec3  c2d    = compute_cov2D(pos, cov3D, focal_x, focal_y,
+                                 cam.tan_fovx, cam.tan_fovy);
+
+    // +0.3 filter on diagonal, then conic = inverse(filtered 2x2 cov).
+    float a = c2d.x + COV_FILTER;
+    float c = c2d.z + COV_FILTER;
+    float b = c2d.y;
+    float det = a * c - b * b;
+    if (det == 0.0) return;  // singular — leave active=0
+
+    float inv_det = 1.0 / det;
+    conics[i * 3u + 0u] =  c * inv_det;
+    conics[i * 3u + 1u] = -b * inv_det;
+    conics[i * 3u + 2u] =  a * inv_det;
+    opacities_2d[i]     = opacities[i];  // no AA in Slice 2c
+
+    active_[i] = 1u;
+}
