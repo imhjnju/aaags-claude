@@ -1,6 +1,9 @@
 #include "vulkan/vk_shader.h"
 
+#include <cstring>
 #include <fstream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -27,6 +30,28 @@ VulkanShader::VulkanShader(VulkanContext& ctx, const std::string& spv_path)
     smci.codeSize = spv.size() * sizeof(uint32_t);
     smci.pCode = spv.data();
     VK_CHECK(vkCreateShaderModule(ctx_.device(), &smci, nullptr, &module_));
+}
+
+VulkanShader::VulkanShader(VulkanContext& ctx, const uint8_t* spirv_bytes,
+                            std::size_t byte_size)
+    : ctx_(ctx)
+{
+    if (byte_size == 0 || (byte_size % 4) != 0) {
+        throw std::runtime_error(
+            "VulkanShader: SPIR-V byte_size must be >0 and multiple of 4, got " +
+            std::to_string(byte_size));
+    }
+
+    // SPIR-V is uint32_t[]; need 4-byte alignment. std::vector<uint32_t> gives it.
+    std::vector<uint32_t> aligned(byte_size / 4);
+    std::memcpy(aligned.data(), spirv_bytes, byte_size);
+
+    VkShaderModuleCreateInfo info{};
+    info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    info.codeSize = byte_size;
+    info.pCode    = aligned.data();
+
+    VK_CHECK(vkCreateShaderModule(ctx_.device(), &info, nullptr, &module_));
 }
 
 VulkanShader::~VulkanShader() {

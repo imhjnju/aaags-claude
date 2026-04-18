@@ -6,12 +6,20 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 class VulkanShader {
 public:
     /// Load SPIR-V from file and create a VkShaderModule.
     VulkanShader(VulkanContext& ctx, const std::string& spv_path);
+
+    /// Load SPIR-V from a raw byte stream (compatible with xxd -i output:
+    /// `unsigned char <name>_spv[]` + `unsigned int <name>_spv_len`).
+    /// `spirv_bytes` must point to valid SPIR-V words (multiple of 4 bytes).
+    VulkanShader(VulkanContext& ctx, const uint8_t* spirv_bytes, std::size_t byte_size);
+
     ~VulkanShader();
 
     VulkanShader(const VulkanShader&)            = delete;
