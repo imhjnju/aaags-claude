@@ -149,7 +149,6 @@ void main() {
 
     int  toDo = int(range_end - range_start);
     int  rounds = (toDo + int(BLOCK_SIZE) - 1) / int(BLOCK_SIZE);
-    uint total_in_range = range_end - range_start;
 
     // Running state for backward accumulation.
     float T        = T_pix;   // transmittance at this point (starts at T_final, recovered going back)
@@ -162,10 +161,9 @@ void main() {
     // This uses count-based n_contrib (our CPU and Vulkan forward convention):
     // n_contrib[pix] = number of Gaussians that actually blended into this pixel.
     // (Different from CUDA's last_contributor position convention — see forward.cu:429.)
-    // The T_MIN guard below skips Gaussians that the forward pass never reached
-    // (i.e., those beyond the saturation boundary). Only the last_contrib nearest
-    // Gaussians — which correspond to the final last_contrib positions in back-to-front
-    // order — receive gradient contributions.
+    // We process ALL Gaussians in the tile range and use alpha/power checks to
+    // identify and skip non-contributing Gaussians, matching the CPU backward's
+    // forward-replay approach.
     bool pix_active = inside && (last_contrib > 0u);
 
     // No viewport scaling here — our CPU backward does NOT apply the 0.5*W/H
@@ -200,21 +198,6 @@ void main() {
         // Per-pixel backward walk through this batch.
         int batch_size = min(int(BLOCK_SIZE), toDo);
         for (int j = 0; j < batch_size; j++) {
-            // T_MIN guard: skip Gaussians the forward pass never reached.
-            // The forward blended last_contrib Gaussians from range_start forward
-            // (nearest-to-farthest). In the back-to-front traversal here,
-            // position_from_back=0 is the farthest Gaussian (range_end-1 in sorted
-            // array). The last_contrib nearest Gaussians occupy positions
-            //   [total_in_range - last_contrib, total_in_range - 1]
-            // in back-to-front order — i.e., the ones visited LAST in this loop.
-            // Skip any position that falls before that window.
-            // Unsigned arithmetic is safe: if last_contrib > total_in_range
-            // (shouldn't happen), position_from_back + last_contrib >= total_in_range
-            // always holds (all Gaussians processed) — a safe fallback.
-            uint position_from_back = uint(i) * BLOCK_SIZE + uint(j);
-            if (position_from_back + last_contrib < total_in_range)
-                continue;
-
             // Only active pixels compute gradients.
             if (!pix_active)
                 continue;
