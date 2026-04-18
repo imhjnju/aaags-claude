@@ -44,6 +44,15 @@ public:
                        const void* push_constants = nullptr,
                        uint32_t push_size = 0);
 
+    /// Layer 2 dispatch (record to external command buffer). Caller owns cmd
+    /// buffer's begin/end/submit lifecycle and any barriers between stages.
+    /// Used by SP-2+ chained pipeline (preprocess → sort → rasterize).
+    void record(VkCommandBuffer cmd,
+                VkDescriptorSet descriptor_set,
+                uint32_t gx, uint32_t gy, uint32_t gz,
+                const void* push_constants = nullptr,
+                uint32_t push_size = 0);
+
 private:
     VulkanContext&        ctx_;
     uint32_t              num_ssbo_bindings_;
@@ -52,3 +61,8 @@ private:
     VkPipeline            pipeline_  = VK_NULL_HANDLE;
     VkDescriptorPool      pool_      = VK_NULL_HANDLE;
 };
+
+/// Insert a compute-to-compute barrier on SSBO reads/writes. Called by the
+/// caller of record() between two dispatches to ensure the second sees the
+/// first's writes.
+void insert_compute_barrier(VkCommandBuffer cmd);

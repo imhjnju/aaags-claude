@@ -142,3 +142,30 @@ void VulkanComputePipeline::dispatch_sync(VkDescriptorSet desc_set,
     ctx_.submitAndWait(cmd);
     ctx_.freePrimary(cmd);
 }
+
+void VulkanComputePipeline::record(VkCommandBuffer cmd,
+                                    VkDescriptorSet desc_set,
+                                    uint32_t gx, uint32_t gy, uint32_t gz,
+                                    const void* push_constants,
+                                    uint32_t push_size)
+{
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
+                             0, 1, &desc_set, 0, nullptr);
+    if (push_size > 0 && push_constants != nullptr) {
+        vkCmdPushConstants(cmd, layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push_constants);
+    }
+    vkCmdDispatch(cmd, gx, gy, gz);
+}
+
+void insert_compute_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier mb{};
+    mb.sType          = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask  = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask  = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
