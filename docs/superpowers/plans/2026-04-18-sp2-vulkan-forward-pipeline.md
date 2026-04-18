@@ -386,6 +386,8 @@ git -c commit.gpgsign=false commit -m "sp2: binding layout header + CameraUBO st
 
 **Purpose:** Declare the class structure without implementation. Lets downstream tests compile while implementation catches up in T4-T6.
 
+> **Note (2026-04-18):** Plan originally specified `void process(..., PreprocessOutput& out)`. Corrected to `PreprocessOutput process(...)` to match `Preprocessor` base class and all existing implementations. T6 code block updated accordingly.
+
 - [ ] **Step 1: Write header**
 
 ```cpp
@@ -413,9 +415,9 @@ public:
     ~PreprocessorVulkan() override;
 
     // Layer 1: sync API matching Preprocessor contract.
-    void process(const GaussianData& g, const Camera& cam,
-                 const RenderConfig& cfg, FrameAllocator& alloc,
-                 ForwardCache* cache, PreprocessOutput& out) override;
+    PreprocessOutput process(const GaussianData& g, const Camera& cam,
+                             const RenderConfig& cfg, FrameAllocator& alloc,
+                             ForwardCache* cache = nullptr) override;
 
     // Layer 2: Vulkan-only — record into external command buffer.
     // Buffers must be pre-bound via bind_buffers().
@@ -700,14 +702,15 @@ PreprocessorVulkan::PreprocessorVulkan(VulkanContext& ctx) : ctx_(ctx) {
 }
 PreprocessorVulkan::~PreprocessorVulkan() = default;
 
-void PreprocessorVulkan::process(const GaussianData& g, const Camera& cam,
-                                  const RenderConfig& cfg, FrameAllocator& alloc,
-                                  ForwardCache* cache, PreprocessOutput& out) {
+PreprocessOutput PreprocessorVulkan::process(const GaussianData& g, const Camera& cam,
+                                              const RenderConfig& cfg, FrameAllocator& alloc,
+                                              ForwardCache* cache) {
     // SP-2 hard errors per spec §4.4
     if (cfg.eval_3D) throw std::runtime_error("PreprocessorVulkan: eval_3D=true not supported in SP-2");
     if (cfg.tile_w != 16 || cfg.tile_h != 16) throw std::runtime_error("PreprocessorVulkan: only 16x16 tiles supported");
     if (cfg.antialiasing) throw std::runtime_error("PreprocessorVulkan: antialiasing flag not supported");
 
+    PreprocessOutput out{};
     const int N = g.count;
     const int M = g.max_coeffs;
 
@@ -790,6 +793,7 @@ void PreprocessorVulkan::process(const GaussianData& g, const Camera& cam,
     }
     out.eval_3D = false;
     // gauss2screen, cov3D_inv, mean_offset all nullptr (not eval_3D)
+    return out;
 }
 
 // ... record() and buffer getters similar, deferred to later if chained integration needs them.

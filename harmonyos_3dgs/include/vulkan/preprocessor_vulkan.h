@@ -25,16 +25,25 @@ class PreprocessPass;
 class PreprocessorVulkan : public Preprocessor {
 public:
     explicit PreprocessorVulkan(VulkanContext& ctx);
+    // Defined out-of-line in preprocessor_vulkan.cpp because
+    // std::unique_ptr<PreprocessPass> requires PreprocessPass to be complete
+    // at the destruction point.
     ~PreprocessorVulkan() override;
 
     PreprocessOutput process(const GaussianData& g, const Camera& cam,
                              const RenderConfig& cfg, FrameAllocator& alloc,
                              ForwardCache* cache = nullptr) override;
 
+    // Layer 2: record into external command buffer.
+    // Pre-conditions: buffers must be allocated and bound via PreprocessPass::bind_buffers()
+    // before calling this. The caller is responsible for inserting a compute barrier
+    // after this returns (use insert_compute_barrier). Spec §4.8.1.
     void record(VkCommandBuffer cmd, uint32_t num_gaussians, uint32_t sh_degree,
                 uint32_t sh_coeffs_per_g, uint32_t num_tiles_x,
                 uint32_t num_tiles_y, float scale_modifier);
 
+    // Handles returned here are owned by *this; valid until the next process()
+    // call or destruction. Do not call vkDestroyBuffer on them.
     VkBuffer means2D_buffer() const;
     VkBuffer depths_buffer() const;
     VkBuffer conic_opacity_packed_buffer() const;
