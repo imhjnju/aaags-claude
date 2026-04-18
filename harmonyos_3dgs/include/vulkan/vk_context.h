@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "vulkan/vk_capabilities.h"
+
+VulkanDeviceCapabilities probe_capabilities(VkPhysicalDevice phys);
+
 // ---------------------------------------------------------------------------
 // VK_CHECK -- throw on any non-VK_SUCCESS result.
 // ---------------------------------------------------------------------------
@@ -48,6 +52,7 @@ public:
 
     const std::string& deviceName() const { return device_name_; }
     uint32_t apiVersion() const { return api_version_; }
+    const VulkanDeviceCapabilities& capabilities() const { return caps_; }
 
     // -- Memory helpers -----------------------------------------------------
 
@@ -79,4 +84,5 @@ private:
     VkCommandPool    command_pool_  = VK_NULL_HANDLE;
     std::string      device_name_;
     uint32_t         api_version_   = 0;
+    VulkanDeviceCapabilities caps_{};
 };

@@ -166,6 +166,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
+            src/vulkan/vk_capabilities.cpp
             src/vulkan/vk_buffer.cpp
             src/vulkan/vk_shader.cpp
             src/vulkan/vk_pipeline.cpp

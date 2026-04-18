@@ -45,6 +45,7 @@ bool VulkanContext::init() {
     vkGetPhysicalDeviceProperties(phys_, &props);
     device_name_ = props.deviceName;
     api_version_ = props.apiVersion;
+    caps_ = probe_capabilities(phys_);
 
     float qp = 1.0f;
     VkDeviceQueueCreateInfo dqci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -89,6 +90,7 @@ void VulkanContext::release() {
     compute_qf_ = 0;
     device_name_.clear();
     api_version_ = 0;
+    caps_ = {};
 }
 
 VulkanContext::~VulkanContext() { release(); }
