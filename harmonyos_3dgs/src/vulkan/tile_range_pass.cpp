@@ -53,6 +53,8 @@ void TileRangePass::dispatch_sync(uint32_t num_elements, uint32_t num_tiles) {
         throw std::runtime_error(
             "TileRangePass::dispatch_sync called before bind_buffers()");
     if (num_elements == 0u) return;  // nothing to sweep; ranges remain as-is.
+    if (num_tiles == 0u)
+        throw std::runtime_error("TileRangePass: num_tiles must be > 0 when num_elements > 0");
 
     TileRangePushConstants pc{};
     pc.num_elements = num_elements;
