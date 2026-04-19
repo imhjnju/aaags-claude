@@ -341,29 +341,26 @@ TEST(Basketball, Training2000Steps)
 
     // --- VkTrainingConfig ---
     VkTrainingConfig tcfg{};
-    tcfg.max_steps        = 2000;
-    tcfg.pos_lr_init      = 1.6e-4f;
-    tcfg.pos_lr_final     = 1.6e-6f;
-    tcfg.sh_degree_max    = 3;
-    tcfg.sh_degree_warmup = 1000;
-    tcfg.densify_from_step = 0;   // 0 = disabled (see VkTrainingConfig)
-    tcfg.lambda_dssim      = 0.0f; // L1-only: DSSIM adds ~10s/step overhead at 720x960
+    tcfg.max_steps         = 2000;
+    tcfg.pos_lr_init       = 1.6e-4f;
+    tcfg.pos_lr_final      = 1.6e-6f;
+    tcfg.sh_degree_max     = 3;
+    tcfg.sh_degree_warmup  = 1000;
+    tcfg.densify_from_step = 0;     // disabled — densification not tested here
+    tcfg.lambda_dssim      = 0.0f;  // L1-only: DSSIM adds ~10s/step at 720x960
+    // SP-6: Python reference regularization defaults
+    tcfg.opacity_reg       = 0.01f;
+    tcfg.scale_reg         = 0.01f;
+    tcfg.spatial_lr_scale  = 1.0f;  // no COLMAP cameras_extent for single-camera test
 
     // --- Construct VulkanTrainer ---
     VulkanTrainer trainer(ctx, init_g, init_raw, sh_degree, W, H, tcfg);
 
-    // SP-5 smoke test: 3 steps only.
-    //
-    // Each step costs ~10-15 seconds on the dev machine (NVIDIA Tegra Thor) due to
-    // ~25 vkDeviceWaitIdle syncs per step (one per GPU dispatch + buffer transfer).
-    // SP-6 adds command buffer chaining to eliminate this overhead; the full 2000-step
-    // convergence milestone (PSNR > 10 dB) will be re-enabled then.
-    //
-    // What we validate here:
-    //   - VulkanTrainer initializes correctly with real COLMAP point cloud data
-    //   - step() completes without crash or GPU error for real scene geometry
-    //   - returned loss values are finite (not NaN or inf)
-    const int N_STEPS = 3;
+    // SP-6 validation: 100 steps with regularization, noise injection, spatial LR.
+    // At ~2.5 s/step on Tegra Thor (sync-per-dispatch), this takes ~250 s.
+    // Asserts PSNR > 10 dB — confirms the full training signal (loss gradient +
+    // regularization + noise) flows correctly into the optimizer.
+    const int N_STEPS = 100;
     std::vector<float> losses(static_cast<size_t>(N_STEPS), 0.0f);
 
     for (int step = 0; step < N_STEPS; ++step) {
@@ -380,13 +377,14 @@ TEST(Basketball, Training2000Steps)
             << "Inf loss at step " << (step + 1);
     }
 
-    // Log loss trajectory and PSNR informally — convergence not asserted (SP-6).
+    // SP-6 PSNR assertion: 100 steps must exceed 10 dB.
     const float* rendered = trainer.rendered_image();
-    if (rendered) {
-        const float psnr = compute_psnr(rendered, target.data(), total_pixels);
-        std::cout << "[Basketball] After " << N_STEPS << " steps:"
-                  << " loss[1]=" << losses[0]
-                  << " loss[" << N_STEPS << "]=" << losses[static_cast<size_t>(N_STEPS - 1)]
-                  << " PSNR=" << psnr << " dB\n";
-    }
+    ASSERT_NE(rendered, nullptr);
+    const float final_psnr = compute_psnr(rendered, target.data(), total_pixels);
+    std::cout << "[Basketball] After " << N_STEPS << " steps:"
+              << " loss[1]=" << losses[0]
+              << " loss[" << N_STEPS << "]=" << losses[static_cast<size_t>(N_STEPS - 1)]
+              << " PSNR=" << final_psnr << " dB\n";
+    EXPECT_GT(final_psnr, 10.0f)
+        << "PSNR after " << N_STEPS << " steps must exceed 10 dB (got " << final_psnr << " dB)";
 }
