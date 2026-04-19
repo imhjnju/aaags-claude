@@ -88,7 +88,7 @@ private:
     // R_max is computed as N * num_tiles_x * num_tiles_y (safe upper bound since
     // sum(tiles_touched[i]) <= N * num_tiles by definition).
     uint32_t bin_N_     = 0u;  // Gaussian count at last alloc
-    uint32_t bin_R_max_ = 0u;  // R upper bound at last alloc
+    uint64_t bin_R_max_ = 0u;  // R upper bound at last alloc (uint64 to prevent overflow for large N * num_tiles)
     uint32_t bin_wg_    = 0u;  // workgroup count = ceil(N/256) at last alloc
 
     std::unique_ptr<VulkanBuffer> bin_tt_buf_;    // tiles_touched [N] i32
@@ -101,5 +101,5 @@ private:
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R_max] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R_max] u32
 
-    void prepare_for_bin(uint32_t N, uint32_t R_max, uint32_t num_wgs);
+    void prepare_for_bin(uint32_t N, uint64_t R_max, uint32_t num_wgs);
 };

@@ -44,11 +44,11 @@ TileBinnerVulkan::TileBinnerVulkan(VulkanContext& ctx)
 // the include).
 TileBinnerVulkan::~TileBinnerVulkan() = default;
 
-void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t R_max, uint32_t num_wgs) {
+void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint64_t R_max, uint32_t num_wgs) {
     if (N <= bin_N_ && R_max <= bin_R_max_ && num_wgs <= bin_wg_) return;
 
     const uint32_t N_new  = std::max(N,       bin_N_);
-    const uint32_t R_new  = std::max(R_max,   bin_R_max_);
+    const uint64_t R_new  = std::max(R_max,   bin_R_max_);
     const uint32_t wg_new = std::max(num_wgs, bin_wg_);
 
     bin_tt_buf_  = std::make_unique<VulkanBuffer>(ctx_,
@@ -123,8 +123,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         (static_cast<uint32_t>(N) + 255u) / 256u;
     // R_max upper bound: each Gaussian touches at most (num_tiles_x * num_tiles_y) tiles.
     // sum(tiles_touched) <= N * num_tiles by definition, so R_max is always safe.
-    const uint32_t R_max_estimate = static_cast<uint32_t>(N) * (num_tiles_x * num_tiles_y);
-    prepare_for_bin(static_cast<uint32_t>(N), std::max(R_max_estimate, 1u), std::max(num_wgs, 1u));
+    // Use uint64_t to prevent overflow for large scenes (e.g. N=200k, 240x135 tiles
+    // = 6.48B pairs — exceeds uint32_t max of 4.29B).
+    const uint64_t R_max_estimate = static_cast<uint64_t>(N) *
+                                    static_cast<uint64_t>(num_tiles_x * num_tiles_y);
+    prepare_for_bin(static_cast<uint32_t>(N), std::max(R_max_estimate, uint64_t{1}), std::max(num_wgs, 1u));
 
     bin_tt_buf_->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
 
