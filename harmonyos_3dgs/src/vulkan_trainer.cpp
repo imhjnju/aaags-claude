@@ -310,8 +310,9 @@ float VulkanTrainer::step(const Camera& cam,
     ++step_count_;
     const uint32_t s = static_cast<uint32_t>(step_count_);
 
-    float pos_lr = lr_schedule(tcfg_.pos_lr_init, tcfg_.pos_lr_final,
-                               step_count_, tcfg_.max_steps);
+    float pos_lr = spatial_lr_schedule(tcfg_.pos_lr_init, tcfg_.pos_lr_final,
+                                       tcfg_.spatial_lr_scale,
+                                       step_count_, tcfg_.max_steps);
 
     if (tcfg_.sh_degree_warmup > 0)
         active_sh_degree_ = std::min(step_count_ / tcfg_.sh_degree_warmup,
