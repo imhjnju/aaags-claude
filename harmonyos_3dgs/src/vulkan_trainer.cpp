@@ -1,4 +1,5 @@
 #include "vulkan_trainer.h"
+#include "vulkan/vk_pipeline.h"
 #include "dssim.h"
 #include "train_utils.h"
 
@@ -320,18 +321,36 @@ float VulkanTrainer::step(const Camera& cam,
     else
         active_sh_degree_ = tcfg_.sh_degree_max;
 
-    vulkan_adam_.step_group(0, raw_param_gpu_bufs_[0]->handle(),
-                            grad_positions_gpu_->handle(), pos_lr, s);
-    vulkan_adam_.step_group(1, raw_param_gpu_bufs_[1]->handle(),
-                            grad_sh_dc_gpu_->handle(),    group_lrs_[1], s);
-    vulkan_adam_.step_group(2, raw_param_gpu_bufs_[2]->handle(),
-                            grad_sh_rest_gpu_->handle(),  group_lrs_[2], s);
-    vulkan_adam_.step_group(3, raw_param_gpu_bufs_[3]->handle(),
-                            grad_opacities_gpu_->handle(), group_lrs_[3], s);
-    vulkan_adam_.step_group(4, raw_param_gpu_bufs_[4]->handle(),
-                            grad_scales_gpu_->handle(),   group_lrs_[4], s);
-    vulkan_adam_.step_group(5, raw_param_gpu_bufs_[5]->handle(),
-                            grad_rotations_gpu_->handle(), group_lrs_[5], s);
+    // GPU Adam — chain all 6 groups into one CB (6 submit+wait → 1).
+    {
+        VkCommandBuffer adam_cmd = ctx_.allocatePrimary();
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(adam_cmd, &bi);
+
+        vulkan_adam_.step_group_record(adam_cmd, 0,
+            raw_param_gpu_bufs_[0]->handle(), grad_positions_gpu_->handle(), pos_lr, s);
+        insert_compute_barrier(adam_cmd);
+        vulkan_adam_.step_group_record(adam_cmd, 1,
+            raw_param_gpu_bufs_[1]->handle(), grad_sh_dc_gpu_->handle(), group_lrs_[1], s);
+        insert_compute_barrier(adam_cmd);
+        vulkan_adam_.step_group_record(adam_cmd, 2,
+            raw_param_gpu_bufs_[2]->handle(), grad_sh_rest_gpu_->handle(), group_lrs_[2], s);
+        insert_compute_barrier(adam_cmd);
+        vulkan_adam_.step_group_record(adam_cmd, 3,
+            raw_param_gpu_bufs_[3]->handle(), grad_opacities_gpu_->handle(), group_lrs_[3], s);
+        insert_compute_barrier(adam_cmd);
+        vulkan_adam_.step_group_record(adam_cmd, 4,
+            raw_param_gpu_bufs_[4]->handle(), grad_scales_gpu_->handle(), group_lrs_[4], s);
+        insert_compute_barrier(adam_cmd);
+        vulkan_adam_.step_group_record(adam_cmd, 5,
+            raw_param_gpu_bufs_[5]->handle(), grad_rotations_gpu_->handle(), group_lrs_[5], s);
+
+        vkEndCommandBuffer(adam_cmd);
+        ctx_.submitAndWait(adam_cmd);
+        ctx_.freePrimary(adam_cmd);
+    }
 
     // 10. Download updated raw params from GPU back to CPU vectors,
     //     so activate_params() on the next step sees the Adam-updated values.

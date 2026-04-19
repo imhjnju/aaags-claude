@@ -99,6 +99,12 @@ public:
                 const void* push_constants = nullptr,
                 uint32_t push_size = 0);
 
+    /// Free all descriptor sets back to the pool without destroying it.
+    /// Equivalent to vkResetDescriptorPool — all previously allocated sets
+    /// become invalid. Use when the owning object rebuilds its group list
+    /// (e.g. after densification) and needs to reallocate fresh sets.
+    void reset_descriptor_pool();
+
 private:
     VulkanContext&        ctx_;
     // Full per-binding type list (length == binding count). For SSBO-only

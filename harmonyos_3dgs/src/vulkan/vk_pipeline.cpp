@@ -287,6 +287,12 @@ void VulkanComputePipeline::record(VkCommandBuffer cmd,
     vkCmdDispatch(cmd, gx, gy, gz);
 }
 
+void VulkanComputePipeline::reset_descriptor_pool()
+{
+    if (pool_ != VK_NULL_HANDLE)
+        VK_CHECK(vkResetDescriptorPool(ctx_.device(), pool_, /*flags=*/0));
+}
+
 void insert_compute_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier mb{};
     mb.sType          = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
