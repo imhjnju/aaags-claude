@@ -275,7 +275,7 @@ float VulkanTrainer::step(const Camera& cam,
         for (int i = 0; i < N_; ++i) {
             if (tcfg_.opacity_reg > 0.f) {
                 const float sig = act_opacities_[static_cast<size_t>(i)];
-                grads.d_raw_opacities[i] += (tcfg_.opacity_reg * inv_N) * sig * (1.f - sig);
+                grads.d_raw_opacities[static_cast<size_t>(i)] += (tcfg_.opacity_reg * inv_N) * sig * (1.f - sig);
             }
             if (tcfg_.scale_reg > 0.f) {
                 const float coeff = tcfg_.scale_reg * inv_N;
