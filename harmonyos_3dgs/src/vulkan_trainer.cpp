@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <numeric>
 
@@ -349,6 +350,14 @@ float VulkanTrainer::step(const Camera& cam,
     raw_param_gpu_bufs_[5]->download(raw_rotations_.data(),
                                      static_cast<size_t>(N_) * 4 * sizeof(float));
 
+    // 10b. Position noise injection — SP-6 Gap 2.
+    //      Near-dead Gaussians (opacity < ~0.995) receive covariance-scaled N(0,1)
+    //      noise proportional to pos_lr. Matches train.py:141-148.
+    //      Must run after raw_positions_ and act_* are both on CPU (activate_params()
+    //      called at step start, download complete above). act_opacities_ reflect
+    //      the *previous* step's values, which is correct — same as Python reference.
+    inject_position_noise(pos_lr);
+
     // 11. Accumulate per-Gaussian gradient norm from raw position gradients
     //     (proxy for |dL/dmeans2D|).  grads.d_raw_positions is valid on CPU
     //     because preprocessor_bwd_ writes it there.
@@ -406,6 +415,57 @@ float VulkanTrainer::step(const Camera& cam,
     }
 
     return last_loss_;
+}
+
+// ---------------------------------------------------------------------------
+// inject_position_noise — covariance-scaled noise for near-dead Gaussians
+// ---------------------------------------------------------------------------
+// Matches train.py:141-148:
+//   noise = randn_like(xyz) * sigmoid(-100*(opacity - 0.995)) * noise_lr * xyz_lr
+//   noise = Sigma @ noise   where Sigma = L @ L^T
+//   xyz += noise
+//
+// Evidence: op_sigmoid(1 - opacity) == sigmoid(-100*(opacity - 0.995))
+// when opacity < 0.995 the factor is near 0 (active Gaussian, no noise);
+// when opacity < 0.01 the factor approaches 1 (dead Gaussian, max noise).
+void VulkanTrainer::inject_position_noise(float pos_lr) {
+    if (tcfg_.noise_lr == 0.f || N_ == 0) return;
+
+    std::mt19937 rng(static_cast<uint32_t>(step_count_));
+    std::normal_distribution<float> normal(0.f, 1.f);
+
+    for (int i = 0; i < N_; ++i) {
+        const float* act_sc  = act_scales_.data()    + static_cast<size_t>(i) * 3;
+        const float* act_rot = act_rotations_.data() + static_cast<size_t>(i) * 4;
+        const float  opacity = act_opacities_[static_cast<size_t>(i)];
+
+        // Soft-step gate: near zero for active Gaussians (opacity close to 1),
+        // approaches 1 for dead Gaussians (opacity close to 0).
+        const float opacity_factor = op_sigmoid(1.f - opacity);
+        if (opacity_factor < 1e-6f) continue;
+
+        // Build L = R @ diag(act_scale), then Sigma = L @ L^T.
+        float L[3][3];
+        build_L(act_rot, act_sc, L);
+
+        float Sigma[3][3] = {};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                for (int k = 0; k < 3; ++k)
+                    Sigma[r][c] += L[r][k] * L[c][k];
+
+        // Draw isotropic noise then scale by Sigma, opacity_factor, noise_lr, pos_lr.
+        const float scalar = opacity_factor * tcfg_.noise_lr * pos_lr;
+        float eta[3];
+        for (int k = 0; k < 3; ++k) eta[k] = scalar * normal(rng);
+
+        float* pos = raw_positions_.data() + static_cast<size_t>(i) * 3;
+        for (int r = 0; r < 3; ++r) {
+            float delta = 0.f;
+            for (int c = 0; c < 3; ++c) delta += Sigma[r][c] * eta[c];
+            pos[r] += delta;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

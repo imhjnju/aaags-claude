@@ -55,6 +55,9 @@ private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
     // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
     void reallocate_for_n(int new_N);
+    // Inject covariance-scaled Gaussian noise into positions of near-dead Gaussians.
+    // Called after GPU Adam download. Matches train.py:141-148.
+    void inject_position_noise(float pos_lr);
 
     VulkanContext&             ctx_;
     int                        N_;

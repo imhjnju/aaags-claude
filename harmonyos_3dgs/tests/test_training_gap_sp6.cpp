@@ -111,3 +111,17 @@ TEST(PositionNoise, NoiseScaleOrder) {
     EXPECT_GT(magnitude, 1e-4f);
     EXPECT_LT(magnitude, 1.0f);
 }
+
+TEST(PositionNoise, ActiveGaussianGetsNoNoise) {
+    // An active Gaussian with opacity=0.9 should have opacity_factor near 0
+    // (op_sigmoid(1-0.9) = op_sigmoid(0.1)), so it gets essentially no noise.
+    const float opacity_factor = op_sigmoid(1.f - 0.9f);
+    EXPECT_LT(opacity_factor, 1e-6f);
+}
+
+TEST(PositionNoise, DeadGaussianGetsFullNoise) {
+    // A dead Gaussian with opacity=0.001 should have opacity_factor near 1.
+    // op_sigmoid(1-0.001) = op_sigmoid(0.999 - 0.995 + 0.995) ~ 1.
+    const float opacity_factor = op_sigmoid(1.f - 0.001f);
+    EXPECT_GT(opacity_factor, 0.5f);
+}
