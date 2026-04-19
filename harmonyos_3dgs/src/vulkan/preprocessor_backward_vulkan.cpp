@@ -112,6 +112,35 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     const VkDeviceSize bytes_m2d_cache = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
     auto m2d_cache_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_m2d_cache, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+    // Validate that the required cache fields are populated.
+    // They are filled by PreprocessorCPU::process() or PreprocessorVulkan::download_cache().
+    if (!cache.p_view)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward: cache.p_view is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.cov2D)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward: cache.cov2D is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.cov2D_det)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward: cache.cov2D_det is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.p_hom_w)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward: cache.p_hom_w is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+
+    const VkDeviceSize bytes_p_view   = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_cov2d    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_c2d_det  = static_cast<VkDeviceSize>(N) * sizeof(float);
+    auto pview_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_p_view,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto cov2d_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_cov2d,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto c2ddet_in_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_c2d_det, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // p_hom_w cache: p_hom.w from forward (for bit-exact inv_w in Part D)
+    const VkDeviceSize bytes_phomw   = static_cast<VkDeviceSize>(N) * sizeof(float);
+    auto phomw_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_phomw,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
     auto ubo_buf    = std::make_unique<VulkanBuffer>(ctx_,
                           static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -130,6 +159,10 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     opa_in_buf->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
     raw_rot_buf->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
     m2d_cache_buf->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
+    pview_in_buf ->upload(cache.p_view,              static_cast<std::size_t>(bytes_p_view));
+    cov2d_in_buf ->upload(cache.cov2D,               static_cast<std::size_t>(bytes_cov2d));
+    c2ddet_in_buf->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
+    phomw_in_buf ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
 
     // Zero-fill gradient output buffers.
     {
@@ -187,8 +220,12 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     pb.d_rotations     = drot_buf   ->handle();
     pb.opacities       = opa_in_buf ->handle();
     pb.d_raw_opacities = d_raw_opa_buf->handle();
-    pb.raw_rotations   = raw_rot_buf->handle();
-    pb.means2D_cache   = m2d_cache_buf->handle();
+    pb.raw_rotations      = raw_rot_buf  ->handle();
+    pb.means2D_cache      = m2d_cache_buf->handle();
+    pb.p_view_cache_in    = pview_in_buf ->handle();
+    pb.cov2D_cache_in     = cov2d_in_buf ->handle();
+    pb.cov2D_det_cache_in = c2ddet_in_buf->handle();
+    pb.p_hom_w_cache_in   = phomw_in_buf ->handle();
 
     pass_->bind_buffers(pb, ubo_buf->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));

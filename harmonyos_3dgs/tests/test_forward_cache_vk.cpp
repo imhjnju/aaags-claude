@@ -7,9 +7,9 @@
 //
 // Fixture: tiny golden (N=103, cam0000) — same as test_preprocess_pass_vk.cpp.
 //
-// Note: ForwardCache.cov2D and cov2D_det are NOT populated by the Vulkan path
-// (the Vulkan backward shader recomputes from conics).  They are left null and
-// not compared here.
+// Note: ForwardCache.cov2D and cov2D_det are populated by the Vulkan path
+// (bindings 17/18 in preprocess.comp) via download_cache(), but are not
+// compared in this test (verified indirectly via backward test accuracy).
 
 #include "types.h"
 #include "vulkan/preprocessor_vulkan.h"

@@ -13,7 +13,11 @@
 //   16     UBO              (PreprocessBackwardUBO)
 //   17     read-only SSBO   (raw_rotations — unnormalized quaternions)
 //   18     read-only SSBO   (means2D_cache — pixel-space means2D from forward)
-// 19 bindings total: 18 SSBOs + 1 UBO
+//   19     read-only SSBO   (p_view_cache_in — unclamped p_view from forward)
+//   20     read-only SSBO   (cov2D_cache_in — dilated cov2D from forward)
+//   21     read-only SSBO   (cov2D_det_cache_in — det from forward)
+//   22     read-only SSBO   (p_hom_w_cache_in — p_hom.w from forward, for inv_w in Part D)
+// 23 bindings total: 22 SSBOs + 1 UBO
 //
 // The caller is responsible for zeroing the gradient SSBOs before calling
 // bind_buffers() / dispatch_sync().
@@ -31,26 +35,30 @@
 
 class PreprocessBackwardPass {
 public:
-    /// All VkBuffers wired to bindings 0..18. Names mirror preprocess_backward_bind::.
+    /// All VkBuffers wired to bindings 0..22. Names mirror preprocess_backward_bind::.
     struct Buffers {
-        VkBuffer positions;       // RO float[N*3]
-        VkBuffer radii;           // RO int[N]
-        VkBuffer cov3D;           // RO float[N*6]
-        VkBuffer d_conics;        // RO float[N*3]
-        VkBuffer d_opacity;       // RO float[N]
-        VkBuffer sh_coeffs;       // RO float[N*max_coeffs*3]
-        VkBuffer scales;          // RO float[N*3]
-        VkBuffer rotations;       // RO float[N*4]
-        VkBuffer d_rgb;           // RO float[N*3]
-        VkBuffer d_means2D;       // RO float[N*2]
-        VkBuffer d_means3D;       // RW float[N*3]  zero-filled by caller
-        VkBuffer d_sh;            // RW float[N*max_coeffs*3]  zero-filled by caller
-        VkBuffer d_scales;        // RW float[N*3]  zero-filled by caller
-        VkBuffer d_rotations;     // RW float[N*4]  zero-filled by caller
-        VkBuffer opacities;       // RO float[N]    activated sigmoid values
-        VkBuffer d_raw_opacities; // WO float[N]    d_raw_opacities output
-        VkBuffer raw_rotations;   // RO float[N*4]  unnormalized quaternions
-        VkBuffer means2D_cache;   // RO float[N*2]  pixel-space means2D from forward
+        VkBuffer positions;           // RO float[N*3]
+        VkBuffer radii;               // RO int[N]
+        VkBuffer cov3D;               // RO float[N*6]
+        VkBuffer d_conics;            // RO float[N*3]
+        VkBuffer d_opacity;           // RO float[N]
+        VkBuffer sh_coeffs;           // RO float[N*max_coeffs*3]
+        VkBuffer scales;              // RO float[N*3]
+        VkBuffer rotations;           // RO float[N*4]
+        VkBuffer d_rgb;               // RO float[N*3]
+        VkBuffer d_means2D;           // RO float[N*2]
+        VkBuffer d_means3D;           // RW float[N*3]  zero-filled by caller
+        VkBuffer d_sh;                // RW float[N*max_coeffs*3]  zero-filled by caller
+        VkBuffer d_scales;            // RW float[N*3]  zero-filled by caller
+        VkBuffer d_rotations;         // RW float[N*4]  zero-filled by caller
+        VkBuffer opacities;           // RO float[N]    activated sigmoid values
+        VkBuffer d_raw_opacities;     // WO float[N]    d_raw_opacities output
+        VkBuffer raw_rotations;       // RO float[N*4]  unnormalized quaternions
+        VkBuffer means2D_cache;       // RO float[N*2]  pixel-space means2D from forward
+        VkBuffer p_view_cache_in;     // RO float[N*3]  unclamped p_view from forward
+        VkBuffer cov2D_cache_in;      // RO float[N*3]  (fa, fb, fc) dilated cov2D from forward
+        VkBuffer cov2D_det_cache_in;  // RO float[N]    det = fa*fc - fb*fb from forward
+        VkBuffer p_hom_w_cache_in;    // RO float[N]    p_hom.w from forward (inv_w for Part D)
     };
 
     explicit PreprocessBackwardPass(VulkanContext& ctx);

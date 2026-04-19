@@ -41,7 +41,7 @@ struct alignas(16) RasterizeBackwardUBO {
 static_assert(sizeof(RasterizeBackwardUBO) == 32,
               "RasterizeBackwardUBO must be 32 bytes (std140)");
 
-// ---- preprocess_backward.comp binding layout (19 total: 18 SSBOs + 1 UBO) ----
+// ---- preprocess_backward.comp binding layout (23 total: 22 SSBOs + 1 UBO) ----
 //
 // Binding layout:
 //   0..9   read-only input SSBOs
@@ -50,6 +50,10 @@ static_assert(sizeof(RasterizeBackwardUBO) == 32,
 //   16     uniform buffer (PreprocessBackwardUBO)
 //   17     read-only SSBO: raw_rotations (unnormalized quaternions)
 //   18     read-only SSBO: means2D_cache (pixel-space means2D from forward)
+//   19     read-only SSBO: p_view_cache_in (unclamped p_view from forward)
+//   20     read-only SSBO: cov2D_cache_in (dilated cov2D from forward)
+//   21     read-only SSBO: cov2D_det_cache_in (det from forward)
+//   22     read-only SSBO: p_hom_w_cache_in (p_hom.w from forward — for inv_w in Part D)
 namespace preprocess_backward_bind {
 constexpr uint32_t POSITIONS        = 0;   // RO float[N*3]          world-space xyz
 constexpr uint32_t RADII            = 1;   // RO int[N]              int-ceiled radius; 0=culled
@@ -70,6 +74,10 @@ constexpr uint32_t D_RAW_OPACITIES  = 15;  // RW float[N]            output
 constexpr uint32_t PREPROCESS_BACKWARD_UBO = 16;  // UBO PreprocessBackwardUBO (192 bytes)
 constexpr uint32_t RAW_ROTATIONS    = 17;  // RO float[N*4]          unnormalized quaternions
 constexpr uint32_t MEANS2D_CACHE    = 18;  // RO float[N*2]          pixel-space means2D from forward
+constexpr uint32_t P_VIEW_CACHE_IN    = 19;  // RO float[N*3]  unclamped p_view from forward
+constexpr uint32_t COV2D_CACHE_IN     = 20;  // RO float[N*3]  (fa, fb, fc) dilated cov2D from forward
+constexpr uint32_t COV2D_DET_CACHE_IN = 21;  // RO float[N]    det = fa*fc - fb*fb from forward
+constexpr uint32_t P_HOM_W_CACHE_IN  = 22;  // RO float[N]    p_hom.w from forward (for inv_w in Part D)
 }  // namespace preprocess_backward_bind
 
 // PreprocessBackwardUBO (std140).

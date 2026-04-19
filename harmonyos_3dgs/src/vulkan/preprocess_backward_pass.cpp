@@ -9,6 +9,10 @@
 //   16    uniform buffer:   PreprocessBackwardUBO (192 bytes)
 //   17    read-only SSBO:   raw_rotations (unnormalized quaternions)
 //   18    read-only SSBO:   means2D_cache (pixel-space means2D from forward)
+//   19    read-only SSBO:   p_view_cache_in (unclamped p_view from forward)
+//   20    read-only SSBO:   cov2D_cache_in (dilated cov2D from forward)
+//   21    read-only SSBO:   cov2D_det_cache_in (det from forward)
+//   22    read-only SSBO:   p_hom_w_cache_in (p_hom.w from forward, for inv_w in Part D)
 //
 // Dispatch: one 256-thread workgroup per Gaussian block.
 // Grid = ceil(N/256) × 1 × 1.
@@ -31,9 +35,9 @@ PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(preprocess_backward_spv),
         static_cast<std::size_t>(preprocess_backward_spv_len));
 
-    // --- 2. Descriptor layout: 18 SSBOs (bindings 0..15, 17, 18) + 1 UBO (binding 16) ---
-    // 19 bindings total; binding 16 is UNIFORM_BUFFER, bindings 17 and 18 are STORAGE_BUFFER.
-    std::vector<VkDescriptorType> binding_types(19,
+    // --- 2. Descriptor layout: 22 SSBOs (bindings 0..15, 17..22) + 1 UBO (binding 16) ---
+    // 23 bindings total; binding 16 is UNIFORM_BUFFER, all others are STORAGE_BUFFER.
+    std::vector<VkDescriptorType> binding_types(23,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[preprocess_backward_bind::PREPROCESS_BACKWARD_UBO] =
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -86,9 +90,17 @@ void PreprocessBackwardPass::bind_buffers(const Buffers& b, VkBuffer ubo) {
     pipeline_->update_ssbo(descriptor_set_,
                            preprocess_backward_bind::D_RAW_OPACITIES, b.d_raw_opacities);
     pipeline_->update_ssbo(descriptor_set_,
-                           preprocess_backward_bind::RAW_ROTATIONS,   b.raw_rotations);
+                           preprocess_backward_bind::RAW_ROTATIONS,      b.raw_rotations);
     pipeline_->update_ssbo(descriptor_set_,
-                           preprocess_backward_bind::MEANS2D_CACHE,   b.means2D_cache);
+                           preprocess_backward_bind::MEANS2D_CACHE,      b.means2D_cache);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::P_VIEW_CACHE_IN,    b.p_view_cache_in);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::COV2D_CACHE_IN,     b.cov2D_cache_in);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::COV2D_DET_CACHE_IN, b.cov2D_det_cache_in);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::P_HOM_W_CACHE_IN,   b.p_hom_w_cache_in);
 
     // UBO binding 16 (PreprocessBackwardUBO, 192 bytes).
     pipeline_->update_ubo(descriptor_set_,

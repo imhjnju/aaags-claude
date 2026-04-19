@@ -1,6 +1,6 @@
 // preprocess_pass.h -- Thin owner of the preprocess.comp compute pipeline
-// (spec §4.8.1). Holds the shader module, compute pipeline (with the 17
-// bindings: 16 SSBO + 1 UBO mixed binding layout), and one descriptor set. Provides two
+// (spec §4.8.1). Holds the shader module, compute pipeline (with the 19
+// bindings: 18 SSBO + 1 UBO mixed binding layout), and one descriptor set. Provides two
 // dispatch entry points:
 //   * dispatch_sync(): Layer 1 sync dispatch (used by tests/bring-up).
 //   * record():        Layer 2 external cmd buffer recording (used by the
@@ -42,10 +42,12 @@ public:
         VkBuffer camera_ubo;
         // Float radius SSBO (binding 13)
         VkBuffer radius_f;
-        // Cache SSBOs for backward pass (bindings 14..16)
-        VkBuffer cov3D_cache;    // binding 14, [N*6] floats
-        VkBuffer p_view_cache;   // binding 15, [N*3] floats
-        VkBuffer p_hom_w_cache;  // binding 16, [N]   floats
+        // Cache SSBOs for backward pass (bindings 14..18)
+        VkBuffer cov3D_cache;        // binding 14, [N*6] floats
+        VkBuffer p_view_cache;       // binding 15, [N*3] floats
+        VkBuffer p_hom_w_cache;      // binding 16, [N]   floats
+        VkBuffer cov2D_cache;        // binding 17, [N*3] floats (fa, fb, fc) dilated cov2D
+        VkBuffer cov2D_det_cache;    // binding 18, [N]   floats det = fa*fc - fb*fb
     };
 
     /// @param spec_training 1=training (skip SH RGB clamp), 0=inference (clamp)

@@ -283,8 +283,19 @@ TEST(PreprocessorBackwardVulkan, CulledGaussianZeroGrad) {
     // Set cov3D for Gaussian 0 (diagonal)
     cache.cov3D[0] = 1.0f; cache.cov3D[3] = 1.0f; cache.cov3D[5] = 1.0f;
 
-    // Set p_view for Gaussian 0 (view-space z=5)
+    // Set p_view for Gaussian 0 (view-space z=5, identity view so same as world pos)
     cache.p_view[2] = 5.0f;
+
+    // Set cov2D and cov2D_det for Gaussian 0.
+    // Camera: identity view, W=H=16, focal=8 (=16/(2*1.0)), tan_fov=1.0
+    // t = [0, 0, 5] (identity view); J diag = [8/5, 8/5, 0]; T = I * J = J
+    // result = J^T * I * J: result[0][0] = (8/5)^2 = 2.56, result[1][1] = 2.56
+    // fa = 2.56 + 0.3 = 2.86, fc = 2.86, fb = 0, det = 2.86^2 = 8.1796
+    cache.cov2D[0]     = 2.86f;   // fa (Gaussian 0)
+    cache.cov2D[1]     = 0.0f;    // fb
+    cache.cov2D[2]     = 2.86f;   // fc
+    cache.cov2D_det[0] = 8.1796f; // det = fa*fc - fb^2
+    // Gaussian 1 (culled): cov2D remains 0 from memset
 
     PreprocessOutput pre{};
     pre.radii = alloc.allocate_array<int>(N);

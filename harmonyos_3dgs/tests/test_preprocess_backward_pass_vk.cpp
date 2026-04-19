@@ -179,6 +179,13 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     auto rawrot_buf   = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto m2d_cache_buf= std::make_unique<VulkanBuffer>(ctx, N*2*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto ubo_buf      = std::make_unique<VulkanBuffer>(ctx, sizeof(PreprocessBackwardUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    // Bindings 19..22: p_view_cache_in, cov2D_cache_in, cov2D_det_cache_in, p_hom_w_cache_in
+    // p_view_cache_in: with identity view matrix, p_view = world position
+    auto pview_in_buf = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto cov2d_in_buf = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto c2ddet_in_buf= std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // p_hom_w_cache_in: for identity proj with proj[11]=1, p_hom.w = z
+    auto phomw_in_buf = std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // ---- Upload inputs ----------------------------------------------------
     pos_buf     ->upload(positions.data(),          N*3*sizeof(float));
@@ -201,6 +208,39 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     m2d_cache_buf->upload(means2D_cache_data.data(),N*2*sizeof(float));
     ubo_buf     ->upload(&ubo,                      sizeof(ubo));
 
+    // p_view_cache_in: with identity view matrix, p_view = world position (x,y,z)
+    // Positions: [0,0,5], [1,0.5,4], [-1,0,3], [0.5,-0.5,6]
+    pview_in_buf->upload(positions.data(), N*3*sizeof(float));
+
+    // cov2D_cache_in: dilated cov2D for each Gaussian.
+    // Camera: identity view, W=H=64, tan_fov=1.0, focal=32.0
+    // With identity view and diagonal cov3D: result[0][0] = (focal/t.z)^2 * sigma_x^2
+    // For diagonal cov3D = diag(1,1,1) and identity view: fa = fc = (focal/t.z)^2 + 0.3, fb = 0
+    // Gaussian 0: z=5 -> fa=fc=(32/5)^2+0.3=41.26, det=41.26^2
+    // Gaussian 1: z=4 -> fa=fc=(32/4)^2+0.3=64.30, det=64.30^2
+    // Gaussian 2: z=3 (culled, radii=0) -> fa=fc=0 (doesn't matter, shader skips)
+    // Gaussian 3: z=6 -> fa=fc=(32/6)^2+0.3=28.58, det=28.58^2
+    std::vector<float> cov2d_data(N * 3, 0.0f);
+    std::vector<float> c2ddet_data(N, 0.0f);
+    // active Gaussians: 0, 1, 3
+    float fa0 = (32.0f/5.0f)*(32.0f/5.0f) + 0.3f;  // 41.26
+    float fa1 = (32.0f/4.0f)*(32.0f/4.0f) + 0.3f;  // 64.30
+    float fa3 = (32.0f/6.0f)*(32.0f/6.0f) + 0.3f;  // 28.58
+    cov2d_data[0*3+0] = fa0; cov2d_data[0*3+1] = 0.0f; cov2d_data[0*3+2] = fa0;
+    cov2d_data[1*3+0] = fa1; cov2d_data[1*3+1] = 0.0f; cov2d_data[1*3+2] = fa1;
+    // Gaussian 2 culled: cov2d = 0 (already set)
+    cov2d_data[3*3+0] = fa3; cov2d_data[3*3+1] = 0.0f; cov2d_data[3*3+2] = fa3;
+    c2ddet_data[0] = fa0 * fa0;
+    c2ddet_data[1] = fa1 * fa1;
+    c2ddet_data[3] = fa3 * fa3;
+    cov2d_in_buf ->upload(cov2d_data.data(),   N*3*sizeof(float));
+    c2ddet_in_buf->upload(c2ddet_data.data(),  N*sizeof(float));
+
+    // p_hom_w_cache_in: for identity proj with proj[11]=1, p_hom.w = z component
+    // Positions[i].z: 5, 4, 3, 6 for Gaussians 0..3
+    std::vector<float> phomw_data = {5.0f, 4.0f, 3.0f, 6.0f};
+    phomw_in_buf ->upload(phomw_data.data(),   N*sizeof(float));
+
     // ---- Create pass and dispatch -----------------------------------------
     PreprocessBackwardPass pass(ctx);
 
@@ -221,8 +261,12 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     pb.d_rotations     = drot_buf     ->handle();
     pb.opacities       = opa_buf      ->handle();
     pb.d_raw_opacities = d_raw_opa_buf->handle();
-    pb.raw_rotations   = rawrot_buf   ->handle();
-    pb.means2D_cache   = m2d_cache_buf->handle();
+    pb.raw_rotations      = rawrot_buf   ->handle();
+    pb.means2D_cache      = m2d_cache_buf->handle();
+    pb.p_view_cache_in    = pview_in_buf ->handle();
+    pb.cov2D_cache_in     = cov2d_in_buf ->handle();
+    pb.cov2D_det_cache_in = c2ddet_in_buf->handle();
+    pb.p_hom_w_cache_in   = phomw_in_buf ->handle();
 
     pass.bind_buffers(pb, ubo_buf->handle());
     pass.dispatch_sync(N);

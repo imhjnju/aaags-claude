@@ -446,24 +446,16 @@ TEST(BackwardPipeline, FullChain_TinyFixture) {
     }
 
     // Compare Vulkan vs CPU with 1e-4 tolerance.
-    // SP-4 Task 5: d_raw_positions now uses cached means2D (binding 18) to recover
-    // ndc via the exact inverse of ndc2Pix, matching preprocessor_backward_cpu.cpp:621-626.
-    // This fixes Part D (projection path) of the backward shader.
-    //
-    // The residual d_raw_positions error (~0.82 max on tiny golden fixture) comes from
-    // Part A (covariance path): the shader recomputes cov2D from scratch while the CPU
-    // backward reads cached cov2D/cov2D_det. These differ slightly due to floating-point
-    // rounding. The PreprocessorBackwardVulkan.MatchesCPU_TinyGolden test passes at 1e-4
-    // for a simple camera where Part A round-trip is exact; the full-pipeline test uses
-    // a real camera where Part A recompute diverges up to ~0.82.
-    //
-    // Tightening to 1e-3 would require also caching cov2D (Part A, separate task).
-    // Mandatory at 1.5 — covers observed 0.82 + margin.
+    // SP-4 cov2D-cache fix: backward shader now reads cov2D/cov2D_det/p_view from forward
+    // cache (bindings 19..21) instead of recomputing them, eliminating the FP-divergence
+    // that caused ~0.82 abs error in d_raw_positions from Part A.
     const float tol = 1e-4f;
 
-    // d_raw_positions — mandatory at 1.5 (Part D fixed; residual from Part A cov2D recompute)
+    // d_raw_positions — mandatory at 1e-4 (Part D: cached means2D; Part A: cached cov2D/det/p_view)
+    // SP-4 fix: preprocess_backward.comp now reads cov2D, cov2D_det, p_view from forward cache
+    // (bindings 19..21) eliminating the ~0.82 abs error from FP-recompute divergence.
     for (int k = 0; k < N * 3; ++k) {
-        EXPECT_NEAR(grads_vk.d_raw_positions[k], grads_cpu.d_raw_positions[k], 1.5f)
+        EXPECT_NEAR(grads_vk.d_raw_positions[k], grads_cpu.d_raw_positions[k], tol)
             << "d_raw_positions[" << k << "]: vk=" << grads_vk.d_raw_positions[k]
             << " cpu=" << grads_cpu.d_raw_positions[k];
     }

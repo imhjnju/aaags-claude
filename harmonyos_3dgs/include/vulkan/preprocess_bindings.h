@@ -23,6 +23,8 @@ constexpr uint32_t RADIUS_F            = 13;  // float eigenvalue radius (scatte
 constexpr uint32_t COV3D_CACHE         = 14;  // [N*6] 3D covariance cache for backward
 constexpr uint32_t P_VIEW_CACHE        = 15;  // [N*3] view-space position cache for backward
 constexpr uint32_t P_HOM_W_CACHE       = 16;  // [N]   clip-space w cache for backward
+constexpr uint32_t COV2D_CACHE         = 17;  // WO float[N*3]  (fa, fb, fc) dilated cov2D
+constexpr uint32_t COV2D_DET_CACHE     = 18;  // WO float[N]    det = fa*fc - fb*fb
 }  // namespace preprocess_bind
 
 // Push constants (24 bytes, spec §4.8.1)

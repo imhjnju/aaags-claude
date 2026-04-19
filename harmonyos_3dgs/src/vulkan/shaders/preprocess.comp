@@ -59,10 +59,12 @@ layout(std430, set = 0, binding = 11) writeonly buffer BufTiles      { int   til
 // ---- Float radius SSBO (binding 13, after UBO at 12) -----------------------
 layout(std430, set = 0, binding = 13) writeonly buffer BufRadiusF    { float radius_f_arr[]; };
 
-// ---- ForwardCache SSBOs for backward pass (bindings 14..16) ----------------
-layout(std430, set = 0, binding = 14) writeonly buffer BufCov3DCache  { float cov3D_cache[];  };  // [N*6]
-layout(std430, set = 0, binding = 15) writeonly buffer BufPViewCache  { float p_view_cache[]; };  // [N*3]
-layout(std430, set = 0, binding = 16) writeonly buffer BufPHomWCache  { float p_hom_w_cache[];};  // [N]
+// ---- ForwardCache SSBOs for backward pass (bindings 14..18) ----------------
+layout(std430, set = 0, binding = 14) writeonly buffer BufCov3DCache    { float cov3D_cache[];    };  // [N*6]
+layout(std430, set = 0, binding = 15) writeonly buffer BufPViewCache    { float p_view_cache[];   };  // [N*3]
+layout(std430, set = 0, binding = 16) writeonly buffer BufPHomWCache    { float p_hom_w_cache[];  };  // [N]
+layout(std430, set = 0, binding = 17) writeonly buffer BufCov2DCache    { float cov2D_cache[];    };  // [N*3] dilated cov2D (fa, fb, fc)
+layout(std430, set = 0, binding = 18) writeonly buffer BufCov2DDetCache { float cov2D_det_cache[];};  // [N]   det = fa*fc - fb*fb
 
 // ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
 layout(std140, set = 0, binding = 12) uniform CameraUBO {
@@ -345,6 +347,8 @@ void main() {
     cov3D_cache[i*6u+3u]=0.0; cov3D_cache[i*6u+4u]=0.0; cov3D_cache[i*6u+5u]=0.0;
     p_view_cache[i*3u+0u]=0.0; p_view_cache[i*3u+1u]=0.0; p_view_cache[i*3u+2u]=0.0;
     p_hom_w_cache[i]=0.0;
+    cov2D_cache[i*3u+0u]=0.0; cov2D_cache[i*3u+1u]=0.0; cov2D_cache[i*3u+2u]=0.0;
+    cov2D_det_cache[i]=0.0;
 
     vec3 position = vec3(positions[i*3u + 0u],
                          positions[i*3u + 1u],
@@ -387,6 +391,15 @@ void main() {
     // 8. Determinant.
     float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
     if (det == 0.0) return;  // CPU tests `det == 0.0f`.
+
+    // Cache dilated cov2D and det for backward pass (bindings 17..18).
+    // Written here (after dilation, before cull checks) so backward Part A
+    // can use the exact same values the forward used — avoiding FP divergence.
+    uint base3 = i * 3u;
+    cov2D_cache[base3 + 0u]  = cov2D.x;   // fa = result[0][0] + 0.3 (dilated)
+    cov2D_cache[base3 + 1u]  = cov2D.y;   // fb = result[1][0]
+    cov2D_cache[base3 + 2u]  = cov2D.z;   // fc = result[1][1] + 0.3 (dilated)
+    cov2D_det_cache[i]        = det;       // det = fa*fc - fb*fb
 
     // 9. Conic = inverse(cov2D) upper triangle.
     float det_inv = 1.0 / det;

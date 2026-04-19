@@ -117,7 +117,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     auto cam_buf = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    // ForwardCache output buffers (bindings 14..16).
+    // ForwardCache output buffers (bindings 14..18).
     // Always allocated so the shader descriptor set is always fully bound.
     cov3d_buf_   = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * 6 * sizeof(float),
@@ -126,6 +126,12 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     p_hom_w_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    cov2d_buf_   = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    cov2d_det_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
@@ -192,9 +198,11 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     b.tiles_touched         = tt_buf ->handle();
     b.camera_ubo            = cam_buf->handle();
     b.radius_f              = rf_buf ->handle();
-    b.cov3D_cache           = cov3d_buf_  ->handle();
-    b.p_view_cache          = p_view_buf_ ->handle();
-    b.p_hom_w_cache         = p_hom_w_buf_->handle();
+    b.cov3D_cache           = cov3d_buf_    ->handle();
+    b.p_view_cache          = p_view_buf_   ->handle();
+    b.p_hom_w_cache         = p_hom_w_buf_  ->handle();
+    b.cov2D_cache           = cov2d_buf_    ->handle();
+    b.cov2D_det_cache       = cov2d_det_buf_->handle();
     pass_->bind_buffers(b);
 
     PreprocessPushConstants pc{};
@@ -254,15 +262,19 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
 // ---------------------------------------------------------------------------
 void PreprocessorVulkan::download_cache(int N, ForwardCache& cache,
                                         FrameAllocator& alloc) {
-    if (!cov3d_buf_ || !p_view_buf_ || !p_hom_w_buf_)
+    if (!cov3d_buf_ || !p_view_buf_ || !p_hom_w_buf_ || !cov2d_buf_ || !cov2d_det_buf_)
         throw std::runtime_error(
             "PreprocessorVulkan::download_cache: process() not yet called");
-    cache.cov3D   = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 6);
-    cache.p_view  = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
-    cache.p_hom_w = alloc.allocate_array<float>(static_cast<std::size_t>(N));
-    cov3d_buf_  ->download(cache.cov3D,   static_cast<std::size_t>(N) * 6 * sizeof(float));
-    p_view_buf_ ->download(cache.p_view,  static_cast<std::size_t>(N) * 3 * sizeof(float));
-    p_hom_w_buf_->download(cache.p_hom_w, static_cast<std::size_t>(N) * sizeof(float));
+    cache.cov3D     = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 6);
+    cache.p_view    = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    cache.p_hom_w   = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    cache.cov2D     = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    cache.cov2D_det = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    cov3d_buf_    ->download(cache.cov3D,     static_cast<std::size_t>(N) * 6 * sizeof(float));
+    p_view_buf_   ->download(cache.p_view,    static_cast<std::size_t>(N) * 3 * sizeof(float));
+    p_hom_w_buf_  ->download(cache.p_hom_w,   static_cast<std::size_t>(N) * sizeof(float));
+    cov2d_buf_    ->download(cache.cov2D,     static_cast<std::size_t>(N) * 3 * sizeof(float));
+    cov2d_det_buf_->download(cache.cov2D_det, static_cast<std::size_t>(N) * sizeof(float));
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +307,8 @@ enum RecBufIdx : size_t {
     kCov3DCache,     // binding 14: ForwardCache cov3D [N*6 floats]
     kPViewCache,     // binding 15: ForwardCache p_view [N*3 floats]
     kPHomWCache,     // binding 16: ForwardCache p_hom_w [N floats]
+    kCov2DCache,     // binding 17: ForwardCache cov2D [N*3 floats] dilated (fa, fb, fc)
+    kCov2DDetCache,  // binding 18: ForwardCache cov2D_det [N floats] det = fa*fc - fb*fb
     kRecBufCount,
 };
 }  // namespace
@@ -360,7 +374,7 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
         ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     record_bufs_[kRadiusF]             =
         mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
-    // ForwardCache output scratch buffers (bindings 14..16).
+    // ForwardCache output scratch buffers (bindings 14..18).
     // Always allocated so the descriptor set is fully bound. Layer-2 callers
     // that use record() don't download these — that is a Layer-1 concern.
     record_bufs_[kCov3DCache]          =
@@ -368,6 +382,10 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     record_bufs_[kPViewCache]          =
         mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
     record_bufs_[kPHomWCache]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    record_bufs_[kCov2DCache]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    record_bufs_[kCov2DDetCache]       =
         mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
 
     // --- 2. Upload inputs ----------------------------------------------------
@@ -430,6 +448,8 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     b.cov3D_cache          = record_bufs_[kCov3DCache]          ->handle();
     b.p_view_cache         = record_bufs_[kPViewCache]          ->handle();
     b.p_hom_w_cache        = record_bufs_[kPHomWCache]          ->handle();
+    b.cov2D_cache          = record_bufs_[kCov2DCache]          ->handle();
+    b.cov2D_det_cache      = record_bufs_[kCov2DDetCache]       ->handle();
     pass_->bind_buffers(b);
 }
 

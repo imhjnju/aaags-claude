@@ -72,9 +72,9 @@ public:
     VkBuffer tiles_touched_buffer() const;
     VkBuffer radius_f_buffer() const;
 
-    // Download the 3 ForwardCache fields populated during process().
+    // Download the 5 ForwardCache fields populated during process().
     // Must be called after process(); throws if process() hasn't run yet.
-    // cache fields cov3D, p_view, p_hom_w are allocated from alloc and filled.
+    // cache fields cov3D, p_view, p_hom_w, cov2D, cov2D_det are allocated from alloc and filled.
     void download_cache(int num_gaussians, ForwardCache& cache, FrameAllocator& alloc);
 
 private:
@@ -83,10 +83,12 @@ private:
 
     // Layer-1 per-call ForwardCache output buffers.
     // Allocated in process() when the feature is used; reset each call.
-    // Named cov3d_buf_ / p_view_buf_ / p_hom_w_buf_ (Layer-1 scope).
+    // Named cov3d_buf_ / p_view_buf_ / p_hom_w_buf_ / cov2d_buf_ / cov2d_det_buf_ (Layer-1 scope).
     std::unique_ptr<VulkanBuffer> cov3d_buf_;
     std::unique_ptr<VulkanBuffer> p_view_buf_;
     std::unique_ptr<VulkanBuffer> p_hom_w_buf_;
+    std::unique_ptr<VulkanBuffer> cov2d_buf_;
+    std::unique_ptr<VulkanBuffer> cov2d_det_buf_;
 
     // Layer-2 persistent buffers. Filled by prepare_record(); released and
     // re-allocated on the next prepare_record(). Index into this vector:
