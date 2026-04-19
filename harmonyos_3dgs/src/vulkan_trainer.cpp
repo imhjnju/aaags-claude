@@ -1,5 +1,6 @@
 #include "vulkan_trainer.h"
 #include "dssim.h"
+#include "train_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -253,6 +254,38 @@ float VulkanTrainer::step(const Camera& cam,
     GradientOutput grads{};
     preprocessor_bwd_.backward(g_, N_, cam, active_cfg, cache, rgrad,
                                raw_view_, grads, alloc_);
+
+    // SP-6 T2: Regularization gradient injection.
+    // After preprocessor_bwd_ writes raw-param gradients, add L1 regularization
+    // gradient corrections before the GPU upload.
+    //
+    // Opacity reg: loss += opacity_reg * mean(|sigmoid(raw_op)|)
+    //   => dL/d_raw_op[i] += (opacity_reg / N) * sig * (1 - sig)
+    //      where sig = sigmoid(raw_op[i]) = act_opacities_[i]
+    //
+    // Scale reg: loss += scale_reg * mean(|exp(raw_sc)|)  (per-component)
+    //   => dL/d_raw_sc[i,k] += (scale_reg / N) * exp(raw_sc[i,k])
+    //      where exp(raw_sc[i,k]) = act_scales_[i*3+k]
+    //
+    // Evidence: test RegularizationGrad.ScaleGradAtRawLogScale asserts per-component
+    // formula (no norm division), test RegularizationGrad.OpacityGradAtRawZero asserts
+    // plain sigmoid derivative (not op_sigmoid which is for noise injection).
+    if (N_ > 0 && (tcfg_.opacity_reg > 0.f || tcfg_.scale_reg > 0.f)) {
+        const float inv_N = 1.0f / static_cast<float>(N_);
+        for (int i = 0; i < N_; ++i) {
+            if (tcfg_.opacity_reg > 0.f) {
+                const float sig = act_opacities_[static_cast<size_t>(i)];
+                grads.d_raw_opacities[i] += (tcfg_.opacity_reg * inv_N) * sig * (1.f - sig);
+            }
+            if (tcfg_.scale_reg > 0.f) {
+                const float coeff = tcfg_.scale_reg * inv_N;
+                for (int k = 0; k < 3; ++k) {
+                    const size_t idx = static_cast<size_t>(i) * 3 + k;
+                    grads.d_raw_scales[idx] += coeff * act_scales_[idx];
+                }
+            }
+        }
+    }
 
     // 8. Upload CPU gradients to gradient GPU buffers.
     //    SH: DC (first N*3 floats) and rest (remaining N*(max_coeffs-1)*3 floats)
