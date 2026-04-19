@@ -1,6 +1,6 @@
-// test_training_step_vk.cpp — SP-4 Task 8: VulkanTrainer integration tests.
+// test_training_step_vk.cpp — SP-4 Task 8 + SP-5 Task 3: VulkanTrainer integration tests.
 //
-// Three tests:
+// Five tests:
 //   T-step-count  : VulkanTrainer.StepCountIncreases
 //       Load tiny golden fixture. Run 3 steps, assert step_count() == 3.
 //
@@ -11,6 +11,14 @@
 //   T-step10      : VulkanTrainer.LossDecreasesOverSteps
 //       All-zeros target. Loss = mean(|rendered|). Adam should drive it lower
 //       over 10 steps. Assert loss_step10 < loss_step1.
+//
+//   T-lr-decay    : VulkanTrainer.LRDecayReducesPositionUpdate
+//       Fast-decay config (max_steps=10, init=1e-2, final=1e-5). Assert the
+//       position update magnitude at step 10 < step 1 (lr decayed).
+//
+//   T-sh-schedule : VulkanTrainer.SHDegreeSchedule
+//       warmup=5 steps per increment. Assert active_sh_degree()==1 after 5
+//       steps and ==2 after 10 steps.
 //
 // All tests use the tiny golden fixture (N=103, 64x64) so the scene is
 // guaranteed to produce visible Gaussians without needing to hand-craft a
@@ -297,4 +305,103 @@ TEST(VulkanTrainer, LossDecreasesOverSteps) {
 
     EXPECT_GE(loss_step10, 0.0f);
     EXPECT_FALSE(std::isnan(loss_step10));
+}
+
+// ---------------------------------------------------------------------------
+// T-lr-decay : position update shrinks as LR decays exponentially
+// ---------------------------------------------------------------------------
+
+TEST(VulkanTrainer, LRDecayReducesPositionUpdate) {
+    // Test that position LR decays over steps: the position update at step 1
+    // should be larger than at step 10 (for fixed gradient, smaller lr => smaller update).
+    // Use a fast-decay config: pos_lr_init=1e-2, pos_lr_final=1e-5, max_steps=10.
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    VkTrainingConfig tcfg;
+    tcfg.pos_lr_init      = 1e-2f;
+    tcfg.pos_lr_final     = 1e-5f;
+    tcfg.max_steps        = 10;
+    tcfg.sh_degree_warmup = 10000;  // disable SH scheduling for this test
+    tcfg.sh_degree_max    = 3;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, tcfg);
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+
+    // Step 1: record positions before and after to get delta1.
+    std::vector<float> pos_before(scene.raw_positions);
+    trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H);
+    const float* pos_after1 = trainer.raw_params().raw_positions;
+    float delta1 = 0.0f;
+    for (int i = 0; i < scene.N * 3; ++i) {
+        delta1 += std::fabs(pos_after1[i] - pos_before[i]);
+    }
+
+    // Steps 2–9 (intermediate).
+    for (int i = 1; i < 9; ++i) {
+        trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H);
+    }
+
+    // Step 10: record positions before and after to get delta10.
+    std::vector<float> pos_before10(trainer.raw_params().raw_positions,
+                                    trainer.raw_params().raw_positions + scene.N * 3);
+    trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H);
+    const float* pos_after10 = trainer.raw_params().raw_positions;
+    float delta10 = 0.0f;
+    for (int i = 0; i < scene.N * 3; ++i) {
+        delta10 += std::fabs(pos_after10[i] - pos_before10[i]);
+    }
+
+    // Position update at step 10 must be smaller than at step 1 (LR decayed).
+    EXPECT_LT(delta10, delta1)
+        << "LR decay did not reduce position update: delta1=" << delta1
+        << " delta10=" << delta10;
+}
+
+// ---------------------------------------------------------------------------
+// T-sh-schedule : active_sh_degree increments by warmup schedule
+// ---------------------------------------------------------------------------
+
+TEST(VulkanTrainer, SHDegreeSchedule) {
+    // After warmup steps, active_sh_degree should increment.
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    VkTrainingConfig tcfg;
+    tcfg.sh_degree_max    = 3;
+    tcfg.sh_degree_warmup = 5;   // increment every 5 steps for fast test
+    tcfg.pos_lr_init      = 1.6e-4f;
+    tcfg.pos_lr_final     = 1.6e-6f;
+    tcfg.max_steps        = 30000;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, tcfg);
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+
+    // Run 5 steps: step_count_ == 5, active_sh_degree_ = 5 / 5 = 1.
+    for (int i = 0; i < 5; ++i) {
+        trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H);
+    }
+    EXPECT_EQ(trainer.active_sh_degree(), 1)
+        << "Expected active_sh_degree==1 after 5 steps (warmup=5).";
+
+    // Run 5 more steps (total 10): active_sh_degree_ = 10 / 5 = 2.
+    for (int i = 0; i < 5; ++i) {
+        trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H);
+    }
+    EXPECT_EQ(trainer.active_sh_degree(), 2)
+        << "Expected active_sh_degree==2 after 10 steps (warmup=5).";
 }

@@ -47,7 +47,7 @@ struct TrainConfig {
     float lr_position_init  = 0.00016f;
     float lr_position_final = 0.0000016f;
     float lr_feature        = 0.0025f;
-    float lr_opacity        = 0.025f;
+    float lr_opacity        = 0.025f;  // CPU trainer default; VulkanTrainer uses 0.05f (Python ref)
     float lr_scaling        = 0.005f;
     float lr_rotation       = 0.001f;
     int   max_steps         = 30000;
@@ -160,4 +160,25 @@ struct OwnedRawParams {
         sh_coeffs.assign(r.raw_sh_coeffs, r.raw_sh_coeffs + N*mc3);
         opacities.assign(r.raw_opacities, r.raw_opacities + N);
     }
+};
+
+// Training configuration for VulkanTrainer.
+// Separate from the legacy TrainConfig used by the CPU trainer.
+struct VkTrainingConfig {
+    int   max_steps           = 30000;
+    float pos_lr_init         = 1.6e-4f;
+    float pos_lr_final        = 1.6e-6f;
+    int   sh_degree_max       = 3;      // final SH degree
+    int   sh_degree_warmup    = 1000;   // steps between SH degree increments
+
+    // Loss: combined L1 + DSSIM weight (0 = L1-only, 0.2 = Python reference default)
+    float lambda_dssim          = 0.2f;
+
+    // Densification hyperparameters (used in Task 5 — MCMC densification)
+    float densify_grad_thresh   = 2e-4f;
+    float opacity_thresh        = 0.005f;
+    int   densify_from_step     = 500;   // 0 = disabled (skips densification entirely)
+    int   densify_until_step    = 15000;
+    int   densify_interval      = 100;
+    float densify_percent_dense = 0.01f;
 };

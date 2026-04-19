@@ -22,11 +22,62 @@
 #include "vulkan/vk_buffer.h"
 #include "types.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// CPU fallback sort — used when R > kRadixLocalSize (256).
+// The Phase-1 radix sort is single-workgroup (256 threads), so it cannot
+// handle more than 256 elements. For large scenes (e.g. basketball 2892 pts)
+// total_pairs easily exceeds 256. This fallback uses std::sort on the CPU
+// and is functionally identical to SorterCPU::sort().
+// ---------------------------------------------------------------------------
+static void sort_cpu_fallback(BinningOutput& bin, FrameAllocator& alloc)
+{
+    const int R         = bin.total_pairs;
+    const int num_tiles = bin.num_tiles;
+
+    // Allocate output arrays from the frame allocator (same lifetime as Vulkan path).
+    bin.keys_sorted   = alloc.allocate_array<uint64_t>(static_cast<size_t>(R));
+    bin.values_sorted = alloc.allocate_array<uint32_t>(static_cast<size_t>(R));
+    bin.tile_ranges   = alloc.allocate_array<uint32_t>(
+                            static_cast<size_t>(num_tiles) * 2u);
+    std::memset(bin.tile_ranges, 0,
+                static_cast<size_t>(num_tiles) * 2u * sizeof(uint32_t));
+
+    // Stable-sort an index array by key, then scatter.
+    uint32_t* indices = alloc.allocate_array<uint32_t>(static_cast<size_t>(R));
+    std::iota(indices, indices + R, 0u);
+    std::stable_sort(indices, indices + R, [&](uint32_t a, uint32_t b) {
+        return bin.keys_unsorted[a] < bin.keys_unsorted[b];
+    });
+    for (int i = 0; i < R; ++i) {
+        bin.keys_sorted[i]   = bin.keys_unsorted[indices[i]];
+        bin.values_sorted[i] = bin.values_unsorted[indices[i]];
+    }
+
+    // Compute tile ranges from sorted keys (upper 32 bits = tile index).
+    for (int i = 0; i < R; ++i) {
+        const uint32_t cur_tile = static_cast<uint32_t>(bin.keys_sorted[i] >> 32);
+        if (i == 0) {
+            bin.tile_ranges[cur_tile * 2u] = 0u;
+        } else {
+            const uint32_t prev_tile = static_cast<uint32_t>(bin.keys_sorted[i - 1] >> 32);
+            if (cur_tile != prev_tile) {
+                bin.tile_ranges[prev_tile * 2u + 1u] = static_cast<uint32_t>(i);
+                bin.tile_ranges[cur_tile  * 2u]      = static_cast<uint32_t>(i);
+            }
+        }
+        if (i == R - 1) {
+            bin.tile_ranges[cur_tile * 2u + 1u] = static_cast<uint32_t>(R);
+        }
+    }
+}
 
 SorterVulkan::SorterVulkan(VulkanContext& ctx)
     : ctx_(ctx) {
@@ -68,6 +119,16 @@ void SorterVulkan::sort(BinningOutput& bin, FrameAllocator& alloc) {
     if (!bin.keys_unsorted || !bin.values_unsorted)
         throw std::runtime_error(
             "SorterVulkan::sort: keys_unsorted/values_unsorted is null");
+
+    // ---- Large-input CPU fallback -----------------------------------------
+    // Phase-1 radix sort is single-workgroup (256 threads) and cannot handle
+    // R > 256. For large scenes (e.g. basketball, thousands of (tile,Gaussian)
+    // pairs) fall back to CPU std::stable_sort which is always correct.
+    constexpr int kRadixLocalSize = 256;
+    if (R > kRadixLocalSize) {
+        sort_cpu_fallback(bin, alloc);
+        return;
+    }
 
     const uint32_t R_u = static_cast<uint32_t>(R);
 

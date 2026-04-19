@@ -38,6 +38,8 @@ add_library(gs3d_core
     src/trainer.cpp
     src/density_controller.cpp
     src/cpu_adam.cpp
+    src/dssim.cpp
+    src/densification.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
@@ -106,6 +108,7 @@ if(BUILD_TESTS)
         tests/test_manifest.cpp
         tests/test_golden_roundtrip.cpp
         tests/test_cpu_adam.cpp
+        tests/test_dssim.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
@@ -200,6 +203,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
         gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
         gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
+        gs3d_compile_glsl(adam_step _spv_adam_step)
+        gs3d_embed_spirv(adam_step _hdr_adam_step)
         add_custom_target(gs3d_vulkan_shaders
             DEPENDS ${_spv_add_one} ${_hdr_add_one}
                     ${_spv_hello} ${_hdr_hello}
@@ -211,7 +216,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_tile_range} ${_hdr_tile_range}
                     ${_spv_rasterize} ${_hdr_rasterize}
                     ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
-                    ${_spv_preprocess_backward} ${_hdr_preprocess_backward})
+                    ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
+                    ${_spv_adam_step} ${_hdr_adam_step})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
@@ -233,6 +239,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/rasterizer_backward_vulkan.cpp
             src/vulkan/preprocess_backward_pass.cpp
             src/vulkan/preprocessor_backward_vulkan.cpp
+            src/vulkan/vulkan_adam.cpp
             src/vulkan_trainer.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
@@ -271,21 +278,30 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_preprocessor_backward_vulkan.cpp
                 tests/test_backward_pipeline_vk.cpp
                 tests/test_forward_cache_vk.cpp
-                tests/test_training_step_vk.cpp)
+                tests/test_training_step_vk.cpp
+                tests/test_vulkan_adam.cpp
+                tests/test_densification.cpp
+                tests/test_e2e_basketball.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
                 gs3d_vk_core gs3d_core GTest::gtest_main)
             target_include_directories(gs3d_vk_tests PRIVATE
                 ${_vk_shader_dir}   # xxd-embedded headers (hello_spv.h etc.)
-                tests)
+                tests
+                include)            # extern/stb_image.h
             # TEST_DATA_DIR is needed by test_preprocess_pass_vk.cpp to
             # locate the tiny golden fixture (../golden/tiny/step.../cam...).
             target_compile_definitions(gs3d_vk_tests PRIVATE
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}"
                 TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
-            gtest_discover_tests(gs3d_vk_tests)
+            # E2E basketball test runs 2000 training steps — allow up to 2 hours.
+            # The synchronous GPU dispatch model makes it slow on the dev machine;
+            # a pipeline-recorded dispatch path would reduce this significantly.
+            # All gs3d_vk_tests get a generous timeout; the basketball test needs
+            # the most headroom.
+            gtest_discover_tests(gs3d_vk_tests PROPERTIES TIMEOUT 7200)
         endif()
         message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello, preprocess)")
     else()

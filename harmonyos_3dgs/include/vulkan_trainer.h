@@ -2,8 +2,10 @@
 
 #include "types.h"
 #include "train_types.h"
-#include "cpu_adam.h"
+#include "densification.h"
 #include "vulkan/vk_context.h"
+#include "vulkan/vk_buffer.h"
+#include "vulkan/vulkan_adam.h"
 #include "vulkan/preprocessor_vulkan.h"
 #include "vulkan/tile_binner_vulkan.h"
 #include "vulkan/sorter_vulkan.h"
@@ -15,11 +17,9 @@
 #include <memory>
 
 // VulkanTrainer wires the full forward→backward→Adam pipeline for one
-// training step. The optimizer is CpuAdam (temporary CPU-side; a Vulkan
-// compute Adam will replace it in a future sprint). The optimizer call site
-// is isolated to step() and parameterized through the Adam groups stored in
-// the constructor, so swapping to a GPU Adam requires changes only at those
-// sites.
+// training step. The optimizer is VulkanAdam (GPU compute). All 6 parameter
+// groups are updated via GPU dispatch each step; raw params are then downloaded
+// back to CPU for the next forward pass activation.
 class VulkanTrainer {
 public:
     // init_g: initial Gaussian parameters (activated values)
@@ -29,7 +29,8 @@ public:
                   const RawGaussianParams& init_raw,
                   int sh_degree,
                   int cam_width,
-                  int cam_height);
+                  int cam_height,
+                  const VkTrainingConfig& tcfg = VkTrainingConfig{});
 
     // One training step. Returns L1 loss value.
     float step(const Camera& cam,
@@ -38,20 +39,29 @@ public:
                int target_W,
                int target_H);
 
-    int step_count() const { return adam_.step_count(); }
+    int step_count() const { return step_count_; }
     float last_loss() const { return last_loss_; }
+    int active_sh_degree() const { return active_sh_degree_; }
 
     // Access current raw parameters (for inspection/checkpointing).
     const RawGaussianParams& raw_params() const { return raw_view_; }
 
+    // Access the last rendered image (pixel-major [H*W*3] float in [0,1]).
+    // Valid after the first call to step(). Size is cam_height * cam_width * 3.
+    const float* rendered_image() const { return image_.data(); }
+    int rendered_image_size() const { return static_cast<int>(image_.size()); }
+
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
+    // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
+    void reallocate_for_n(int new_N);
 
     VulkanContext&             ctx_;
     int                        N_;
     int                        max_coeffs_;
 
-    // Raw parameters — Adam updates these in-place.
+    // Raw parameters — GPU Adam updates these in-place (via GPU bufs), then
+    // downloads back to CPU for activation.
     // Stored as vectors so they own the memory.
     std::vector<float> raw_positions_;    // [N*3]
     std::vector<float> raw_scales_;       // [N*3]
@@ -61,10 +71,6 @@ private:
 
     // Non-owning view into the above vectors.
     RawGaussianParams raw_view_;
-
-    // Adam moment storage (one pair of m/v vectors per parameter group).
-    std::vector<std::vector<float>> m_storage_;  // 6 groups
-    std::vector<std::vector<float>> v_storage_;  // 6 groups
 
     // Activated parameters (rebuilt each step from raw_).
     std::vector<float> act_positions_;   // [N*3]   (= raw, no activation)
@@ -78,9 +84,44 @@ private:
     std::vector<float> image_;           // [H*W*3]
     std::vector<float> dL_dpixels_;     // [H*W*3]
 
-    FrameAllocator      alloc_;
-    CpuAdam             adam_;
-    float               last_loss_ = 0.0f;
+    FrameAllocator alloc_;
+    float          last_loss_ = 0.0f;
+
+    // GPU Adam optimizer (one pipeline shared across 6 groups).
+    VulkanAdam vulkan_adam_;
+
+    // Persistent GPU raw param buffers — one per Adam group.
+    // Group 0: positions      [N*3]
+    // Group 1: sh DC          [N*3]          (first N*3 floats of raw_sh_coeffs_)
+    // Group 2: sh rest        [N*(max-1)*3]  (remaining floats of raw_sh_coeffs_)
+    // Group 3: opacities      [N]
+    // Group 4: scales         [N*3]
+    // Group 5: rotations      [N*4]
+    std::unique_ptr<VulkanBuffer> raw_param_gpu_bufs_[6];
+
+    // Persistent GPU gradient buffers — one per param group.
+    std::unique_ptr<VulkanBuffer> grad_positions_gpu_;   // [N*3]
+    std::unique_ptr<VulkanBuffer> grad_sh_dc_gpu_;       // [N*3]
+    std::unique_ptr<VulkanBuffer> grad_sh_rest_gpu_;     // [N*(max_coeffs-1)*3]
+    std::unique_ptr<VulkanBuffer> grad_opacities_gpu_;   // [N]
+    std::unique_ptr<VulkanBuffer> grad_scales_gpu_;      // [N*3]
+    std::unique_ptr<VulkanBuffer> grad_rotations_gpu_;   // [N*4]
+
+    // Per-Gaussian accumulated gradient norm of means2D (proxy: |d_raw_positions|).
+    // Size N_, reset to zeros after each densification step.
+    std::vector<float> grad_means2D_accum_;
+
+    // 1-indexed step counter (incremented before each GPU Adam dispatch).
+    int step_count_ = 0;
+
+    // Learning rates per group — stored so step() doesn't hardcode them.
+    float group_lrs_[6] = {1.6e-4f, 2.5e-3f, 1.25e-4f, 0.05f, 0.005f, 0.001f};
+
+    // Training configuration (LR schedule, SH warmup).
+    VkTrainingConfig tcfg_;
+
+    // Current active SH degree (incremented by SH warmup schedule).
+    int active_sh_degree_ = 0;
 
     // Vulkan pipeline components.
     PreprocessorVulkan        preprocessor_;
