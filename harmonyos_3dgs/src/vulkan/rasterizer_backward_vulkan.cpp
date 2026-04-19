@@ -24,6 +24,7 @@
 #include "vulkan/vk_buffer.h"
 #include "vulkan/backward_bindings.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +38,59 @@ RasterizerBackwardVulkan::RasterizerBackwardVulkan(VulkanContext& ctx)
 }
 
 RasterizerBackwardVulkan::~RasterizerBackwardVulkan() = default;
+
+void RasterizerBackwardVulkan::prepare_for_n(int N, int R, int num_tiles, int HW) {
+    if (N <= buf_N_ && R <= buf_R_ && num_tiles <= buf_num_tiles_ && HW <= buf_HW_)
+        return;
+
+    const int N_new  = std::max(N,  buf_N_);
+    const int R_new  = std::max(R,  buf_R_);
+    const int T_new  = std::max(num_tiles, buf_num_tiles_);
+    const int HW_new = std::max(HW, buf_HW_);
+
+    tr_buf_    = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(T_new) * 2u * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    vs_buf_    = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    m2d_buf_   = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    co_buf_    = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 4u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    col_buf_   = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    tf_buf_    = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(HW_new) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    nc_buf_    = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(HW_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlpix_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(HW_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlm2d_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlcon_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlopa_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlcol_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    ubo_buf_   = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(sizeof(RasterizeBackwardUBO)),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    buf_N_ = N_new; buf_R_ = R_new;
+    buf_num_tiles_ = T_new; buf_HW_ = HW_new;
+}
 
 void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                                          const BinningOutput& bin,
@@ -78,22 +132,11 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     const int R   = bin.total_pairs;
     const int HW  = H * W;
 
-    // -------------------------------------------------------------------
-    // Pack conic + opacity into a single interleaved buffer [N*4]:
-    //   {a=conic[0], b=conic[1], c=conic[2], opacity=opacities_2d[i]}
-    // -------------------------------------------------------------------
-    std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u);
-    for (int i = 0; i < N; ++i) {
-        const std::size_t dst = static_cast<std::size_t>(i) * 4u;
-        const std::size_t src = static_cast<std::size_t>(i) * 3u;
-        conic_opacity_packed[dst + 0] = pre.conics[src + 0];
-        conic_opacity_packed[dst + 1] = pre.conics[src + 1];
-        conic_opacity_packed[dst + 2] = pre.conics[src + 2];
-        conic_opacity_packed[dst + 3] = pre.opacities_2d[i];
-    }
+    // Ensure persistent buffers are large enough for this call.
+    prepare_for_n(N, R, static_cast<int>(num_tiles_x * num_tiles_y), HW);
 
     // -------------------------------------------------------------------
-    // Compute buffer sizes.
+    // Compute upload sizes (in bytes, for current call dimensions).
     // -------------------------------------------------------------------
     const VkDeviceSize bytes_tile_ranges =
         static_cast<VkDeviceSize>(bin.num_tiles) * 2u * sizeof(uint32_t);
@@ -121,85 +164,61 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
 
     // -------------------------------------------------------------------
-    // Allocate GPU buffers (host-visible coherent).
+    // Pack conic + opacity into a single interleaved buffer [N*4]:
+    //   {a=conic[0], b=conic[1], c=conic[2], opacity=opacities_2d[i]}
     // -------------------------------------------------------------------
-    auto tr_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tile_ranges, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto vs_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_vs,          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto m2d_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_m2d,         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto co_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_co,          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto col_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_colors,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto tf_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tfinal,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto nc_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_ncontrib,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dlpix_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_dL_dpix,     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    // Gradient output buffers — must be zero-filled before dispatch.
-    // VulkanBuffer does NOT zero on allocation (vk_buffer.cpp:6-23 confirms
-    // only vkAllocateMemory + bind; no memset). We zero by uploading a
-    // zero-filled vector.
-    auto dlm2d_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_dL_m2d,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dlcon_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_dL_con,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dlopa_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_dL_opa,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dlcol_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_dL_col,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    auto ubo_buf   = std::make_unique<VulkanBuffer>(
-        ctx_,
-        static_cast<VkDeviceSize>(sizeof(RasterizeBackwardUBO)),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u);
+    for (int i = 0; i < N; ++i) {
+        const std::size_t dst = static_cast<std::size_t>(i) * 4u;
+        const std::size_t src = static_cast<std::size_t>(i) * 3u;
+        conic_opacity_packed[dst + 0] = pre.conics[src + 0];
+        conic_opacity_packed[dst + 1] = pre.conics[src + 1];
+        conic_opacity_packed[dst + 2] = pre.conics[src + 2];
+        conic_opacity_packed[dst + 3] = pre.opacities_2d[i];
+    }
 
     // -------------------------------------------------------------------
     // Upload inputs.
     // -------------------------------------------------------------------
-    tr_buf ->upload(bin.tile_ranges,
-                    static_cast<std::size_t>(bytes_tile_ranges));
-    vs_buf ->upload(bin.values_sorted,
-                    static_cast<std::size_t>(bytes_vs));
-    m2d_buf->upload(pre.means2D,
-                    static_cast<std::size_t>(bytes_m2d));
-    co_buf ->upload(conic_opacity_packed.data(),
-                    static_cast<std::size_t>(bytes_co));
-    col_buf->upload(pre.rgb,
-                    static_cast<std::size_t>(bytes_colors));
-    tf_buf ->upload(cache.T_final,
-                    static_cast<std::size_t>(bytes_tfinal));
+    tr_buf_ ->upload(bin.tile_ranges,
+                     static_cast<std::size_t>(bytes_tile_ranges));
+    vs_buf_ ->upload(bin.values_sorted,
+                     static_cast<std::size_t>(bytes_vs));
+    m2d_buf_->upload(pre.means2D,
+                     static_cast<std::size_t>(bytes_m2d));
+    co_buf_ ->upload(conic_opacity_packed.data(),
+                     static_cast<std::size_t>(bytes_co));
+    col_buf_->upload(pre.rgb,
+                     static_cast<std::size_t>(bytes_colors));
+    tf_buf_ ->upload(cache.T_final,
+                     static_cast<std::size_t>(bytes_tfinal));
     // n_contrib is int*; we reinterpret as uint32 (same width, counts < 2^31).
-    nc_buf ->upload(cache.n_contrib,
-                    static_cast<std::size_t>(bytes_ncontrib));
-    dlpix_buf->upload(dL_dpixels,
-                      static_cast<std::size_t>(bytes_dL_dpix));
+    nc_buf_ ->upload(cache.n_contrib,
+                     static_cast<std::size_t>(bytes_ncontrib));
+    dlpix_buf_->upload(dL_dpixels,
+                       static_cast<std::size_t>(bytes_dL_dpix));
 
     // Zero-fill gradient output buffers (atomicAdd accumulates into them).
     {
         const std::vector<float> zeros_m2d(
             static_cast<std::size_t>(N) * 2u, 0.0f);
-        dlm2d_buf->upload(zeros_m2d.data(),
-                          static_cast<std::size_t>(bytes_dL_m2d));
+        dlm2d_buf_->upload(zeros_m2d.data(),
+                           static_cast<std::size_t>(bytes_dL_m2d));
 
         const std::vector<float> zeros_con(
             static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcon_buf->upload(zeros_con.data(),
-                          static_cast<std::size_t>(bytes_dL_con));
+        dlcon_buf_->upload(zeros_con.data(),
+                           static_cast<std::size_t>(bytes_dL_con));
 
         const std::vector<float> zeros_opa(
             static_cast<std::size_t>(N), 0.0f);
-        dlopa_buf->upload(zeros_opa.data(),
-                          static_cast<std::size_t>(bytes_dL_opa));
+        dlopa_buf_->upload(zeros_opa.data(),
+                           static_cast<std::size_t>(bytes_dL_opa));
 
         const std::vector<float> zeros_col(
             static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcol_buf->upload(zeros_col.data(),
-                          static_cast<std::size_t>(bytes_dL_col));
+        dlcol_buf_->upload(zeros_col.data(),
+                           static_cast<std::size_t>(bytes_dL_col));
     }
 
     // Upload UBO.
@@ -212,37 +231,37 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     ubo.bg_color[1] = cfg.bg_color[1];
     ubo.bg_color[2] = cfg.bg_color[2];
     ubo._pad2       = 0.f;
-    ubo_buf->upload(&ubo, sizeof(ubo));
+    ubo_buf_->upload(&ubo, sizeof(ubo));
 
     // -------------------------------------------------------------------
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizeBackwardPass::Buffers rb{};
-    rb.tile_ranges  = tr_buf   ->handle();
-    rb.values_sorted = vs_buf  ->handle();
-    rb.means2D      = m2d_buf  ->handle();
-    rb.conic_opacity = co_buf  ->handle();
-    rb.colors       = col_buf  ->handle();
-    rb.T_final      = tf_buf   ->handle();
-    rb.n_contrib    = nc_buf   ->handle();
-    rb.dL_dpixels   = dlpix_buf->handle();
-    rb.dL_dmeans2D  = dlm2d_buf->handle();
-    rb.dL_dconics   = dlcon_buf->handle();
-    rb.dL_dopacity  = dlopa_buf->handle();
-    rb.dL_dcolors   = dlcol_buf->handle();
+    rb.tile_ranges   = tr_buf_   ->handle();
+    rb.values_sorted = vs_buf_   ->handle();
+    rb.means2D       = m2d_buf_  ->handle();
+    rb.conic_opacity = co_buf_   ->handle();
+    rb.colors        = col_buf_  ->handle();
+    rb.T_final       = tf_buf_   ->handle();
+    rb.n_contrib     = nc_buf_   ->handle();
+    rb.dL_dpixels    = dlpix_buf_->handle();
+    rb.dL_dmeans2D   = dlm2d_buf_->handle();
+    rb.dL_dconics    = dlcon_buf_->handle();
+    rb.dL_dopacity   = dlopa_buf_->handle();
+    rb.dL_dcolors    = dlcol_buf_->handle();
 
-    pass_->bind_buffers(rb, ubo_buf->handle());
+    pass_->bind_buffers(rb, ubo_buf_->handle());
     pass_->dispatch_sync(num_tiles_x, num_tiles_y);
 
     // -------------------------------------------------------------------
     // Download gradients into rgrad arrays.
     // -------------------------------------------------------------------
-    dlm2d_buf->download(rgrad.d_means2D,
-                        static_cast<std::size_t>(bytes_dL_m2d));
-    dlcon_buf->download(rgrad.d_conics,
-                        static_cast<std::size_t>(bytes_dL_con));
-    dlopa_buf->download(rgrad.d_opacities_2d,
-                        static_cast<std::size_t>(bytes_dL_opa));
-    dlcol_buf->download(rgrad.d_rgb,
-                        static_cast<std::size_t>(bytes_dL_col));
+    dlm2d_buf_->download(rgrad.d_means2D,
+                         static_cast<std::size_t>(bytes_dL_m2d));
+    dlcon_buf_->download(rgrad.d_conics,
+                         static_cast<std::size_t>(bytes_dL_con));
+    dlopa_buf_->download(rgrad.d_opacities_2d,
+                         static_cast<std::size_t>(bytes_dL_opa));
+    dlcol_buf_->download(rgrad.d_rgb,
+                         static_cast<std::size_t>(bytes_dL_col));
 }

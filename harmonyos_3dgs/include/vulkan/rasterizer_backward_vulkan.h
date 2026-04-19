@@ -17,6 +17,7 @@
 
 #include "train_types.h"
 #include "vulkan/vk_context.h"
+#include "vulkan/vk_buffer.h"
 #include "vulkan/rasterize_backward_pass.h"
 
 #include <memory>
@@ -58,4 +59,27 @@ public:
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RasterizeBackwardPass> pass_;
+
+    // Persistent GPU buffers — pre-allocated in prepare_for_n(), reused each
+    // backward() call. Eliminates 13 vkDeviceWaitIdle/step from destructors.
+    int buf_N_         = 0;
+    int buf_R_         = 0;
+    int buf_num_tiles_ = 0;
+    int buf_HW_        = 0;
+
+    std::unique_ptr<VulkanBuffer> tr_buf_;     // tile_ranges   [num_tiles*2] u32
+    std::unique_ptr<VulkanBuffer> vs_buf_;     // values_sorted [R] u32
+    std::unique_ptr<VulkanBuffer> m2d_buf_;    // means2D       [N*2] f32
+    std::unique_ptr<VulkanBuffer> co_buf_;     // conic_opacity [N*4] f32
+    std::unique_ptr<VulkanBuffer> col_buf_;    // colors        [N*3] f32
+    std::unique_ptr<VulkanBuffer> tf_buf_;     // T_final       [HW] f32
+    std::unique_ptr<VulkanBuffer> nc_buf_;     // n_contrib      [HW] u32
+    std::unique_ptr<VulkanBuffer> dlpix_buf_;  // dL_dpixels    [HW*3] f32
+    std::unique_ptr<VulkanBuffer> dlm2d_buf_;  // dL_dmeans2D   [N*2] f32
+    std::unique_ptr<VulkanBuffer> dlcon_buf_;  // dL_dconics    [N*3] f32
+    std::unique_ptr<VulkanBuffer> dlopa_buf_;  // dL_dopacity   [N] f32
+    std::unique_ptr<VulkanBuffer> dlcol_buf_;  // dL_dcolors    [N*3] f32
+    std::unique_ptr<VulkanBuffer> ubo_buf_;    // RasterizeBackwardUBO (32B)
+
+    void prepare_for_n(int N, int R, int num_tiles, int HW);
 };

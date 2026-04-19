@@ -304,6 +304,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             # All gs3d_vk_tests get a generous timeout; the basketball test needs
             # the most headroom.
             gtest_discover_tests(gs3d_vk_tests PROPERTIES TIMEOUT 7200)
+
+            add_executable(test_sp7_cb_chain tests/test_sp7_cb_chain.cpp)
+            target_link_libraries(test_sp7_cb_chain PRIVATE gs3d_core gs3d_vk_core GTest::gtest_main)
+            add_test(NAME Sp7Chain COMMAND test_sp7_cb_chain)
         endif()
         message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello, preprocess)")
     else()
