@@ -122,3 +122,12 @@ void PreprocessBackwardPass::dispatch_sync(uint32_t num_gaussians) {
                              num_wg, 1u, 1u,
                              nullptr, 0u);
 }
+
+void PreprocessBackwardPass::record(VkCommandBuffer cmd, uint32_t num_gaussians) {
+    if (descriptor_set_ == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "PreprocessBackwardPass::record called before bind_buffers()");
+    if (num_gaussians == 0u) return;
+    const uint32_t num_wg = (num_gaussians + 255u) / 256u;
+    pipeline_->record(cmd, descriptor_set_, num_wg, 1u, 1u, nullptr, 0u);
+}

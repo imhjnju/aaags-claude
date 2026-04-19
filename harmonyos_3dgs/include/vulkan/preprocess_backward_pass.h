@@ -75,6 +75,9 @@ public:
     /// bind_buffers() must have been called first.
     void dispatch_sync(uint32_t num_gaussians);
 
+    /// Record dispatch into cmd without submitting. bind_buffers() must be called first.
+    void record(VkCommandBuffer cmd, uint32_t num_gaussians);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<VulkanShader>          shader_;

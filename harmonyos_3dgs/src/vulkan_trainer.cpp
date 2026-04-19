@@ -247,15 +247,32 @@ float VulkanTrainer::step(const Camera& cam,
     last_loss_ = compute_combined_loss_gradient(
         image_.data(), target, dL_dpixels_.data(), W, H, tcfg_.lambda_dssim);
 
-    // 6. Rasterizer backward
-    RasterGradOutput rgrad{};
-    rasterizer_bwd_.backward(pre, bin, N_, cam, active_cfg, cache,
-                             dL_dpixels_.data(), rgrad, alloc_);
-
-    // 7. Preprocessor backward
+    // 6+7. Rasterize backward + preprocess backward chained into one CB.
+    //      rasterize_bwd writes dL_d* to GPU; preprocess_bwd reads them directly.
+    //      Eliminates rgrad CPU round-trip + merges 2 submit+wait into 1.
     GradientOutput grads{};
-    preprocessor_bwd_.backward(g_, N_, cam, active_cfg, cache, rgrad,
-                               raw_view_, grads, alloc_);
+    {
+        VkCommandBuffer bwd_cmd = ctx_.allocatePrimary();
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(bwd_cmd, &bi);
+
+        rasterizer_bwd_.backward_record_into(bwd_cmd, pre, bin, N_, cam, active_cfg,
+                                              cache, dL_dpixels_.data());
+        insert_compute_barrier(bwd_cmd);
+        preprocessor_bwd_.backward_record_into(bwd_cmd, g_, N_, cam, active_cfg, cache,
+            rasterizer_bwd_.dL_dconics_buf(),
+            rasterizer_bwd_.dL_dopacity_buf(),
+            rasterizer_bwd_.dL_dcolors_buf(),
+            rasterizer_bwd_.dL_dmeans2D_buf(),
+            raw_view_);
+
+        vkEndCommandBuffer(bwd_cmd);
+        ctx_.submitAndWait(bwd_cmd);
+        ctx_.freePrimary(bwd_cmd);
+    }
+    preprocessor_bwd_.download_grads(N_, max_coeffs_, grads, alloc_);
 
     // SP-6 T2: Regularization gradient injection.
     // After preprocessor_bwd_ writes raw-param gradients, add L1 regularization

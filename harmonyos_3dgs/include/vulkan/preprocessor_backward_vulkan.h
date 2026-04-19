@@ -54,6 +54,26 @@ public:
                   GradientOutput& grads,
                   FrameAllocator& alloc);
 
+    /// Record backward pass into cmd, reading rgrad directly from GPU buffer handles.
+    /// Eliminates the CPU round-trip: rasterize_bwd GPU outputs bind directly as inputs.
+    /// Caller must submit the CB, then call download_grads() to get grads on CPU.
+    void backward_record_into(VkCommandBuffer cmd,
+                              const GaussianData& g,
+                              int num_gaussians,
+                              const Camera& cam,
+                              const RenderConfig& cfg,
+                              const ForwardCache& cache,
+                              VkBuffer d_conics_gpu,   // from rasterize_bwd dL_dconics_buf()
+                              VkBuffer d_opacity_gpu,  // from rasterize_bwd dL_dopacity_buf()
+                              VkBuffer d_rgb_gpu,      // from rasterize_bwd dL_dcolors_buf()
+                              VkBuffer d_means2D_gpu,  // from rasterize_bwd dL_dmeans2D_buf()
+                              const RawGaussianParams& raw);
+
+    /// Download gradient outputs to CPU after backward_record_into() + submit.
+    /// grads is allocated from alloc and filled from persistent GPU output buffers.
+    void download_grads(int num_gaussians, int max_coeffs,
+                        GradientOutput& grads, FrameAllocator& alloc);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<PreprocessBackwardPass> pass_;

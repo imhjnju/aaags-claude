@@ -56,6 +56,26 @@ public:
                   RasterGradOutput& rgrad,
                   FrameAllocator& alloc);
 
+    /// GPU output buffer handles for rasterize_bwd (valid after backward() or backward_record_into()).
+    /// Used for GPU-to-GPU chaining with PreprocessorBackwardVulkan::backward_record_into().
+    VkBuffer dL_dmeans2D_buf() const { return dlm2d_buf_ ? dlm2d_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer dL_dconics_buf()  const { return dlcon_buf_ ? dlcon_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer dL_dopacity_buf() const { return dlopa_buf_ ? dlopa_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer dL_dcolors_buf()  const { return dlcol_buf_ ? dlcol_buf_->handle() : VK_NULL_HANDLE; }
+
+    /// Record backward pass into cmd (no submit, no download).
+    /// Uploads inputs to persistent GPU buffers, calls pass_->record().
+    /// Caller must: insert_compute_barrier(), call preprocessor_bwd_.backward_record_into(),
+    ///   submit the CB, then call preprocessor_bwd_.download_grads().
+    void backward_record_into(VkCommandBuffer cmd,
+                              const PreprocessOutput& pre,
+                              const BinningOutput& bin,
+                              int num_gaussians,
+                              const Camera& cam,
+                              const RenderConfig& cfg,
+                              const ForwardCache& cache,
+                              const float* dL_dpixels);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RasterizeBackwardPass> pass_;

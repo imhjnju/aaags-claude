@@ -246,3 +246,173 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     drot_buf_    ->download(grads.d_raw_rotations,  static_cast<std::size_t>(bytes_d_rot));
     d_raw_opa_buf_->download(grads.d_raw_opacities, static_cast<std::size_t>(bytes_N_float));
 }
+
+void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
+                                                       const GaussianData& g,
+                                                       int num_gaussians,
+                                                       const Camera& cam,
+                                                       const RenderConfig& cfg,
+                                                       const ForwardCache& cache,
+                                                       VkBuffer d_conics_gpu,
+                                                       VkBuffer d_opacity_gpu,
+                                                       VkBuffer d_rgb_gpu,
+                                                       VkBuffer d_means2D_gpu,
+                                                       const RawGaussianParams& raw) {
+    // --- Guard: eval_3D path not implemented --------------------------------
+    if (cache.pre && cache.pre->eval_3D)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward_record_into: eval_3D=true is not supported");
+
+    const int N = num_gaussians;
+    const int K = g.max_coeffs;  // (sh_degree+1)^2
+
+    if (N == 0) return;
+
+    prepare_for_n(N, K);
+
+    // Compute UBO parameters
+    const float h_x = static_cast<float>(cam.width)  / (2.0f * cam.tan_fovx);
+    const float h_y = static_cast<float>(cam.height) / (2.0f * cam.tan_fovy);
+
+    // --- Compute buffer sizes -----------------------------------------------
+    const VkDeviceSize bytes_pos     = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_radii   = static_cast<VkDeviceSize>(N) * sizeof(int);
+    const VkDeviceSize bytes_cov3D   = static_cast<VkDeviceSize>(N) * 6u * sizeof(float);
+    const VkDeviceSize bytes_sh      = static_cast<VkDeviceSize>(N) * K * 3u * sizeof(float);
+    const VkDeviceSize bytes_scales  = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_rot     = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_d_m3d   = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_sh    = static_cast<VkDeviceSize>(N) * K * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_sc    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_rot   = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_N_float = static_cast<VkDeviceSize>(N) * sizeof(float);
+    const VkDeviceSize bytes_raw_rot    = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_m2d_cache  = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
+    const VkDeviceSize bytes_p_view     = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_cov2d      = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_c2d_det    = static_cast<VkDeviceSize>(N) * sizeof(float);
+    const VkDeviceSize bytes_phomw      = static_cast<VkDeviceSize>(N) * sizeof(float);
+
+    // Validate that the required cache fields are populated.
+    if (!cache.p_view)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward_record_into: cache.p_view is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.cov2D)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward_record_into: cache.cov2D is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.cov2D_det)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward_record_into: cache.cov2D_det is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+    if (!cache.p_hom_w)
+        throw std::runtime_error(
+            "PreprocessorBackwardVulkan::backward_record_into: cache.p_hom_w is null — "
+            "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
+
+    // --- Upload inputs (all except the rgrad GPU inputs) --------------------
+    pos_buf_ ->upload(g.positions,                   static_cast<std::size_t>(bytes_pos));
+    rad_buf_ ->upload(cache.pre->radii,               static_cast<std::size_t>(bytes_radii));
+    cv3_buf_ ->upload(cache.cov3D,                    static_cast<std::size_t>(bytes_cov3D));
+    sh_buf_  ->upload(g.sh_coeffs,                    static_cast<std::size_t>(bytes_sh));
+    sc_buf_  ->upload(g.scales,                       static_cast<std::size_t>(bytes_scales));
+    rot_buf_ ->upload(g.rotations,                    static_cast<std::size_t>(bytes_rot));
+    opa_in_buf_->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
+    raw_rot_buf_->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
+    m2d_cache_buf_->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
+    pview_in_buf_ ->upload(cache.p_view,              static_cast<std::size_t>(bytes_p_view));
+    cov2d_in_buf_ ->upload(cache.cov2D,               static_cast<std::size_t>(bytes_cov2d));
+    c2ddet_in_buf_->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
+    phomw_in_buf_ ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
+
+    // Zero-fill gradient output buffers.
+    {
+        const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
+        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
+
+        const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
+        dsh_buf_ ->upload(zeros_sh.data(),  static_cast<std::size_t>(bytes_d_sh));
+
+        const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
+        dsc_buf_ ->upload(zeros_sc.data(),  static_cast<std::size_t>(bytes_d_sc));
+
+        const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
+        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
+
+        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
+        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
+    }
+
+    // Upload UBO.
+    PreprocessBackwardUBO ubo{};
+    std::memcpy(ubo.view_matrix, cam.view_matrix,       16 * sizeof(float));
+    std::memcpy(ubo.proj_matrix, cam.viewproj_matrix,   16 * sizeof(float));
+    ubo.num_gaussians   = static_cast<uint32_t>(N);
+    ubo.sh_degree       = static_cast<uint32_t>(cfg.sh_degree);
+    ubo.sh_coeffs_per_g = static_cast<uint32_t>(K);
+    ubo.scale_modifier  = cfg.scale_modifier;
+    ubo.h_x             = h_x;
+    ubo.h_y             = h_y;
+    ubo.tan_fovx        = cam.tan_fovx;
+    ubo.tan_fovy        = cam.tan_fovy;
+    ubo.cam_pos[0]      = cam.cam_pos[0];
+    ubo.cam_pos[1]      = cam.cam_pos[1];
+    ubo.cam_pos[2]      = cam.cam_pos[2];
+    ubo.training        = cfg.training ? 1u : 0u;
+    ubo.cam_width       = static_cast<uint32_t>(cam.width);
+    ubo.cam_height      = static_cast<uint32_t>(cam.height);
+    ubo_buf_->upload(&ubo, sizeof(ubo));
+
+    // --- Bind and record into cmd ------------------------------------------
+    // rgrad inputs come directly from GPU buffers (d_conics_gpu, d_opacity_gpu,
+    // d_rgb_gpu, d_means2D_gpu) rather than being uploaded from CPU.
+    PreprocessBackwardPass::Buffers pb{};
+    pb.positions   = pos_buf_ ->handle();
+    pb.radii       = rad_buf_ ->handle();
+    pb.cov3D       = cv3_buf_ ->handle();
+    pb.d_conics    = d_conics_gpu;
+    pb.d_opacity   = d_opacity_gpu;
+    pb.sh_coeffs   = sh_buf_  ->handle();
+    pb.scales      = sc_buf_  ->handle();
+    pb.rotations   = rot_buf_ ->handle();
+    pb.d_rgb       = d_rgb_gpu;
+    pb.d_means2D   = d_means2D_gpu;
+    pb.d_means3D       = dm3d_buf_   ->handle();
+    pb.d_sh            = dsh_buf_    ->handle();
+    pb.d_scales        = dsc_buf_    ->handle();
+    pb.d_rotations     = drot_buf_   ->handle();
+    pb.opacities       = opa_in_buf_ ->handle();
+    pb.d_raw_opacities = d_raw_opa_buf_->handle();
+    pb.raw_rotations      = raw_rot_buf_  ->handle();
+    pb.means2D_cache      = m2d_cache_buf_->handle();
+    pb.p_view_cache_in    = pview_in_buf_ ->handle();
+    pb.cov2D_cache_in     = cov2d_in_buf_ ->handle();
+    pb.cov2D_det_cache_in = c2ddet_in_buf_->handle();
+    pb.p_hom_w_cache_in   = phomw_in_buf_ ->handle();
+
+    pass_->bind_buffers(pb, ubo_buf_->handle());
+    pass_->record(cmd, static_cast<uint32_t>(N));
+}
+
+void PreprocessorBackwardVulkan::download_grads(int N, int K,
+    GradientOutput& grads, FrameAllocator& alloc)
+{
+    grads.allocate_and_zero(alloc, N, K);
+    if (N == 0) return;
+    const VkDeviceSize bytes_d_m3d   = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_sh    = static_cast<VkDeviceSize>(N) * K * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_sc    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_d_rot   = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_N_float = static_cast<VkDeviceSize>(N) * sizeof(float);
+    dm3d_buf_    ->download(grads.d_raw_positions,
+                            static_cast<std::size_t>(bytes_d_m3d));
+    dsh_buf_     ->download(grads.d_raw_sh_coeffs,
+                            static_cast<std::size_t>(bytes_d_sh));
+    dsc_buf_     ->download(grads.d_raw_scales,
+                            static_cast<std::size_t>(bytes_d_sc));
+    drot_buf_    ->download(grads.d_raw_rotations,
+                            static_cast<std::size_t>(bytes_d_rot));
+    d_raw_opa_buf_->download(grads.d_raw_opacities,
+                             static_cast<std::size_t>(bytes_N_float));
+}
