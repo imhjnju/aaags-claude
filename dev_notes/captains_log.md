@@ -1,5 +1,27 @@
 # Captain's Log
 
+## Session 6 — 2026-04-19
+
+SP-5 complete. 229/229 tests pass. Basketball E2E smoke test runs in ~7.7 s (3 steps).
+
+Key perf finding: ~2.5 s/step on NVIDIA Tegra Thor at 720×960 due to sync-per-dispatch
+architecture (~25 vkDeviceWaitIdle calls per step). This means:
+- 50-step test: ~125 s
+- 2000-step test: ~83 min (infeasible for CI)
+
+SP-6 primary goal: eliminate per-dispatch syncs via command buffer chaining.
+After SP-6, the 2000-step PSNR>10dB basketball milestone can be re-enabled.
+
+SP-5 technical decisions:
+- VulkanAdam: 4 SSBOs (params, grads, m, v) + UBO (AdamStepUBO) per group; 6 groups in VulkanTrainer
+- DSSIM: correct analytical sliding-window gradient (center-window FD approximation was O(1/121))
+- MCMC densification: separate output OwnedRawParams prevents pointer invalidation during realloc
+- reallocate_for_n uses max(sz, 4) guard for all buffer sizes (prevents VUID-VkBufferCreateInfo-size-00912)
+- densify_from_step=0 is the disable sentinel (documented in VkTrainingConfig)
+- lambda_dssim=0.0f added to VkTrainingConfig for L1-only mode
+
+---
+
 ## Session 5 — 2026-04-18
 
 Starting SP-5: GPU Optimizer + Training Hyperparameters.

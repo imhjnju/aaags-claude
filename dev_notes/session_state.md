@@ -1,10 +1,10 @@
 # Session State
 
 ## Current Phase
-SP-5: GPU Optimizer + Training Hyperparameters
+SP-6: Command buffer chaining + convergence validation (next)
 
 ## Test Counts
-- Total passing: 216 / 216 (as of SP-4 completion, 2026-04-18)
+- Total passing: 229 / 229 (as of SP-5 completion, 2026-04-19)
 - GPU tests: skipped when no device (expected)
 
 ## Milestones
@@ -15,14 +15,21 @@ SP-5: GPU Optimizer + Training Hyperparameters
 | SP-2: Vulkan forward pipeline | DONE | S2 | preprocess.comp + sort + rasterize.comp |
 | SP-3: Vulkan backward pipeline | DONE | S3 | rasterize_backward.comp + preprocess_backward.comp |
 | SP-4: Training integration | DONE | S4 | ForwardCache caching, GPU Adam skeleton (CpuAdam), VulkanTrainer, 216 tests |
-| SP-5: GPU optimizer + hyperparams | IN PROGRESS | S5 | GPU Adam, LR schedule, DSSIM, MCMC densification, 2000-step validation |
+| SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam kernel, LR+SH schedules, DSSIM, MCMC densification, basketball E2E smoke test, 229 tests |
+| SP-6: CB chaining + convergence | PENDING | — | Eliminate sync-per-dispatch, enable 2000-step PSNR>10dB test |
 | M0: Foundation | IN PROGRESS | — | Interleaved with Vulkan migration |
 
 ## Latest Sessions
 
-### S5 — 2026-04-18 (current)
-- Writing SP-5 plan
-- Next: execute SP-5 tasks via subagent-driven development
+### S6 — 2026-04-19 (current)
+- SP-5 Task 6 (basketball E2E) completed and committed
+- 229/229 tests pass
+- Next: SP-6 command buffer chaining
+
+### S5 — 2026-04-18 to 2026-04-19
+- SP-5 Tasks 1-6 complete via subagent-driven development
+- GPU Adam (adam_step.comp + VulkanAdam), LR schedule, SH warmup, DSSIM analytical gradient, MCMC densification, basketball smoke test
+- Key perf finding: ~2.5 s/step on Tegra due to sync-per-dispatch; SP-6 will chain CBs
 
 ### S4 — 2026-04-18
 - SP-4 all 8 tasks complete + extra cov2D/Part C bug fix
