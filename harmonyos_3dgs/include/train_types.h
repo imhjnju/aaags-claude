@@ -181,4 +181,14 @@ struct VkTrainingConfig {
     int   densify_until_step    = 15000;
     int   densify_interval      = 100;
     float densify_percent_dense = 0.01f;
+
+    // SP-6: regularization loss coefficients (match Python reference defaults)
+    float opacity_reg        = 0.01f;   // weight on mean(|sigmoid(raw_opacity)|)
+    float scale_reg          = 0.01f;   // weight on mean(|exp(raw_scale)|)
+
+    // SP-6: position noise injection after Adam step (Python reference: noise_lr=5e5)
+    float noise_lr           = 5e5f;    // multiplied by pos_lr and op_sigmoid factor
+
+    // SP-6: spatial LR scale (cameras_extent from COLMAP; 1.0 = no scaling)
+    float spatial_lr_scale   = 1.0f;
 };

@@ -40,6 +40,7 @@ add_library(gs3d_core
     src/cpu_adam.cpp
     src/dssim.cpp
     src/densification.cpp
+    src/train_utils.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
@@ -109,6 +110,7 @@ if(BUILD_TESTS)
         tests/test_golden_roundtrip.cpp
         tests/test_cpu_adam.cpp
         tests/test_dssim.cpp
+        tests/test_training_gap_sp6.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
