@@ -41,7 +41,7 @@ struct alignas(16) RasterizeBackwardUBO {
 static_assert(sizeof(RasterizeBackwardUBO) == 32,
               "RasterizeBackwardUBO must be 32 bytes (std140)");
 
-// ---- preprocess_backward.comp binding layout (18 total: 17 SSBOs + 1 UBO) ----
+// ---- preprocess_backward.comp binding layout (19 total: 18 SSBOs + 1 UBO) ----
 //
 // Binding layout:
 //   0..9   read-only input SSBOs
@@ -49,6 +49,7 @@ static_assert(sizeof(RasterizeBackwardUBO) == 32,
 //   14..15 new: opacities input + d_raw_opacities output
 //   16     uniform buffer (PreprocessBackwardUBO)
 //   17     read-only SSBO: raw_rotations (unnormalized quaternions)
+//   18     read-only SSBO: means2D_cache (pixel-space means2D from forward)
 namespace preprocess_backward_bind {
 constexpr uint32_t POSITIONS        = 0;   // RO float[N*3]          world-space xyz
 constexpr uint32_t RADII            = 1;   // RO int[N]              int-ceiled radius; 0=culled
@@ -68,6 +69,7 @@ constexpr uint32_t OPACITIES        = 14;  // RO float[N]            activated s
 constexpr uint32_t D_RAW_OPACITIES  = 15;  // RW float[N]            output
 constexpr uint32_t PREPROCESS_BACKWARD_UBO = 16;  // UBO PreprocessBackwardUBO (192 bytes)
 constexpr uint32_t RAW_ROTATIONS    = 17;  // RO float[N*4]          unnormalized quaternions
+constexpr uint32_t MEANS2D_CACHE    = 18;  // RO float[N*2]          pixel-space means2D from forward
 }  // namespace preprocess_backward_bind
 
 // PreprocessBackwardUBO (std140).

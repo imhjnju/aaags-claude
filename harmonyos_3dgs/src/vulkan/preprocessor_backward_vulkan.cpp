@@ -109,6 +109,9 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     const VkDeviceSize bytes_raw_rot = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
     auto raw_rot_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_raw_rot, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+    const VkDeviceSize bytes_m2d_cache = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
+    auto m2d_cache_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_m2d_cache, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
     auto ubo_buf    = std::make_unique<VulkanBuffer>(ctx_,
                           static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -126,6 +129,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     dm2d_buf->upload(rgrad.d_means2D,               static_cast<std::size_t>(bytes_d_m2d));
     opa_in_buf->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
     raw_rot_buf->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
+    m2d_cache_buf->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
 
     // Zero-fill gradient output buffers.
     {
@@ -184,6 +188,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     pb.opacities       = opa_in_buf ->handle();
     pb.d_raw_opacities = d_raw_opa_buf->handle();
     pb.raw_rotations   = raw_rot_buf->handle();
+    pb.means2D_cache   = m2d_cache_buf->handle();
 
     pass_->bind_buffers(pb, ubo_buf->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));

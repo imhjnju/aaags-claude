@@ -105,8 +105,28 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     std::vector<float> zeros_sc(N * 3, 0.0f);
     std::vector<float> zeros_rot(N * 4, 0.0f);
 
+    // ---- Opacities and raw_rotations data ---------------------------------
+    // opacities: sigmoid-activated values (N floats)
+    std::vector<float> opacities_data(N, 0.7f);
+
+    // d_raw_opacities output: zero-filled
+    std::vector<float> zeros_d_raw_opa(N, 0.0f);
+
+    // raw_rotations: unnormalized quaternions (identity here, so |q|=1)
+    std::vector<float> raw_rotations_data(N * 4, 0.0f);
+    for (uint32_t i = 0; i < N; i++) {
+        raw_rotations_data[i*4 + 0] = 1.0f;  // r (identity, |q|=1)
+    }
+
+    // means2D_cache: pixel-space means2D from forward pass.
+    // For a Gaussian at z=5 with identity view/proj and W=H=64:
+    //   p_hom = proj*[x,y,z,1] => for identity at [0,0,5]: p_hom=[0,0,5,5]
+    //   ndc = [0,0], pixel = ((0+1)*64-1)*0.5 = 31.5
+    // These values approximate what the forward pass would produce.
+    std::vector<float> means2D_cache_data(N * 2, 31.5f);  // center of 64x64 image
+
     // ---- Build UBO --------------------------------------------------------
-    // Simple camera: identity view matrix, looking down +Z
+    // Simple camera: identity view matrix, looking down +Z, W=H=64
     PreprocessBackwardUBO ubo{};
 
     // Identity view matrix (column-major)
@@ -135,59 +155,74 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     ubo.cam_pos[1]      = 0.0f;
     ubo.cam_pos[2]      = 0.0f;
     ubo.training        = 1u;
+    ubo.cam_width       = 64u;   // required by ndc recovery in means2D_cache path
+    ubo.cam_height      = 64u;
 
     // ---- Allocate GPU buffers ---------------------------------------------
-    auto pos_buf  = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rad_buf  = std::make_unique<VulkanBuffer>(ctx, N*sizeof(int32_t),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto cv3_buf  = std::make_unique<VulkanBuffer>(ctx, N*6*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dcon_buf = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dopa_buf = std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto sh_buf   = std::make_unique<VulkanBuffer>(ctx, N*K*3*sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto sc_buf   = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rot_buf  = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto drgb_buf = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dm2d_buf = std::make_unique<VulkanBuffer>(ctx, N*2*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dm3d_buf = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dsh_buf  = std::make_unique<VulkanBuffer>(ctx, N*K*3*sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dsc_buf  = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto drot_buf = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto ubo_buf  = std::make_unique<VulkanBuffer>(ctx, sizeof(PreprocessBackwardUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    auto pos_buf      = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rad_buf      = std::make_unique<VulkanBuffer>(ctx, N*sizeof(int32_t),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto cv3_buf      = std::make_unique<VulkanBuffer>(ctx, N*6*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dcon_buf     = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dopa_buf     = std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto sh_buf       = std::make_unique<VulkanBuffer>(ctx, N*K*3*sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto sc_buf       = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rot_buf      = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto drgb_buf     = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dm2d_buf     = std::make_unique<VulkanBuffer>(ctx, N*2*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dm3d_buf     = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dsh_buf      = std::make_unique<VulkanBuffer>(ctx, N*K*3*sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dsc_buf      = std::make_unique<VulkanBuffer>(ctx, N*3*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto drot_buf     = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // Bindings 14, 15 (opacities, d_raw_opacities), 17 (raw_rotations), 18 (means2D_cache)
+    auto opa_buf      = std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto d_raw_opa_buf= std::make_unique<VulkanBuffer>(ctx, N*sizeof(float),     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rawrot_buf   = std::make_unique<VulkanBuffer>(ctx, N*4*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto m2d_cache_buf= std::make_unique<VulkanBuffer>(ctx, N*2*sizeof(float),   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto ubo_buf      = std::make_unique<VulkanBuffer>(ctx, sizeof(PreprocessBackwardUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
     // ---- Upload inputs ----------------------------------------------------
-    pos_buf ->upload(positions.data(),      N*3*sizeof(float));
-    rad_buf ->upload(radii.data(),          N*sizeof(int32_t));
-    cv3_buf ->upload(cov3D_data.data(),     N*6*sizeof(float));
-    dcon_buf->upload(d_conics.data(),       N*3*sizeof(float));
-    dopa_buf->upload(d_opacity.data(),      N*sizeof(float));
-    sh_buf  ->upload(sh_coeffs_data.data(), N*K*3*sizeof(float));
-    sc_buf  ->upload(scales_data.data(),    N*3*sizeof(float));
-    rot_buf ->upload(rotations_data.data(), N*4*sizeof(float));
-    drgb_buf->upload(d_rgb_data.data(),     N*3*sizeof(float));
-    dm2d_buf->upload(d_means2D_data.data(), N*2*sizeof(float));
-    dm3d_buf->upload(zeros_m3d.data(),      N*3*sizeof(float));
-    dsh_buf ->upload(zeros_sh.data(),       N*K*3*sizeof(float));
-    dsc_buf ->upload(zeros_sc.data(),       N*3*sizeof(float));
-    drot_buf->upload(zeros_rot.data(),      N*4*sizeof(float));
-    ubo_buf ->upload(&ubo,                  sizeof(ubo));
+    pos_buf     ->upload(positions.data(),          N*3*sizeof(float));
+    rad_buf     ->upload(radii.data(),              N*sizeof(int32_t));
+    cv3_buf     ->upload(cov3D_data.data(),         N*6*sizeof(float));
+    dcon_buf    ->upload(d_conics.data(),           N*3*sizeof(float));
+    dopa_buf    ->upload(d_opacity.data(),          N*sizeof(float));
+    sh_buf      ->upload(sh_coeffs_data.data(),     N*K*3*sizeof(float));
+    sc_buf      ->upload(scales_data.data(),        N*3*sizeof(float));
+    rot_buf     ->upload(rotations_data.data(),     N*4*sizeof(float));
+    drgb_buf    ->upload(d_rgb_data.data(),         N*3*sizeof(float));
+    dm2d_buf    ->upload(d_means2D_data.data(),     N*2*sizeof(float));
+    dm3d_buf    ->upload(zeros_m3d.data(),          N*3*sizeof(float));
+    dsh_buf     ->upload(zeros_sh.data(),           N*K*3*sizeof(float));
+    dsc_buf     ->upload(zeros_sc.data(),           N*3*sizeof(float));
+    drot_buf    ->upload(zeros_rot.data(),          N*4*sizeof(float));
+    opa_buf     ->upload(opacities_data.data(),     N*sizeof(float));
+    d_raw_opa_buf->upload(zeros_d_raw_opa.data(),  N*sizeof(float));
+    rawrot_buf  ->upload(raw_rotations_data.data(), N*4*sizeof(float));
+    m2d_cache_buf->upload(means2D_cache_data.data(),N*2*sizeof(float));
+    ubo_buf     ->upload(&ubo,                      sizeof(ubo));
 
     // ---- Create pass and dispatch -----------------------------------------
     PreprocessBackwardPass pass(ctx);
 
     PreprocessBackwardPass::Buffers pb{};
-    pb.positions   = pos_buf ->handle();
-    pb.radii       = rad_buf ->handle();
-    pb.cov3D       = cv3_buf ->handle();
-    pb.d_conics    = dcon_buf->handle();
-    pb.d_opacity   = dopa_buf->handle();
-    pb.sh_coeffs   = sh_buf  ->handle();
-    pb.scales      = sc_buf  ->handle();
-    pb.rotations   = rot_buf ->handle();
-    pb.d_rgb       = drgb_buf->handle();
-    pb.d_means2D   = dm2d_buf->handle();
-    pb.d_means3D   = dm3d_buf->handle();
-    pb.d_sh        = dsh_buf ->handle();
-    pb.d_scales    = dsc_buf ->handle();
-    pb.d_rotations = drot_buf->handle();
+    pb.positions       = pos_buf      ->handle();
+    pb.radii           = rad_buf      ->handle();
+    pb.cov3D           = cv3_buf      ->handle();
+    pb.d_conics        = dcon_buf     ->handle();
+    pb.d_opacity       = dopa_buf     ->handle();
+    pb.sh_coeffs       = sh_buf       ->handle();
+    pb.scales          = sc_buf       ->handle();
+    pb.rotations       = rot_buf      ->handle();
+    pb.d_rgb           = drgb_buf     ->handle();
+    pb.d_means2D       = dm2d_buf     ->handle();
+    pb.d_means3D       = dm3d_buf     ->handle();
+    pb.d_sh            = dsh_buf      ->handle();
+    pb.d_scales        = dsc_buf      ->handle();
+    pb.d_rotations     = drot_buf     ->handle();
+    pb.opacities       = opa_buf      ->handle();
+    pb.d_raw_opacities = d_raw_opa_buf->handle();
+    pb.raw_rotations   = rawrot_buf   ->handle();
+    pb.means2D_cache   = m2d_cache_buf->handle();
 
     pass.bind_buffers(pb, ubo_buf->handle());
     pass.dispatch_sync(N);

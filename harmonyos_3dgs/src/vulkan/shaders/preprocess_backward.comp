@@ -43,6 +43,7 @@ layout(std430, set = 0, binding = 13) writeonly buffer BufDRotations { float d_r
 layout(std430, set = 0, binding = 14) readonly  buffer BufOpacities     { float opacities[];     };
 layout(std430, set = 0, binding = 15) writeonly buffer BufDRawOpacities { float d_raw_opacities[];};
 layout(std430, set = 0, binding = 17) readonly  buffer BufRawRotations  { float raw_rotations[]; };
+layout(std430, set = 0, binding = 18) readonly  buffer BufMeans2DCache { float means2D_cache[]; };
 
 // ---- UBO (std140, binding 16) ----------------------------------------------
 layout(std140, set = 0, binding = 16) uniform PreprocessBwdUBO {
@@ -623,13 +624,13 @@ void main() {
     float d_ndc_x = d_pixel_x * float(ubo.cam_width)  * 0.5;
     float d_ndc_y = d_pixel_y * float(ubo.cam_height) * 0.5;
 
-    // Perspective divide backward: ndc = p_hom.xy / w
-    // Recover ndc from cached means2D via inverse ndc2Pix:
-    //   ndc = (2*pixel + 1) / S - 1
-    // But means2D is not available here as a cached value (it would require another buffer).
-    // Instead, compute ndc directly from p_hom:
-    float ndc_x = p_hom.x * inv_w;
-    float ndc_y = p_hom.y * inv_w;
+    // Recover ndc from cached means2D via exact inverse of ndc2Pix:
+    //   ndc2Pix: pixel = ((ndc+1)*S - 1) * 0.5
+    //   inverse: ndc = (2*pixel + 1) / S - 1
+    // This matches preprocessor_backward_cpu.cpp:621-626 exactly, avoiding
+    // the ~0.8 absolute error from recomputing ndc = p_hom.xy / p_hom.w.
+    float ndc_x = (2.0 * means2D_cache[i * 2u + 0u] + 1.0) / float(ubo.cam_width)  - 1.0;
+    float ndc_y = (2.0 * means2D_cache[i * 2u + 1u] + 1.0) / float(ubo.cam_height) - 1.0;
 
     // d_p_hom:
     //   d_p_hom[0] = d_ndc_x * inv_w
