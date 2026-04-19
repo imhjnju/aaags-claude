@@ -26,6 +26,7 @@
 #include "vulkan/vk_buffer.h"
 #include "vulkan/backward_bindings.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -39,6 +40,49 @@ PreprocessorBackwardVulkan::PreprocessorBackwardVulkan(VulkanContext& ctx)
 }
 
 PreprocessorBackwardVulkan::~PreprocessorBackwardVulkan() = default;
+
+void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
+    if (N <= buf_N_ && K <= buf_K_) return;
+
+    const int N_new = std::max(N, buf_N_);
+    const int K_new = std::max(K, buf_K_);
+
+    const VkDeviceSize sz_N3 = static_cast<VkDeviceSize>(N_new) * 3u * sizeof(float);
+    const VkDeviceSize sz_N4 = static_cast<VkDeviceSize>(N_new) * 4u * sizeof(float);
+    const VkDeviceSize sz_N2 = static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float);
+    const VkDeviceSize sz_N6 = static_cast<VkDeviceSize>(N_new) * 6u * sizeof(float);
+    const VkDeviceSize sz_N  = static_cast<VkDeviceSize>(N_new) * sizeof(float);
+    const VkDeviceSize sz_Ni = static_cast<VkDeviceSize>(N_new) * sizeof(int32_t);
+    const VkDeviceSize sz_sh = static_cast<VkDeviceSize>(N_new) * static_cast<VkDeviceSize>(K_new) * 3u * sizeof(float);
+
+    pos_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    rad_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_Ni, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    cv3_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N6, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dcon_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dopa_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    sh_buf_        = std::make_unique<VulkanBuffer>(ctx_, sz_sh, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    sc_buf_        = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    rot_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    drgb_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dm2d_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    opa_in_buf_    = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    raw_rot_buf_   = std::make_unique<VulkanBuffer>(ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    m2d_cache_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    pview_in_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    cov2d_in_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    c2ddet_in_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    phomw_in_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dm3d_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dsh_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_sh, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dsc_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    drot_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    d_raw_opa_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    ubo_buf_       = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    buf_N_ = N_new; buf_K_ = K_new;
+}
 
 void PreprocessorBackwardVulkan::backward(const GaussianData& g,
                                            int num_gaussians,
@@ -62,6 +106,8 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
 
     if (N == 0) return;
 
+    prepare_for_n(N, K);
+
     // Compute UBO parameters
     const float h_x = static_cast<float>(cam.width)  / (2.0f * cam.tan_fovx);
     const float h_y = static_cast<float>(cam.height) / (2.0f * cam.tan_fovy);
@@ -82,35 +128,12 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     const VkDeviceSize bytes_d_sc    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
     const VkDeviceSize bytes_d_rot   = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
     const VkDeviceSize bytes_N_float = static_cast<VkDeviceSize>(N) * sizeof(float);
-
-    // --- Allocate GPU buffers (host-visible coherent) -----------------------
-    auto pos_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_pos,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rad_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_radii, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto cv3_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_cov3D, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dcon_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_con, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dopa_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_opa, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto sh_buf     = std::make_unique<VulkanBuffer>(ctx_, bytes_sh,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto sc_buf     = std::make_unique<VulkanBuffer>(ctx_, bytes_scales,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rot_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_rot,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto drgb_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_rgb, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dm2d_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_m2d, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    // Gradient output buffers — must be zero-filled before dispatch.
-    // preprocess_backward.comp writes directly (not atomicAdd), so they must
-    // start at zero (culled Gaussians don't write and the buffer retains the value).
-    auto dm3d_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_m3d, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dsh_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_d_sh,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dsc_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_d_sc,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto drot_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_d_rot, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    auto opa_in_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto d_raw_opa_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_N_float, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    const VkDeviceSize bytes_raw_rot = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
-    auto raw_rot_buf   = std::make_unique<VulkanBuffer>(ctx_, bytes_raw_rot, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    const VkDeviceSize bytes_m2d_cache = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
-    auto m2d_cache_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_m2d_cache, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const VkDeviceSize bytes_raw_rot    = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_m2d_cache  = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
+    const VkDeviceSize bytes_p_view     = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_cov2d      = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_c2d_det    = static_cast<VkDeviceSize>(N) * sizeof(float);
+    const VkDeviceSize bytes_phomw      = static_cast<VkDeviceSize>(N) * sizeof(float);
 
     // Validate that the required cache fields are populated.
     // They are filled by PreprocessorCPU::process() or PreprocessorVulkan::download_cache().
@@ -131,55 +154,41 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
             "PreprocessorBackwardVulkan::backward: cache.p_hom_w is null — "
             "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
 
-    const VkDeviceSize bytes_p_view   = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
-    const VkDeviceSize bytes_cov2d    = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
-    const VkDeviceSize bytes_c2d_det  = static_cast<VkDeviceSize>(N) * sizeof(float);
-    auto pview_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_p_view,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto cov2d_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_cov2d,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto c2ddet_in_buf = std::make_unique<VulkanBuffer>(ctx_, bytes_c2d_det, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // p_hom_w cache: p_hom.w from forward (for bit-exact inv_w in Part D)
-    const VkDeviceSize bytes_phomw   = static_cast<VkDeviceSize>(N) * sizeof(float);
-    auto phomw_in_buf  = std::make_unique<VulkanBuffer>(ctx_, bytes_phomw,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    auto ubo_buf    = std::make_unique<VulkanBuffer>(ctx_,
-                          static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
-                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-
     // --- Upload inputs -------------------------------------------------------
-    pos_buf ->upload(g.positions,                   static_cast<std::size_t>(bytes_pos));
-    rad_buf ->upload(cache.pre->radii,               static_cast<std::size_t>(bytes_radii));
-    cv3_buf ->upload(cache.cov3D,                    static_cast<std::size_t>(bytes_cov3D));
-    dcon_buf->upload(rgrad.d_conics,                 static_cast<std::size_t>(bytes_d_con));
-    dopa_buf->upload(rgrad.d_opacities_2d,           static_cast<std::size_t>(bytes_d_opa));  // d_opacity uploaded but not read by shader — SP-3 scope
-    sh_buf  ->upload(g.sh_coeffs,                    static_cast<std::size_t>(bytes_sh));
-    sc_buf  ->upload(g.scales,                       static_cast<std::size_t>(bytes_scales));
-    rot_buf ->upload(g.rotations,                    static_cast<std::size_t>(bytes_rot));
-    drgb_buf->upload(rgrad.d_rgb,                    static_cast<std::size_t>(bytes_d_rgb));
-    dm2d_buf->upload(rgrad.d_means2D,               static_cast<std::size_t>(bytes_d_m2d));
-    opa_in_buf->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
-    raw_rot_buf->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
-    m2d_cache_buf->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
-    pview_in_buf ->upload(cache.p_view,              static_cast<std::size_t>(bytes_p_view));
-    cov2d_in_buf ->upload(cache.cov2D,               static_cast<std::size_t>(bytes_cov2d));
-    c2ddet_in_buf->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
-    phomw_in_buf ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
+    pos_buf_ ->upload(g.positions,                   static_cast<std::size_t>(bytes_pos));
+    rad_buf_ ->upload(cache.pre->radii,               static_cast<std::size_t>(bytes_radii));
+    cv3_buf_ ->upload(cache.cov3D,                    static_cast<std::size_t>(bytes_cov3D));
+    dcon_buf_->upload(rgrad.d_conics,                 static_cast<std::size_t>(bytes_d_con));
+    dopa_buf_->upload(rgrad.d_opacities_2d,           static_cast<std::size_t>(bytes_d_opa));  // d_opacity uploaded but not read by shader — SP-3 scope
+    sh_buf_  ->upload(g.sh_coeffs,                    static_cast<std::size_t>(bytes_sh));
+    sc_buf_  ->upload(g.scales,                       static_cast<std::size_t>(bytes_scales));
+    rot_buf_ ->upload(g.rotations,                    static_cast<std::size_t>(bytes_rot));
+    drgb_buf_->upload(rgrad.d_rgb,                    static_cast<std::size_t>(bytes_d_rgb));
+    dm2d_buf_->upload(rgrad.d_means2D,               static_cast<std::size_t>(bytes_d_m2d));
+    opa_in_buf_->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
+    raw_rot_buf_->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
+    m2d_cache_buf_->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
+    pview_in_buf_ ->upload(cache.p_view,              static_cast<std::size_t>(bytes_p_view));
+    cov2d_in_buf_ ->upload(cache.cov2D,               static_cast<std::size_t>(bytes_cov2d));
+    c2ddet_in_buf_->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
+    phomw_in_buf_ ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
 
     // Zero-fill gradient output buffers.
     {
         const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dm3d_buf->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
+        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
 
         const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
-        dsh_buf ->upload(zeros_sh.data(),  static_cast<std::size_t>(bytes_d_sh));
+        dsh_buf_ ->upload(zeros_sh.data(),  static_cast<std::size_t>(bytes_d_sh));
 
         const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dsc_buf ->upload(zeros_sc.data(),  static_cast<std::size_t>(bytes_d_sc));
+        dsc_buf_ ->upload(zeros_sc.data(),  static_cast<std::size_t>(bytes_d_sc));
 
         const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
-        drot_buf->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
+        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
 
         const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        d_raw_opa_buf->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
+        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
     }
 
     // Upload UBO.
@@ -200,40 +209,40 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     ubo.training        = cfg.training ? 1u : 0u;
     ubo.cam_width       = static_cast<uint32_t>(cam.width);
     ubo.cam_height      = static_cast<uint32_t>(cam.height);
-    ubo_buf->upload(&ubo, sizeof(ubo));
+    ubo_buf_->upload(&ubo, sizeof(ubo));
 
     // --- Bind and dispatch --------------------------------------------------
     PreprocessBackwardPass::Buffers pb{};
-    pb.positions   = pos_buf ->handle();
-    pb.radii       = rad_buf ->handle();
-    pb.cov3D       = cv3_buf ->handle();
-    pb.d_conics    = dcon_buf->handle();
-    pb.d_opacity   = dopa_buf->handle();
-    pb.sh_coeffs   = sh_buf  ->handle();
-    pb.scales      = sc_buf  ->handle();
-    pb.rotations   = rot_buf ->handle();
-    pb.d_rgb       = drgb_buf->handle();
-    pb.d_means2D   = dm2d_buf->handle();
-    pb.d_means3D       = dm3d_buf   ->handle();
-    pb.d_sh            = dsh_buf    ->handle();
-    pb.d_scales        = dsc_buf    ->handle();
-    pb.d_rotations     = drot_buf   ->handle();
-    pb.opacities       = opa_in_buf ->handle();
-    pb.d_raw_opacities = d_raw_opa_buf->handle();
-    pb.raw_rotations      = raw_rot_buf  ->handle();
-    pb.means2D_cache      = m2d_cache_buf->handle();
-    pb.p_view_cache_in    = pview_in_buf ->handle();
-    pb.cov2D_cache_in     = cov2d_in_buf ->handle();
-    pb.cov2D_det_cache_in = c2ddet_in_buf->handle();
-    pb.p_hom_w_cache_in   = phomw_in_buf ->handle();
+    pb.positions   = pos_buf_ ->handle();
+    pb.radii       = rad_buf_ ->handle();
+    pb.cov3D       = cv3_buf_ ->handle();
+    pb.d_conics    = dcon_buf_->handle();
+    pb.d_opacity   = dopa_buf_->handle();
+    pb.sh_coeffs   = sh_buf_  ->handle();
+    pb.scales      = sc_buf_  ->handle();
+    pb.rotations   = rot_buf_ ->handle();
+    pb.d_rgb       = drgb_buf_->handle();
+    pb.d_means2D   = dm2d_buf_->handle();
+    pb.d_means3D       = dm3d_buf_   ->handle();
+    pb.d_sh            = dsh_buf_    ->handle();
+    pb.d_scales        = dsc_buf_    ->handle();
+    pb.d_rotations     = drot_buf_   ->handle();
+    pb.opacities       = opa_in_buf_ ->handle();
+    pb.d_raw_opacities = d_raw_opa_buf_->handle();
+    pb.raw_rotations      = raw_rot_buf_  ->handle();
+    pb.means2D_cache      = m2d_cache_buf_->handle();
+    pb.p_view_cache_in    = pview_in_buf_ ->handle();
+    pb.cov2D_cache_in     = cov2d_in_buf_ ->handle();
+    pb.cov2D_det_cache_in = c2ddet_in_buf_->handle();
+    pb.p_hom_w_cache_in   = phomw_in_buf_ ->handle();
 
-    pass_->bind_buffers(pb, ubo_buf->handle());
+    pass_->bind_buffers(pb, ubo_buf_->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));
 
     // --- Download gradients into grads arrays --------------------------------
-    dm3d_buf    ->download(grads.d_raw_positions,  static_cast<std::size_t>(bytes_d_m3d));
-    dsh_buf     ->download(grads.d_raw_sh_coeffs,  static_cast<std::size_t>(bytes_d_sh));
-    dsc_buf     ->download(grads.d_raw_scales,     static_cast<std::size_t>(bytes_d_sc));
-    drot_buf    ->download(grads.d_raw_rotations,  static_cast<std::size_t>(bytes_d_rot));
-    d_raw_opa_buf->download(grads.d_raw_opacities, static_cast<std::size_t>(bytes_N_float));
+    dm3d_buf_    ->download(grads.d_raw_positions,  static_cast<std::size_t>(bytes_d_m3d));
+    dsh_buf_     ->download(grads.d_raw_sh_coeffs,  static_cast<std::size_t>(bytes_d_sh));
+    dsc_buf_     ->download(grads.d_raw_scales,     static_cast<std::size_t>(bytes_d_sc));
+    drot_buf_    ->download(grads.d_raw_rotations,  static_cast<std::size_t>(bytes_d_rot));
+    d_raw_opa_buf_->download(grads.d_raw_opacities, static_cast<std::size_t>(bytes_N_float));
 }
