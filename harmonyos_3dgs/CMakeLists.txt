@@ -232,7 +232,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/rasterize_backward_pass.cpp
             src/vulkan/rasterizer_backward_vulkan.cpp
             src/vulkan/preprocess_backward_pass.cpp
-            src/vulkan/preprocessor_backward_vulkan.cpp)
+            src/vulkan/preprocessor_backward_vulkan.cpp
+            src/vulkan_trainer.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
@@ -269,7 +270,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_preprocess_backward_pass_vk.cpp
                 tests/test_preprocessor_backward_vulkan.cpp
                 tests/test_backward_pipeline_vk.cpp
-                tests/test_forward_cache_vk.cpp)
+                tests/test_forward_cache_vk.cpp
+                tests/test_training_step_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

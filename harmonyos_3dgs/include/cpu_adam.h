@@ -30,6 +30,10 @@ public:
     // Run one Adam step. Increments internal step counter.
     void step();
 
+    // Update the grad pointer for group idx (groups_ must already exist).
+    // Called each training step to re-wire gradients before step().
+    void set_grad(int idx, const float* grad);
+
     int step_count() const { return step_; }
 
 private:

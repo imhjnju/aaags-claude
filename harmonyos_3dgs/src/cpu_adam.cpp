@@ -8,6 +8,10 @@ void CpuAdam::add_group(AdamGroup g) {
     groups_.push_back(g);
 }
 
+void CpuAdam::set_grad(int idx, const float* grad) {
+    groups_.at(static_cast<size_t>(idx)).grad = grad;
+}
+
 void CpuAdam::step() {
     ++step_;
     float bc1 = 1.0f - std::pow(beta1_, static_cast<float>(step_));
