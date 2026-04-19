@@ -425,9 +425,9 @@ float VulkanTrainer::step(const Camera& cam,
 //   noise = Sigma @ noise   where Sigma = L @ L^T
 //   xyz += noise
 //
-// Evidence: op_sigmoid(1 - opacity) == sigmoid(-100*(opacity - 0.995))
-// when opacity < 0.995 the factor is near 0 (active Gaussian, no noise);
-// when opacity < 0.01 the factor approaches 1 (dead Gaussian, max noise).
+// Evidence: op_sigmoid(1 - opacity) = sigmoid(-100*(opacity - 0.005))
+// when opacity >= ~0.01 (active) the factor is < 1e-6 (no noise injected);
+// when opacity < ~0.005 (dead) the factor approaches 0.62 (noise injected).
 void VulkanTrainer::inject_position_noise(float pos_lr) {
     if (tcfg_.noise_lr == 0.f || N_ == 0) return;
 

@@ -119,9 +119,9 @@ TEST(PositionNoise, ActiveGaussianGetsNoNoise) {
     EXPECT_LT(opacity_factor, 1e-6f);
 }
 
-TEST(PositionNoise, DeadGaussianGetsFullNoise) {
-    // A dead Gaussian with opacity=0.001 should have opacity_factor near 1.
-    // op_sigmoid(1-0.001) = op_sigmoid(0.999 - 0.995 + 0.995) ~ 1.
+TEST(PositionNoise, DeadGaussianGetsNoise) {
+    // A dead Gaussian (opacity=0.001) should have opacity_factor well above the
+    // 1e-6 skip threshold. op_sigmoid(1-0.001)=op_sigmoid(0.999) ~ 0.60.
     const float opacity_factor = op_sigmoid(1.f - 0.001f);
-    EXPECT_GT(opacity_factor, 0.5f);
+    EXPECT_GT(opacity_factor, 0.55f);
 }
