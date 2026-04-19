@@ -37,6 +37,7 @@ add_library(gs3d_core
     src/optimizer.cpp
     src/trainer.cpp
     src/density_controller.cpp
+    src/cpu_adam.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
@@ -104,6 +105,7 @@ if(BUILD_TESTS)
         tests/test_compare.cpp
         tests/test_manifest.cpp
         tests/test_golden_roundtrip.cpp
+        tests/test_cpu_adam.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
