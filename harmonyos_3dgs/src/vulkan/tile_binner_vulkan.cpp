@@ -26,6 +26,7 @@
 #include "vulkan/tile_binner_vulkan.h"
 #include "vulkan/vk_buffer.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -42,6 +43,44 @@ TileBinnerVulkan::TileBinnerVulkan(VulkanContext& ctx)
 // types from tile_binner_passes.h (header uses forward-declaration style via
 // the include).
 TileBinnerVulkan::~TileBinnerVulkan() = default;
+
+void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t R_max, uint32_t num_wgs) {
+    if (N <= bin_N_ && R_max <= bin_R_max_ && num_wgs <= bin_wg_) return;
+
+    const uint32_t N_new  = std::max(N,       bin_N_);
+    const uint32_t R_new  = std::max(R_max,   bin_R_max_);
+    const uint32_t wg_new = std::max(num_wgs, bin_wg_);
+
+    bin_tt_buf_  = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(int32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_po_buf_  = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_ws_buf_  = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(wg_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_m2d_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_dep_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_rad_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(int32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_rf_buf_  = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_keys_buf_= std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R_new) * sizeof(uint64_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_vals_buf_= std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    bin_N_ = N_new; bin_R_max_ = R_new; bin_wg_ = wg_new;
+}
 
 BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
                                     int num_gaussians,
@@ -70,37 +109,31 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     }
 
     // -------------------------------------------------------------------
-    // 1. Allocate + upload input SSBOs.
+    // 1. Ensure persistent SSBOs are large enough, then upload inputs.
     // -------------------------------------------------------------------
     // tiles_touched: host int* (non-negative), used by prefix scan as uint[]
     // AND by scatter as int[]. Bit layout is identical, so one buffer works.
     const VkDeviceSize bytes_int_N    = static_cast<VkDeviceSize>(N) * sizeof(int32_t);
-    const VkDeviceSize bytes_uint_N   = static_cast<VkDeviceSize>(N) * sizeof(uint32_t);
     const VkDeviceSize bytes_float_N  = static_cast<VkDeviceSize>(N) * sizeof(float);
     const VkDeviceSize bytes_float_N2 = static_cast<VkDeviceSize>(N) * 2 * sizeof(float);
-
-    auto tt_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_int_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto po_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_uint_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // workgroup_sums[ceil(N/256)], min 1. Phase-1 scan writes one slot per
     // phase-0 workgroup; phase-1 scans it in a single 256-thread WG in-place.
     const uint32_t num_wgs =
         (static_cast<uint32_t>(N) + 255u) / 256u;
-    const uint32_t wg_sums_count = num_wgs == 0u ? 1u : num_wgs;
-    auto ws_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(wg_sums_count) * sizeof(uint32_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // R_max upper bound: each Gaussian touches at most (num_tiles_x * num_tiles_y) tiles.
+    // sum(tiles_touched) <= N * num_tiles by definition, so R_max is always safe.
+    const uint32_t R_max_estimate = static_cast<uint32_t>(N) * (num_tiles_x * num_tiles_y);
+    prepare_for_bin(static_cast<uint32_t>(N), std::max(R_max_estimate, 1u), std::max(num_wgs, 1u));
 
-    tt_buf->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
+    bin_tt_buf_->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
 
     // -------------------------------------------------------------------
     // 2. Exclusive prefix scan: tiles_touched -> point_offsets.
     // -------------------------------------------------------------------
-    scan_pass_->bind_buffers(tt_buf->handle(),
-                             po_buf->handle(),
-                             ws_buf->handle());
+    scan_pass_->bind_buffers(bin_tt_buf_->handle(),
+                             bin_po_buf_->handle(),
+                             bin_ws_buf_->handle());
     scan_pass_->scan_sync(static_cast<uint32_t>(N));
 
     // -------------------------------------------------------------------
@@ -108,15 +141,15 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     // -------------------------------------------------------------------
     uint32_t last_offset = 0u;
     uint32_t last_count  = 0u;
-    po_buf->download(&last_offset,
-                     sizeof(uint32_t),
-                     /*offset=*/static_cast<VkDeviceSize>(N - 1) * sizeof(uint32_t));
+    bin_po_buf_->download(&last_offset,
+                          sizeof(uint32_t),
+                          /*offset=*/static_cast<VkDeviceSize>(N - 1) * sizeof(uint32_t));
     // tiles_touched is stored as int32 but non-negative; read as uint32.
     {
         int32_t tmp = 0;
-        tt_buf->download(&tmp,
-                         sizeof(int32_t),
-                         static_cast<VkDeviceSize>(N - 1) * sizeof(int32_t));
+        bin_tt_buf_->download(&tmp,
+                              sizeof(int32_t),
+                              static_cast<VkDeviceSize>(N - 1) * sizeof(int32_t));
         if (tmp < 0)
             throw std::runtime_error(
                 "TileBinnerVulkan: tiles_touched[N-1] is negative — preprocess bug?");
@@ -138,53 +171,38 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     }
 
     // -------------------------------------------------------------------
-    // 4. Allocate scatter input SSBOs (means2D, depths, radii) + output
-    //    SSBOs (keys_unsorted[R], values_unsorted[R]), upload, dispatch.
+    // 4. Upload scatter inputs into persistent SSBOs, dispatch.
+    //    keys_unsorted[R_max] / values_unsorted[R_max] are pre-allocated
+    //    (R_max >= R by construction); we only download R valid elements.
     // -------------------------------------------------------------------
-    auto m2d_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_float_N2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dep_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_float_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rad_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_int_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rf_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_float_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    auto keys_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(R) * sizeof(uint64_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto vals_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(R) * sizeof(uint32_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    m2d_buf->upload(pre.means2D, static_cast<std::size_t>(bytes_float_N2));
-    dep_buf->upload(pre.depths,  static_cast<std::size_t>(bytes_float_N));
-    rad_buf->upload(pre.radii,   static_cast<std::size_t>(bytes_int_N));
+    bin_m2d_buf_->upload(pre.means2D, static_cast<std::size_t>(bytes_float_N2));
+    bin_dep_buf_->upload(pre.depths,  static_cast<std::size_t>(bytes_float_N));
+    bin_rad_buf_->upload(pre.radii,   static_cast<std::size_t>(bytes_int_N));
     if (pre.radius_f != nullptr) {
-        rf_buf->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N));
+        bin_rf_buf_->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N));
     } else {
         std::vector<float> rf_host(static_cast<std::size_t>(N));
         for (int k = 0; k < N; ++k)
             rf_host[static_cast<std::size_t>(k)] = static_cast<float>(pre.radii[k]);
-        rf_buf->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N));
+        bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N));
     }
 
     ScatterPass::Buffers sb{};
-    sb.means2D         = m2d_buf->handle();
-    sb.depths          = dep_buf->handle();
-    sb.radii           = rad_buf->handle();
-    sb.point_offsets   = po_buf ->handle();
-    sb.tiles_touched   = tt_buf ->handle();
-    sb.keys_unsorted   = keys_buf->handle();
-    sb.values_unsorted = vals_buf->handle();
-    sb.radius_f        = rf_buf ->handle();
+    sb.means2D         = bin_m2d_buf_->handle();
+    sb.depths          = bin_dep_buf_->handle();
+    sb.radii           = bin_rad_buf_->handle();
+    sb.point_offsets   = bin_po_buf_ ->handle();
+    sb.tiles_touched   = bin_tt_buf_ ->handle();
+    sb.keys_unsorted   = bin_keys_buf_->handle();
+    sb.values_unsorted = bin_vals_buf_->handle();
+    sb.radius_f        = bin_rf_buf_ ->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
                                  num_tiles_y);
 
     // -------------------------------------------------------------------
-    // 5. Download pairs into FrameAllocator-backed output.
+    // 5. Download R valid pairs into FrameAllocator-backed output.
     // -------------------------------------------------------------------
     out.keys_unsorted   = alloc.allocate_array<uint64_t>(R);
     out.values_unsorted = alloc.allocate_array<uint32_t>(R);
@@ -192,10 +210,10 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     out.values_sorted   = nullptr;
     out.tile_ranges     = nullptr;
 
-    keys_buf->download(out.keys_unsorted,
-                       static_cast<std::size_t>(R) * sizeof(uint64_t));
-    vals_buf->download(out.values_unsorted,
-                       static_cast<std::size_t>(R) * sizeof(uint32_t));
+    bin_keys_buf_->download(out.keys_unsorted,
+                            static_cast<std::size_t>(R) * sizeof(uint64_t));
+    bin_vals_buf_->download(out.values_unsorted,
+                            static_cast<std::size_t>(R) * sizeof(uint32_t));
 
     return out;
 }

@@ -82,4 +82,24 @@ private:
     std::unique_ptr<VulkanBuffer> r_ws_buf_;      // workgroup sums [ceil(N/256)]
     std::unique_ptr<VulkanBuffer> r_keys_buf_;    // keys_unsorted [R_max] u64
     std::unique_ptr<VulkanBuffer> r_vals_buf_;    // values_unsorted [R_max] u32
+
+    // --- Layer-1 persistent buffers (bin() reuses across calls) ---
+    // Sized to max(N, R_max) seen so far; reallocated only when sizes grow.
+    // R_max is computed as N * num_tiles_x * num_tiles_y (safe upper bound since
+    // sum(tiles_touched[i]) <= N * num_tiles by definition).
+    uint32_t bin_N_     = 0u;  // Gaussian count at last alloc
+    uint32_t bin_R_max_ = 0u;  // R upper bound at last alloc
+    uint32_t bin_wg_    = 0u;  // workgroup count = ceil(N/256) at last alloc
+
+    std::unique_ptr<VulkanBuffer> bin_tt_buf_;    // tiles_touched [N] i32
+    std::unique_ptr<VulkanBuffer> bin_po_buf_;    // point_offsets [N] u32
+    std::unique_ptr<VulkanBuffer> bin_ws_buf_;    // workgroup_sums [ceil(N/256)] u32
+    std::unique_ptr<VulkanBuffer> bin_m2d_buf_;   // means2D [N*2] f32
+    std::unique_ptr<VulkanBuffer> bin_dep_buf_;   // depths [N] f32
+    std::unique_ptr<VulkanBuffer> bin_rad_buf_;   // radii [N] i32
+    std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N] f32
+    std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R_max] u64
+    std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R_max] u32
+
+    void prepare_for_bin(uint32_t N, uint32_t R_max, uint32_t num_wgs);
 };
