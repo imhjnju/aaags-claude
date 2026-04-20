@@ -280,6 +280,9 @@ float VulkanTrainer::step(const Camera& cam,
                     chw_tmp[static_cast<size_t>(ch) * HW + px];
             }
         }
+        // TODO(perf): eliminate this copy by fixing rasterize.comp to write HWC
+        // directly (out_image[px*3+ch] instead of out_image[ch*HW+px]). At
+        // 720×960 this is ~8 MB copied every training step.
     }
 
     // 5. Combined L1 + DSSIM loss + gradient.
