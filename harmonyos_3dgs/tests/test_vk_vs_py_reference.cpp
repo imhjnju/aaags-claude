@@ -574,9 +574,9 @@ TEST(VkVsPyReference, PerStepFullComparison) {
 // ---------------------------------------------------------------------------
 // Test 4: OraclePerStepComparison
 //
-// For each step i in [1..100], inject Python step i-1 params into a freshly
-// zeroed VulkanTrainer, run 1 step, and compare loss and gradients element-wise
-// against Python step i.
+// For each step i in [1..N_ORACLE_STEPS], inject Python step i-1 params into a
+// freshly zeroed VulkanTrainer, run 1 step, and compare loss and gradients
+// element-wise against Python step i.
 //
 // This approach removes FP-accumulation as a confound: every oracle step starts
 // from IDENTICAL inputs to Python. If the algorithm is correct, loss and
@@ -595,7 +595,17 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
     TinyScene scene;
     ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
 
-    constexpr int N_STEPS = 100;
+    constexpr int N_STEPS = 1000;
+    {
+        char check[256];
+        std::snprintf(check, sizeof(check), "%s/step_%04d_loss.npy",
+                      py_ref_dir().c_str(), N_STEPS);
+        if (!std::filesystem::exists(check)) {
+            GTEST_SKIP() << "Python dump has fewer than " << N_STEPS
+                         << " steps — run: python tools/dump_tiny_reference.py --steps "
+                         << N_STEPS;
+        }
+    }
 
     RenderConfig rcfg = scene.cfg;
     rcfg.sh_degree = 0;
