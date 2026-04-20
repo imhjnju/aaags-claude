@@ -608,11 +608,18 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
     const int N   = scene.N;
     const int MC3 = scene.max_coeffs * 3;
 
-    // Helper: max element-wise relative diff (uses |py| as denominator, clamped to 1e-8).
+    // Helper: max element-wise relative diff.
+    // Denominator = max(|py[i]|, 1e-3 × ||py||_inf) to avoid inflating relative
+    // error for near-zero elements. Without the group-relative floor, an element
+    // at py=1e-8 with absolute diff 6e-11 (pure FP noise) would read as 0.6% —
+    // a measurement artifact that obscures real errors on larger elements.
     auto max_elem_rel_diff = [](const float* vk, const float* py, int n) -> float {
+        float py_inf = 0.0f;
+        for (int i = 0; i < n; ++i) py_inf = std::max(py_inf, std::fabs(py[i]));
+        const float floor_denom = 1e-3f * std::max(py_inf, 1e-8f);
         float mx = 0.0f;
         for (int i = 0; i < n; ++i) {
-            float d = std::fabs(vk[i] - py[i]) / std::max(std::fabs(py[i]), 1e-8f);
+            float d = std::fabs(vk[i] - py[i]) / std::max(std::fabs(py[i]), floor_denom);
             mx = std::max(mx, d);
         }
         return mx;
@@ -696,11 +703,12 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
         float gop_rd  = max_elem_rel_diff(trainer.captured_grad_opacities().data(),
                                           py_gop.data(), N);
         // Per-group max element-wise rel-diff tracking.
-        // Thresholds set at ~3× the empirically measured maxima (2026-04-20):
+        // Thresholds set at ~2× the empirically measured maxima (2026-04-20),
+        // using group-relative denominator (floor = 1e-3 × group_inf_norm):
         //   loss: 0.0003%  → threshold 0.001%   (3× headroom)
-        //   gpos: 0.52%    → threshold 1.0%     (2× headroom; GPU parallel-reduce on small N)
-        //   gsc:  0.0003%  → threshold 0.01%    (30× headroom)
-        //   grot: 0.74%    → threshold 1.5%     (2× headroom; normalised quat grads vary)
+        //   gpos: 0.1049%  → threshold 0.20%    (2× headroom; GPU parallel-reduce on small N)
+        //   gsc:  0.0002%  → threshold 0.01%    (50× headroom)
+        //   grot: 0.0408%  → threshold 0.10%    (2.5× headroom; quat Jacobian cross-terms)
         //   gsh:  0.0001%  → threshold 0.01%
         //   gop:  0.0001%  → threshold 0.01%
         float grad_max_rd = std::max({gpos_rd, gsc_rd, grot_rd, gsh_rd, gop_rd});
@@ -709,9 +717,9 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
         if (grad_max_rd > max_grad_rd_all) { max_grad_rd_all = grad_max_rd; worst_step_grad = step; }
 
         bool step_pass = (loss_rd  < 0.00001f) &&   // 0.001%
-                         (gpos_rd  < 0.01f)    &&   // 1.0%
+                         (gpos_rd  < 0.002f)   &&   // 0.20%
                          (gsc_rd   < 0.0001f)  &&   // 0.01%
-                         (grot_rd  < 0.015f)   &&   // 1.5%
+                         (grot_rd  < 0.001f)   &&   // 0.10%
                          (gsh_rd   < 0.0001f)  &&   // 0.01%
                          (gop_rd   < 0.0001f);      // 0.01%
         if (!step_pass) all_pass = false;
@@ -731,7 +739,7 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
     char sbuf[512];
     std::snprintf(sbuf, sizeof(sbuf),
         "  Max loss rel_diff:      %.4f%% (step %d)  [thresh 0.001%%]\n"
-        "  Max grad max_elem_diff: %.4f%% (step %d)  [thresh per-group: pos<1%% sc<0.01%% rot<1.5%% sh<0.01%% op<0.01%%]\n"
+        "  Max grad max_elem_diff: %.4f%% (step %d)  [thresh per-group: pos<0.20%% sc<0.01%% rot<0.10%% sh<0.01%% op<0.01%%]\n"
         "  All steps pass: %s\n",
         max_loss_rd_all * 100.f, worst_step_loss,
         max_grad_rd_all * 100.f, worst_step_grad,
@@ -740,6 +748,109 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
 
     EXPECT_LT(max_loss_rd_all, 0.00001f)
         << "Oracle max loss rel_diff > 0.001% (worst: step " << worst_step_loss << ")";
-    EXPECT_LT(max_grad_rd_all, 0.015f)
-        << "Oracle max gradient element rel_diff > 1.5% (worst: step " << worst_step_grad << ")";
+    EXPECT_LT(max_grad_rd_all, 0.002f)
+        << "Oracle max gradient element rel_diff > 0.20% (worst: step " << worst_step_grad << ")";
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic: element-wise print for worst grot/gpos steps
+// ---------------------------------------------------------------------------
+TEST(VkVsPyReference, DiagnosticElemwiseWorstSteps) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists())
+        GTEST_SKIP() << "Python dump missing.";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load());
+
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, make_vk_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const int N    = scene.N;
+    const int MC3  = scene.max_coeffs * 3;
+
+    // Diagnose step 61 grot and step 98 gpos.
+    struct Job { int prev; int step; const char* group; };
+    for (auto [prev_s, step_s, grp] : std::vector<Job>{{60,61,"grot"},{97,98,"gpos"}}) {
+        // Load prev params.
+        auto load_prev = [&](int ps) {
+            std::vector<float> pos, sc, rot, sh, op;
+            if (ps == 0) {
+                pos = scene.raw_positions; sc = scene.raw_scales;
+                rot = scene.raw_rotations; sh  = scene.raw_sh;
+                op  = scene.raw_opacities;
+            } else {
+                char pp[256];
+                std::snprintf(pp, sizeof(pp), "%s/step_%04d", py_ref_dir().c_str(), ps);
+                pos = npy_to_f32(load_npy(std::string(pp) + "_raw_pos.npy"));
+                sc  = npy_to_f32(load_npy(std::string(pp) + "_raw_sc.npy"));
+                rot = npy_to_f32(load_npy(std::string(pp) + "_raw_rot.npy"));
+                sh  = npy_to_f32(load_npy(std::string(pp) + "_raw_sh.npy"));
+                op  = npy_to_f32(load_npy(std::string(pp) + "_raw_op.npy"));
+            }
+            return std::make_tuple(pos, sc, rot, sh, op);
+        };
+
+        auto [pos, sc, rot, sh, op] = load_prev(prev_s);
+        RawGaussianParams oracle_raw{};
+        oracle_raw.count = N; oracle_raw.sh_degree = scene.sh_degree;
+        oracle_raw.max_coeffs = scene.max_coeffs;
+        oracle_raw.raw_positions = pos.data(); oracle_raw.raw_scales = sc.data();
+        oracle_raw.raw_rotations = rot.data(); oracle_raw.raw_sh_coeffs = sh.data();
+        oracle_raw.raw_opacities = op.data();
+        trainer.reset_for_oracle(oracle_raw);
+        float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+
+        // Load Python reference grads.
+        char sp[256];
+        std::snprintf(sp, sizeof(sp), "%s/step_%04d", py_ref_dir().c_str(), step_s);
+        std::string ssp(sp);
+        std::vector<float> py_g, vk_g;
+        int elem_size = 0;
+        if (std::string(grp) == "grot") {
+            py_g = npy_to_f32(load_npy(ssp + "_grad_rot.npy"));
+            vk_g = trainer.captured_grad_rotations();
+            elem_size = N * 4;
+        } else {
+            py_g = npy_to_f32(load_npy(ssp + "_grad_pos.npy"));
+            vk_g = trainer.captured_grad_positions();
+            elem_size = N * 3;
+        }
+
+        printf("\n=== step %d %s element-wise (py vs vk) ===\n", step_s, grp);
+        printf("%4s  %5s  %14s  %14s  %10s  %8s\n",
+               "idx","G.c","py","vk","abs_diff","rel_diff%");
+        float max_rd = 0.f; int worst_i = -1;
+        for (int i = 0; i < elem_size; ++i) {
+            float denom = std::max(std::fabs(py_g[i]), 1e-8f);
+            float ad = std::fabs(vk_g[i] - py_g[i]);
+            float rd = ad / denom;
+            if (rd > max_rd) { max_rd = rd; worst_i = i; }
+        }
+        // Print worst 15 elements by rel_diff.
+        std::vector<std::pair<float,int>> ranked;
+        for (int i = 0; i < elem_size; ++i) {
+            float denom = std::max(std::fabs(py_g[i]), 1e-8f);
+            ranked.push_back({std::fabs(vk_g[i]-py_g[i])/denom, i});
+        }
+        std::sort(ranked.begin(), ranked.end(), [](auto& a, auto& b){ return a.first > b.first; });
+        int stride = (std::string(grp) == "grot") ? 4 : 3;
+        for (int k = 0; k < std::min(15, (int)ranked.size()); ++k) {
+            int i = ranked[k].second;
+            float denom = std::max(std::fabs(py_g[i]), 1e-8f);
+            float ad = std::fabs(vk_g[i] - py_g[i]);
+            float rd = ad / denom;
+            printf("%4d  %2d.%1d  %+14.6e  %+14.6e  %10.4e  %8.4f%%\n",
+                   i, i/stride, i%stride,
+                   py_g[i], vk_g[i], ad, rd*100.f);
+        }
+        printf("  max rel_diff=%.4f%% at idx %d\n", max_rd*100.f, worst_i);
+    }
+    SUCCEED();
 }
