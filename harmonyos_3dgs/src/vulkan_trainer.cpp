@@ -321,6 +321,23 @@ float VulkanTrainer::step(const Camera& cam,
         }
     }
 
+    // Gradient capture — optional, for testing. Copies grads after regularization
+    // corrections, before GPU Adam upload. Matches Python autograd capture point.
+    if (capture_grads_) {
+        const size_t n = static_cast<size_t>(N_);
+        const size_t mc3 = static_cast<size_t>(max_coeffs_) * 3;
+        captured_grad_positions_.assign(grads.d_raw_positions,
+                                        grads.d_raw_positions + n * 3);
+        captured_grad_scales_.assign(grads.d_raw_scales,
+                                     grads.d_raw_scales + n * 3);
+        captured_grad_rotations_.assign(grads.d_raw_rotations,
+                                        grads.d_raw_rotations + n * 4);
+        captured_grad_sh_.assign(grads.d_raw_sh_coeffs,
+                                 grads.d_raw_sh_coeffs + n * mc3);
+        captured_grad_opacities_.assign(grads.d_raw_opacities,
+                                        grads.d_raw_opacities + n);
+    }
+
     // 8. Upload CPU gradients to gradient GPU buffers.
     //    SH: DC (first N*3 floats) and rest (remaining N*(max_coeffs-1)*3 floats)
     //    are uploaded to separate buffers to match the separate raw param GPU bufs.

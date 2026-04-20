@@ -51,6 +51,15 @@ public:
     const float* rendered_image() const { return image_.data(); }
     int rendered_image_size() const { return static_cast<int>(image_.size()); }
 
+    // Gradient capture — for testing only. Enable before calling step().
+    // Each step() call overwrites the previously captured gradients.
+    void enable_gradient_capture(bool on) { capture_grads_ = on; }
+    const std::vector<float>& captured_grad_positions()  const { return captured_grad_positions_; }
+    const std::vector<float>& captured_grad_scales()     const { return captured_grad_scales_; }
+    const std::vector<float>& captured_grad_rotations()  const { return captured_grad_rotations_; }
+    const std::vector<float>& captured_grad_sh()         const { return captured_grad_sh_; }
+    const std::vector<float>& captured_grad_opacities()  const { return captured_grad_opacities_; }
+
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
     // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
@@ -113,6 +122,16 @@ private:
     // Per-Gaussian accumulated gradient norm of means2D (proxy: |d_raw_positions|).
     // Size N_, reset to zeros after each densification step.
     std::vector<float> grad_means2D_accum_;
+
+    // Gradient capture (for testing). When capture_grads_ is true, each call
+    // to step() copies the computed gradients (after regularization, before
+    // GPU Adam upload) into captured_grad_* vectors.
+    bool                       capture_grads_ = false;
+    std::vector<float>         captured_grad_positions_;   // [N*3]
+    std::vector<float>         captured_grad_scales_;      // [N*3]
+    std::vector<float>         captured_grad_rotations_;   // [N*4]
+    std::vector<float>         captured_grad_sh_;          // [N*max_coeffs*3]
+    std::vector<float>         captured_grad_opacities_;   // [N]
 
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;
