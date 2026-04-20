@@ -41,6 +41,7 @@ add_library(gs3d_core
     src/dssim.cpp
     src/densification.cpp
     src/train_utils.cpp
+    src/camera_utils.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
