@@ -51,6 +51,13 @@ public:
     const float* rendered_image() const { return image_.data(); }
     int rendered_image_size() const { return static_cast<int>(image_.size()); }
 
+    // Reset params and zero Adam state for oracle per-step testing.
+    // Injects new_raw into all owned param vectors + GPU buffers,
+    // zeros all Adam moment buffers, and resets step_count_ to 0.
+    // Call before each oracle step to test algorithm correctness
+    // independent of FP accumulation.
+    void reset_for_oracle(const RawGaussianParams& new_raw);
+
     // Gradient capture — for testing only. Enable before calling step().
     // Each step() call overwrites the previously captured gradients.
     void enable_gradient_capture(bool on) { capture_grads_ = on; }

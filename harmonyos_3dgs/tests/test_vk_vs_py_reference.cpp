@@ -570,3 +570,163 @@ TEST(VkVsPyReference, PerStepFullComparison) {
     EXPECT_LT(max_prot_rd, 0.10f) << "param_rot max norm divergence > 10%";
     EXPECT_LT(max_pop_rd,  0.10f) << "param_op max norm divergence > 10%";
 }
+
+// ---------------------------------------------------------------------------
+// Test 4: OraclePerStepComparison
+//
+// For each step i in [1..100], inject Python step i-1 params into a freshly
+// zeroed VulkanTrainer, run 1 step, and compare loss and gradients element-wise
+// against Python step i.
+//
+// This approach removes FP-accumulation as a confound: every oracle step starts
+// from IDENTICAL inputs to Python. If the algorithm is correct, loss and
+// gradients must match to within single-step FP precision (same as step 1).
+//
+// NOTE: params AFTER Adam are NOT compared here because oracle uses freshly
+// zeroed Adam state while Python has accumulated moments from previous steps.
+// Adam correctness is proven at step 1 by Step1GradientAndLoss.
+// ---------------------------------------------------------------------------
+TEST(VkVsPyReference, OraclePerStepComparison) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists())
+        GTEST_SKIP() << "Python dump missing — run: python tools/dump_tiny_reference.py";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    constexpr int N_STEPS = 100;
+
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, make_vk_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const int N   = scene.N;
+    const int MC3 = scene.max_coeffs * 3;
+
+    // Helper: max element-wise relative diff (uses |py| as denominator, clamped to 1e-8).
+    auto max_elem_rel_diff = [](const float* vk, const float* py, int n) -> float {
+        float mx = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            float d = std::fabs(vk[i] - py[i]) / std::max(std::fabs(py[i]), 1e-8f);
+            mx = std::max(mx, d);
+        }
+        return mx;
+    };
+
+    // Storage for the "previous step" raw params (loaded from Python dump).
+    std::vector<float> prev_pos, prev_sc, prev_rot, prev_sh, prev_op;
+
+    float max_loss_rd_all = 0.0f, max_grad_rd_all = 0.0f;
+    int   worst_step_loss = 0,    worst_step_grad = 0;
+
+    bool all_pass = true;
+
+    std::cout << "\n=== Oracle per-step comparison (injected Python params, fresh Adam) ===\n";
+    std::cout << "Step  loss_rd%  gpos_mrd%  gsc_mrd%  grot_mrd%  gsh_mrd%  gop_mrd%\n";
+    std::cout << "----  --------  ---------  --------  ---------  --------  --------\n";
+
+    for (int s = 0; s < N_STEPS; ++s) {
+        const int step = s + 1;    // Python dump step index (1-based)
+        const int prev = s;        // Python dump step index of previous step (0 = initial)
+
+        // Load previous-step params.
+        if (prev == 0) {
+            // Step 0: use fixture initial params.
+            prev_pos.assign(scene.raw_positions.begin(), scene.raw_positions.end());
+            prev_sc .assign(scene.raw_scales.begin(),    scene.raw_scales.end());
+            prev_rot.assign(scene.raw_rotations.begin(), scene.raw_rotations.end());
+            prev_sh .assign(scene.raw_sh.begin(),        scene.raw_sh.end());
+            prev_op .assign(scene.raw_opacities.begin(), scene.raw_opacities.end());
+        } else {
+            char pp[256];
+            std::snprintf(pp, sizeof(pp), "%s/step_%04d", py_ref_dir().c_str(), prev);
+            const std::string spp(pp);
+            prev_pos = npy_to_f32(load_npy(spp + "_raw_pos.npy"));
+            prev_sc  = npy_to_f32(load_npy(spp + "_raw_sc.npy"));
+            prev_rot = npy_to_f32(load_npy(spp + "_raw_rot.npy"));
+            prev_sh  = npy_to_f32(load_npy(spp + "_raw_sh.npy"));
+            prev_op  = npy_to_f32(load_npy(spp + "_raw_op.npy"));
+        }
+
+        // Build RawGaussianParams pointing into the loaded vectors.
+        RawGaussianParams oracle_raw{};
+        oracle_raw.count         = N;
+        oracle_raw.sh_degree     = scene.sh_degree;
+        oracle_raw.max_coeffs    = scene.max_coeffs;
+        oracle_raw.raw_positions = prev_pos.data();
+        oracle_raw.raw_scales    = prev_sc.data();
+        oracle_raw.raw_rotations = prev_rot.data();
+        oracle_raw.raw_sh_coeffs = prev_sh.data();
+        oracle_raw.raw_opacities = prev_op.data();
+
+        // Inject params + zero Adam + reset step_count.
+        trainer.reset_for_oracle(oracle_raw);
+
+        // Run one VK step.
+        float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+        ASSERT_FALSE(std::isnan(vk_loss)) << "VK NaN at oracle step " << step;
+        ASSERT_FALSE(std::isinf(vk_loss)) << "VK Inf at oracle step " << step;
+
+        // Load Python reference for this step.
+        char sp[256];
+        std::snprintf(sp, sizeof(sp), "%s/step_%04d", py_ref_dir().c_str(), step);
+        const std::string ssp(sp);
+        float py_loss  = npy_scalar(ssp + "_loss.npy");
+        auto  py_gpos  = npy_to_f32(load_npy(ssp + "_grad_pos.npy"));
+        auto  py_gsc   = npy_to_f32(load_npy(ssp + "_grad_sc.npy"));
+        auto  py_grot  = npy_to_f32(load_npy(ssp + "_grad_rot.npy"));
+        auto  py_gsh   = npy_to_f32(load_npy(ssp + "_grad_sh.npy"));
+        auto  py_gop   = npy_to_f32(load_npy(ssp + "_grad_op.npy"));
+
+        // Element-wise max relative differences.
+        float loss_rd = rel_diff(vk_loss, py_loss);
+        float gpos_rd = max_elem_rel_diff(trainer.captured_grad_positions().data(),
+                                          py_gpos.data(), N * 3);
+        float gsc_rd  = max_elem_rel_diff(trainer.captured_grad_scales().data(),
+                                          py_gsc.data(), N * 3);
+        float grot_rd = max_elem_rel_diff(trainer.captured_grad_rotations().data(),
+                                          py_grot.data(), N * 4);
+        float gsh_rd  = max_elem_rel_diff(trainer.captured_grad_sh().data(),
+                                          py_gsh.data(), N * MC3);
+        float gop_rd  = max_elem_rel_diff(trainer.captured_grad_opacities().data(),
+                                          py_gop.data(), N);
+        float grad_max_rd = std::max({gpos_rd, gsc_rd, grot_rd, gsh_rd, gop_rd});
+
+        if (loss_rd > max_loss_rd_all) { max_loss_rd_all = loss_rd; worst_step_loss = step; }
+        if (grad_max_rd > max_grad_rd_all) { max_grad_rd_all = grad_max_rd; worst_step_grad = step; }
+
+        bool step_pass = (loss_rd < 0.005f) && (grad_max_rd < 0.02f);
+        if (!step_pass) all_pass = false;
+
+        // Print every step (verbose — full oracle table).
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "%4d  %7.4f%%  %8.4f%%  %7.4f%%  %8.4f%%  %7.4f%%  %7.4f%%  %s\n",
+            step,
+            loss_rd * 100.f, gpos_rd * 100.f, gsc_rd * 100.f,
+            grot_rd * 100.f, gsh_rd * 100.f,  gop_rd * 100.f,
+            step_pass ? "" : "FAIL");
+        std::cout << buf;
+    }
+
+    std::cout << "\n=== Oracle summary ===\n";
+    char sbuf[512];
+    std::snprintf(sbuf, sizeof(sbuf),
+        "  Max loss rel_diff:      %.4f%% (step %d)\n"
+        "  Max grad max_elem_diff: %.4f%% (step %d)\n"
+        "  All steps pass (<0.5%% loss, <2%% grad): %s\n",
+        max_loss_rd_all * 100.f, worst_step_loss,
+        max_grad_rd_all * 100.f, worst_step_grad,
+        all_pass ? "YES" : "NO");
+    std::cout << sbuf;
+
+    EXPECT_LT(max_loss_rd_all, 0.005f)
+        << "Oracle max loss rel_diff > 0.5% (worst: step " << worst_step_loss << ")";
+    EXPECT_LT(max_grad_rd_all, 0.02f)
+        << "Oracle max gradient element rel_diff > 2% (worst: step " << worst_step_grad << ")";
+}

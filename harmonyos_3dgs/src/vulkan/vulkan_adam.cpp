@@ -93,6 +93,16 @@ void VulkanAdam::reset_groups()
     pipeline_->reset_descriptor_pool();
 }
 
+void VulkanAdam::zero_moments()
+{
+    for (auto& g : groups_) {
+        const size_t n_bytes = static_cast<size_t>(g.n) * sizeof(float);
+        const std::vector<float> zeros(g.n, 0.0f);
+        g.m_buf->upload(zeros.data(), n_bytes);
+        g.v_buf->upload(zeros.data(), n_bytes);
+    }
+}
+
 void VulkanAdam::step_group(int idx,
                              VkBuffer params_buf,
                              VkBuffer grad_buf,

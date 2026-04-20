@@ -198,6 +198,49 @@ void VulkanTrainer::activate_params() {
 }
 
 // ---------------------------------------------------------------------------
+// reset_for_oracle — inject params + zero Adam state (for oracle per-step testing)
+// ---------------------------------------------------------------------------
+
+void VulkanTrainer::reset_for_oracle(const RawGaussianParams& new_raw)
+{
+    // Replace owned param vectors with new_raw data.
+    raw_positions_.assign(new_raw.raw_positions,
+                          new_raw.raw_positions + static_cast<size_t>(N_) * 3);
+    raw_scales_.assign   (new_raw.raw_scales,
+                          new_raw.raw_scales    + static_cast<size_t>(N_) * 3);
+    raw_rotations_.assign(new_raw.raw_rotations,
+                          new_raw.raw_rotations + static_cast<size_t>(N_) * 4);
+    raw_sh_coeffs_.assign(new_raw.raw_sh_coeffs,
+                          new_raw.raw_sh_coeffs + static_cast<size_t>(N_) * max_coeffs_ * 3);
+    raw_opacities_.assign(new_raw.raw_opacities,
+                          new_raw.raw_opacities + static_cast<size_t>(N_));
+
+    // Re-upload to GPU raw param buffers (same layout as constructor).
+    const size_t sz_N3 = static_cast<size_t>(N_) * 3 * sizeof(float);
+    const size_t sz_N4 = static_cast<size_t>(N_) * 4 * sizeof(float);
+    const size_t sz_N  = static_cast<size_t>(N_) * sizeof(float);
+
+    raw_param_gpu_bufs_[0]->upload(raw_positions_.data(), sz_N3);    // positions
+    raw_param_gpu_bufs_[1]->upload(raw_sh_coeffs_.data(), sz_N3);    // sh DC (first N*3)
+    if (max_coeffs_ > 1) {
+        const size_t sz_rest = static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3 * sizeof(float);
+        raw_param_gpu_bufs_[2]->upload(raw_sh_coeffs_.data() + static_cast<size_t>(N_) * 3,
+                                       sz_rest);                      // sh rest
+    }
+    raw_param_gpu_bufs_[3]->upload(raw_opacities_.data(), sz_N);     // opacities
+    raw_param_gpu_bufs_[4]->upload(raw_scales_.data(), sz_N3);       // scales
+    raw_param_gpu_bufs_[5]->upload(raw_rotations_.data(), sz_N4);    // rotations
+
+    // Zero all Adam moment buffers and reset step counter.
+    vulkan_adam_.zero_moments();
+    step_count_ = 0;
+    last_loss_  = 0.0f;
+
+    // Re-activate (raw → activated values for the next forward pass).
+    activate_params();
+}
+
+// ---------------------------------------------------------------------------
 // step
 // ---------------------------------------------------------------------------
 

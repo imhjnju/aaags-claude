@@ -49,6 +49,9 @@ public:
     // Call before re-adding groups after Gaussian count changes (e.g. densification).
     void reset_groups();
 
+    // Zero all m/v moment buffers for all groups (for oracle testing).
+    void zero_moments();
+
     // Dispatch one Adam step for group `idx` synchronously (submit+wait).
     // params_buf: GPU buffer of grp.n floats — updated in-place.
     // grad_buf:   GPU buffer of grp.n floats — gradient (read-only).
