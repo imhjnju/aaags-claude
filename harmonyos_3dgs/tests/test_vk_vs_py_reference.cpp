@@ -695,12 +695,25 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
                                           py_gsh.data(), N * MC3);
         float gop_rd  = max_elem_rel_diff(trainer.captured_grad_opacities().data(),
                                           py_gop.data(), N);
+        // Per-group max element-wise rel-diff tracking.
+        // Thresholds set at ~3× the empirically measured maxima (2026-04-20):
+        //   loss: 0.0003%  → threshold 0.001%   (3× headroom)
+        //   gpos: 0.52%    → threshold 1.0%     (2× headroom; GPU parallel-reduce on small N)
+        //   gsc:  0.0003%  → threshold 0.01%    (30× headroom)
+        //   grot: 0.74%    → threshold 1.5%     (2× headroom; normalised quat grads vary)
+        //   gsh:  0.0001%  → threshold 0.01%
+        //   gop:  0.0001%  → threshold 0.01%
         float grad_max_rd = std::max({gpos_rd, gsc_rd, grot_rd, gsh_rd, gop_rd});
 
-        if (loss_rd > max_loss_rd_all) { max_loss_rd_all = loss_rd; worst_step_loss = step; }
+        if (loss_rd    > max_loss_rd_all) { max_loss_rd_all = loss_rd;    worst_step_loss = step; }
         if (grad_max_rd > max_grad_rd_all) { max_grad_rd_all = grad_max_rd; worst_step_grad = step; }
 
-        bool step_pass = (loss_rd < 0.005f) && (grad_max_rd < 0.02f);
+        bool step_pass = (loss_rd  < 0.00001f) &&   // 0.001%
+                         (gpos_rd  < 0.01f)    &&   // 1.0%
+                         (gsc_rd   < 0.0001f)  &&   // 0.01%
+                         (grot_rd  < 0.015f)   &&   // 1.5%
+                         (gsh_rd   < 0.0001f)  &&   // 0.01%
+                         (gop_rd   < 0.0001f);      // 0.01%
         if (!step_pass) all_pass = false;
 
         // Print every step (verbose — full oracle table).
@@ -717,16 +730,16 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
     std::cout << "\n=== Oracle summary ===\n";
     char sbuf[512];
     std::snprintf(sbuf, sizeof(sbuf),
-        "  Max loss rel_diff:      %.4f%% (step %d)\n"
-        "  Max grad max_elem_diff: %.4f%% (step %d)\n"
-        "  All steps pass (<0.5%% loss, <2%% grad): %s\n",
+        "  Max loss rel_diff:      %.4f%% (step %d)  [thresh 0.001%%]\n"
+        "  Max grad max_elem_diff: %.4f%% (step %d)  [thresh per-group: pos<1%% sc<0.01%% rot<1.5%% sh<0.01%% op<0.01%%]\n"
+        "  All steps pass: %s\n",
         max_loss_rd_all * 100.f, worst_step_loss,
         max_grad_rd_all * 100.f, worst_step_grad,
         all_pass ? "YES" : "NO");
     std::cout << sbuf;
 
-    EXPECT_LT(max_loss_rd_all, 0.005f)
-        << "Oracle max loss rel_diff > 0.5% (worst: step " << worst_step_loss << ")";
-    EXPECT_LT(max_grad_rd_all, 0.02f)
-        << "Oracle max gradient element rel_diff > 2% (worst: step " << worst_step_grad << ")";
+    EXPECT_LT(max_loss_rd_all, 0.00001f)
+        << "Oracle max loss rel_diff > 0.001% (worst: step " << worst_step_loss << ")";
+    EXPECT_LT(max_grad_rd_all, 0.015f)
+        << "Oracle max gradient element rel_diff > 1.5% (worst: step " << worst_step_grad << ")";
 }
