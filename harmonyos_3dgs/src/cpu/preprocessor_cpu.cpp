@@ -19,6 +19,7 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
     out.opacities_2d = alloc.allocate_array<float>(N);
     out.rgb = alloc.allocate_array<float>(N * 3);
     out.radii = alloc.allocate_array<int>(N);
+    out.radius_f = alloc.allocate_array<float>(static_cast<std::size_t>(N));
     out.tiles_touched = alloc.allocate_array<int>(N);
     out.eval_3D = cfg.eval_3D;
 
@@ -220,9 +221,11 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
             float conic[3] = {cov2d[2]*det_inv, -cov2d[1]*det_inv, cov2d[0]*det_inv};
 
             float mid = 0.5f * (cov2d[0] + cov2d[2]);
-            float lambda1 = mid + std::sqrt(std::max(0.1f, mid*mid - det));
-            float lambda2 = mid - std::sqrt(std::max(0.1f, mid*mid - det));
-            int my_radius = (int)std::ceil(3.0f * std::sqrt(std::max(lambda1, lambda2)));
+            float disc = std::max(0.01f, mid * mid - det);
+            float lambda1 = mid + std::sqrt(disc);
+            float lambda2 = mid - std::sqrt(disc);
+            float radius_f_val = 3.33f * std::sqrt(std::max(lambda1, lambda2));
+            int my_radius = static_cast<int>(std::ceil(radius_f_val));
 
             int max_screen_dim = std::max(cam.width, cam.height);
             if (my_radius > max_screen_dim)
@@ -230,7 +233,13 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
 
             float point_image[2] = {pixel_x, pixel_y};
             int rect_min[2], rect_max[2];
-            getRect(point_image, my_radius, grid_x, grid_y, cfg.tile_w, cfg.tile_h, rect_min, rect_max);
+            {
+                float r = radius_f_val;
+                rect_min[0] = std::min(grid_x, std::max(0, static_cast<int>(std::floor((point_image[0] - r) / cfg.tile_w))));
+                rect_min[1] = std::min(grid_y, std::max(0, static_cast<int>(std::floor((point_image[1] - r) / cfg.tile_h))));
+                rect_max[0] = std::min(grid_x, std::max(0, static_cast<int>(std::ceil((point_image[0] + r) / cfg.tile_w))));
+                rect_max[1] = std::min(grid_y, std::max(0, static_cast<int>(std::ceil((point_image[1] + r) / cfg.tile_h))));
+            }
 
             if ((rect_max[0] - rect_min[0]) * (rect_max[1] - rect_min[1]) == 0)
                 continue;
@@ -242,6 +251,7 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
 
             out.depths[i] = p_view[2];
             out.radii[i] = my_radius;
+            if (out.radius_f) out.radius_f[i] = radius_f_val;
             out.means2D[i*2] = pixel_x;
             out.means2D[i*2+1] = pixel_y;
             out.conics[i*3] = conic[0];

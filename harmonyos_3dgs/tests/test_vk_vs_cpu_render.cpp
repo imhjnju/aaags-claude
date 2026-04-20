@@ -83,6 +83,11 @@ TEST(VkVsCpuRender, FullFramePSNR) {
     config.eval_3D = false;
     config.antialiasing = false;
     config.sh_degree = model.data.sh_degree;
+    // PreprocessorVulkan is hardcoded to spec_training=1 (training mode, no
+    // upper SH color clamp). Setting training=true on the CPU side matches
+    // this behaviour, eliminating the systematic RGB divergence that otherwise
+    // dominates the PSNR (unclamped SH values can exceed 1.0 by several units).
+    config.training = true;
     // black background
     config.bg_color[0] = config.bg_color[1] = config.bg_color[2] = 0.0f;
 
@@ -128,16 +133,14 @@ TEST(VkVsCpuRender, FullFramePSNR) {
                 max_err, max_px, max_ch,
                 cpu_image[max_err_idx], vk_image[max_err_idx]);
 
-    // GPU (FMA-enabled shaders, parallel reduction) and CPU (-ffp-contract=off,
-    // sequential) accumulate floating-point error differently. With 400K Gaussians,
-    // small preprocess FP differences cascade through sort-order sensitivity in
-    // alpha blending, producing ~28 dB PSNR on basket-aaa.ply. This is expected
-    // architectural divergence (see test_cpu_vk_compare.cpp comments), not a bug.
-    // Threshold: PSNR > 25 dB ensures images are recognizably the same scene.
-    EXPECT_GT(psnr, 25.0) << "PSNR too low — Vulkan output diverges from CPU";
-    // SH evaluation can produce values outside [0,1]; sort-order differences
-    // at boundaries cause large per-pixel errors in the tail distribution.
-    EXPECT_LT(max_err, 2.0f) << "Max per-pixel error unreasonably large";
+    // With sort-critical computations marked 'precise' in preprocess.comp (no
+    // FMA) and training=true matching Vulkan's spec_training=1, the only
+    // remaining error is FP accumulation noise in the rasterizer's alpha-blend
+    // loop and minor FMA differences in SH evaluation / cov2D.  On basket-aaa
+    // (400K Gaussians, 720x960) this gives ~100 dB PSNR.
+    // Threshold: PSNR > 60 dB is near-bit-exact; 40 dB is the absolute floor.
+    EXPECT_GT(psnr, 60.0) << "PSNR too low — Vulkan output diverges from CPU";
+    EXPECT_LT(max_err, 0.01f) << "Max per-pixel error unreasonably large";
 
     model.free();
 }

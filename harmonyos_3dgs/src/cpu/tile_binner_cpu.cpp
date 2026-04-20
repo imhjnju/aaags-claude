@@ -66,8 +66,16 @@ BinningOutput TileBinnerCPU::bin(const PreprocessOutput& pre, int N,
         // Recompute tile rect
         float point[2] = {pre.means2D[i * 2], pre.means2D[i * 2 + 1]};
         int rect_min[2], rect_max[2];
-        getRect(point, pre.radii[i], grid_x, grid_y, cfg.tile_w, cfg.tile_h,
-                rect_min, rect_max);
+        if (pre.radius_f) {
+            float r = pre.radius_f[i];
+            rect_min[0] = std::min(grid_x, std::max(0, static_cast<int>(std::floor((point[0] - r) / cfg.tile_w))));
+            rect_min[1] = std::min(grid_y, std::max(0, static_cast<int>(std::floor((point[1] - r) / cfg.tile_h))));
+            rect_max[0] = std::min(grid_x, std::max(0, static_cast<int>(std::ceil((point[0] + r) / cfg.tile_w))));
+            rect_max[1] = std::min(grid_y, std::max(0, static_cast<int>(std::ceil((point[1] + r) / cfg.tile_h))));
+        } else {
+            getRect(point, pre.radii[i], grid_x, grid_y, cfg.tile_w, cfg.tile_h,
+                    rect_min, rect_max);
+        }
 
         // Encode depth as uint32
         uint32_t depth_bits;

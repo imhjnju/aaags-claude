@@ -99,6 +99,46 @@ float ndc2Pix(float v, float S) {
 }
 
 // -----------------------------------------------------------------------------
+// Precise mat4*vec4 helpers: force separate multiply-and-add (no FMA) so the
+// GPU produces bit-exact results matching CPU's -ffp-contract=off.
+//
+// CPU transformPoint4x3 evaluates as (left-to-right association):
+//   out[r] = ((m[r]*p[0] + m[r+4]*p[1]) + m[r+8]*p[2]) + m[r+12]
+// where m[] is column-major. With 'precise', the compiler cannot contract
+// multiply+add into FMA, ensuring identical rounding to the CPU.
+//
+// This is critical for depth (sort key) and pixel coordinates (tile assignment).
+// Without precise, FMA on NVIDIA GPUs produces ~1 ULP depth differences that
+// cascade into completely different sort orders for close-depth Gaussians,
+// degrading full-frame PSNR from 60+ dB to ~28 dB.
+// -----------------------------------------------------------------------------
+precise float preciseTransformRow(mat4 M, vec3 pos, int row) {
+    // Column-major: M[col][row]. Match CPU left-to-right: ((a+b)+c)+d
+    precise float a = M[0][row] * pos.x;
+    precise float b = M[1][row] * pos.y;
+    precise float c = M[2][row] * pos.z;
+    precise float d = M[3][row];
+    precise float ab = a + b;
+    precise float abc = ab + c;
+    precise float abcd = abc + d;
+    return abcd;
+}
+
+// Full 4-component transform (for projmatrix * position), row 'row'.
+// CPU transformPoint4x4: out[r] = m[r]*p[0] + m[r+4]*p[1] + m[r+8]*p[2] + m[r+12]
+// Same as above but the w-column also multiplies position.w (=1.0).
+precise float preciseTransformRow4(mat4 M, vec3 pos, int row) {
+    precise float a = M[0][row] * pos.x;
+    precise float b = M[1][row] * pos.y;
+    precise float c = M[2][row] * pos.z;
+    precise float d = M[3][row];  // * 1.0 for homogeneous
+    precise float ab = a + b;
+    precise float abc = ab + c;
+    precise float abcd = abc + d;
+    return abcd;
+}
+
+// -----------------------------------------------------------------------------
 // Build rotation matrix R (row-major conceptual: R[row][col])
 // from quaternion (r, x, y, z). Matches math_utils.cpp::quat2mat.
 // Returns 9 floats as mat3 stored so that R_mat[row][col] = out[row][col].
@@ -189,9 +229,13 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
                   float tan_fovx, float tan_fovy,
                   out vec3 cov2D_out)
 {
-    // mean3d -> view space. viewmatrix is column-major mat4.
-    vec4 t4 = cam.viewmatrix * vec4(mean3d, 1.0);
-    vec3 t = t4.xyz;
+    // mean3d -> view space. Use precise helpers to match CPU (no FMA).
+    // The view-space position feeds into the Jacobian which determines cov2D,
+    // radius, and tile coverage — precision here prevents tile-assignment drift.
+    vec3 t = vec3(
+        preciseTransformRow(cam.viewmatrix, mean3d, 0),
+        preciseTransformRow(cam.viewmatrix, mean3d, 1),
+        preciseTransformRow(cam.viewmatrix, mean3d, 2));
 
     // Clamp to 1.3x frustum boundary (CPU lines 73-79).
     float limx = 1.3 * tan_fovx;
@@ -355,12 +399,23 @@ void main() {
                          positions[i*3u + 2u]);
 
     // 3. World -> view (near-plane cull).
-    vec4 p_view4 = cam.viewmatrix * vec4(position, 1.0);
-    vec3 p_view  = p_view4.xyz;
+    // Use precise helpers to match CPU's -ffp-contract=off (no FMA).
+    // The depth (p_view.z) is the sort key — FMA divergence cascades into
+    // completely different sort orders, destroying full-frame PSNR.
+    vec3 p_view = vec3(
+        preciseTransformRow(cam.viewmatrix, position, 0),
+        preciseTransformRow(cam.viewmatrix, position, 1),
+        preciseTransformRow(cam.viewmatrix, position, 2));
     if (p_view.z <= 0.2) return;   // CPU uses <= 0.2 in the 2D path.
 
     // 4. View -> clip -> NDC -> pixel using ndc2Pix (matches CPU).
-    vec4 p_hom = cam.projmatrix * vec4(position, 1.0);
+    // Precise computation of p_hom to match CPU's transformPoint4x4.
+    // Pixel coordinates determine tile assignment — precision matters.
+    vec4 p_hom = vec4(
+        preciseTransformRow4(cam.projmatrix, position, 0),
+        preciseTransformRow4(cam.projmatrix, position, 1),
+        preciseTransformRow4(cam.projmatrix, position, 2),
+        preciseTransformRow4(cam.projmatrix, position, 3));
     float p_w  = 1.0 / (p_hom.w + 1e-7);
     vec3 p_ndc = vec3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
 
