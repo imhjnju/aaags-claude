@@ -208,15 +208,15 @@ float VulkanTrainer::step(const Camera& cam,
                           int H)
 {
     alloc_.reset();
-    // Grow arena to hold this step's allocations. The dominant cost is binner+sorter
-    // R-pair arrays (R × 32 bytes). We estimate R by scaling last step's actual R by
-    // the N ratio (densification can double N) with a 4× safety margin.
-    // First step: use R/N = 100 as conservative default.
+    // Grow CPU arena to hold binner+sorter R-pair CPU arrays (R × 32 bytes)
+    // plus cache and gradient arrays (N × ~300 bytes). Use last step's actual R,
+    // scaled by N growth ratio with 2× headroom for densification.
+    // First step: assume R/N = 50 as conservative default.
     {
         const size_t cur_N = static_cast<size_t>(N_);
         const size_t est_R = (last_bin_N_ > 0)
-            ? last_bin_R_ * cur_N * 4u / last_bin_N_
-            : cur_N * 100u;
+            ? last_bin_R_ * cur_N * 2u / last_bin_N_
+            : cur_N * 50u;
         const size_t needed = (6u << 20) + cur_N * 300u + est_R * 32u;
         alloc_.grow(needed);
     }

@@ -44,11 +44,13 @@ TileBinnerVulkan::TileBinnerVulkan(VulkanContext& ctx)
 // the include).
 TileBinnerVulkan::~TileBinnerVulkan() = default;
 
-void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint64_t R_max, uint32_t num_wgs) {
-    if (N <= bin_N_ && R_max <= bin_R_max_ && num_wgs <= bin_wg_) return;
+// Allocate/grow the 7 scan-phase buffers (all N-or-wg-sized).
+// Scatter output buffers (bin_keys_buf_, bin_vals_buf_) are NOT allocated here;
+// prepare_for_scatter() handles them after the scan gives us actual R.
+void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t num_wgs) {
+    if (N <= bin_N_ && num_wgs <= bin_wg_) return;
 
     const uint32_t N_new  = std::max(N,       bin_N_);
-    const uint64_t R_new  = std::max(R_max,   bin_R_max_);
     const uint32_t wg_new = std::max(num_wgs, bin_wg_);
 
     bin_tt_buf_  = std::make_unique<VulkanBuffer>(ctx_,
@@ -72,14 +74,21 @@ void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint64_t R_max, uint32_t num_
     bin_rf_buf_  = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    bin_keys_buf_= std::make_unique<VulkanBuffer>(ctx_,
-        static_cast<VkDeviceSize>(R_new) * sizeof(uint64_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    bin_vals_buf_= std::make_unique<VulkanBuffer>(ctx_,
-        static_cast<VkDeviceSize>(R_new) * sizeof(uint32_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    bin_N_ = N_new; bin_R_max_ = R_new; bin_wg_ = wg_new;
+    bin_N_ = N_new; bin_wg_ = wg_new;
+}
+
+// Grow scatter output buffers to hold at least R pairs.
+// Called after the scan gives us actual R — never uses the N*num_tiles overestimate.
+void TileBinnerVulkan::prepare_for_scatter(uint64_t R) {
+    if (R <= bin_R_max_) return;
+    bin_R_max_ = R;  // grow-only; R is already the new max
+    bin_keys_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R) * sizeof(uint64_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_vals_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 
 BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
@@ -117,17 +126,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     const VkDeviceSize bytes_float_N  = static_cast<VkDeviceSize>(N) * sizeof(float);
     const VkDeviceSize bytes_float_N2 = static_cast<VkDeviceSize>(N) * 2 * sizeof(float);
 
-    // workgroup_sums[ceil(N/256)], min 1. Phase-1 scan writes one slot per
-    // phase-0 workgroup; phase-1 scans it in a single 256-thread WG in-place.
-    const uint32_t num_wgs =
-        (static_cast<uint32_t>(N) + 255u) / 256u;
-    // R_max upper bound: each Gaussian touches at most (num_tiles_x * num_tiles_y) tiles.
-    // sum(tiles_touched) <= N * num_tiles by definition, so R_max is always safe.
-    // Use uint64_t to prevent overflow for large scenes (e.g. N=200k, 240x135 tiles
-    // = 6.48B pairs — exceeds uint32_t max of 4.29B).
-    const uint64_t R_max_estimate = static_cast<uint64_t>(N) *
-                                    static_cast<uint64_t>(num_tiles_x * num_tiles_y);
-    prepare_for_bin(static_cast<uint32_t>(N), std::max(R_max_estimate, uint64_t{1}), std::max(num_wgs, 1u));
+    // workgroup_sums[ceil(N/256)], min 1.
+    const uint32_t num_wgs = (static_cast<uint32_t>(N) + 255u) / 256u;
+    // Allocate scan-phase buffers (N-sized). Scatter buffers are deferred to
+    // prepare_for_scatter() after we know actual R from the scan.
+    prepare_for_bin(static_cast<uint32_t>(N), std::max(num_wgs, 1u));
 
     bin_tt_buf_->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
 
@@ -160,6 +163,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     }
     const uint32_t R = last_offset + last_count;
     out.total_pairs  = static_cast<int>(R);
+
+    // Allocate/grow scatter output GPU buffers to exactly R entries.
+    // This runs AFTER the scan — actual R is known, so no over-allocation.
+    if (R > 0u)
+        prepare_for_scatter(static_cast<uint64_t>(R));
 
     if (R == 0u) {
         // No Gaussian touches any tile — all culled. Nothing for scatter to

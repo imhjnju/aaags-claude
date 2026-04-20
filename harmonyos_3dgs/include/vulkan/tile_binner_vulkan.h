@@ -84,11 +84,11 @@ private:
     std::unique_ptr<VulkanBuffer> r_vals_buf_;    // values_unsorted [R_max] u32
 
     // --- Layer-1 persistent buffers (bin() reuses across calls) ---
-    // Sized to max(N, R_max) seen so far; reallocated only when sizes grow.
-    // R_max is computed as N * num_tiles_x * num_tiles_y (safe upper bound since
-    // sum(tiles_touched[i]) <= N * num_tiles by definition).
-    uint32_t bin_N_     = 0u;  // Gaussian count at last alloc
-    uint64_t bin_R_max_ = 0u;  // R upper bound at last alloc (uint64 to prevent overflow for large N * num_tiles)
+    // Scan buffers sized to max N seen; scatter buffers sized to max ACTUAL R
+    // seen (NOT N*num_tiles worst-case). prepare_for_scatter() is called after
+    // the scan gives us actual R, so we never over-allocate by 100-1000x.
+    uint32_t bin_N_     = 0u;  // Gaussian count at last scan alloc
+    uint64_t bin_R_max_ = 0u;  // actual scatter buffer capacity (grow-only)
     uint32_t bin_wg_    = 0u;  // workgroup count = ceil(N/256) at last alloc
 
     std::unique_ptr<VulkanBuffer> bin_tt_buf_;    // tiles_touched [N] i32
@@ -98,8 +98,12 @@ private:
     std::unique_ptr<VulkanBuffer> bin_dep_buf_;   // depths [N] f32
     std::unique_ptr<VulkanBuffer> bin_rad_buf_;   // radii [N] i32
     std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N] f32
-    std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R_max] u64
-    std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R_max] u32
+    std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
+    std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
 
-    void prepare_for_bin(uint32_t N, uint64_t R_max, uint32_t num_wgs);
+    // Allocate/grow the 7 N-sized + 1 wg-sized scan buffers.
+    void prepare_for_bin(uint32_t N, uint32_t num_wgs);
+    // Allocate/grow scatter output buffers to at least R entries.
+    // Called after scan gives us actual R — never over-allocates to N*num_tiles.
+    void prepare_for_scatter(uint64_t R);
 };
