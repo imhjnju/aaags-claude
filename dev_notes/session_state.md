@@ -15,6 +15,12 @@ M0: Foundation
 
 ## Latest Sessions
 
+### S2 — 2026-04-20
+- Implemented `tools/render_single.py`: AAA-GS render for a single camera pose
+- Loads basket-aaa.ply (400k Gaussians, sh_degree=3, filter_3D) → renders camera ID 0 from cameras.json
+- All AAA features enabled via configs/aaa.json; runtime: `conda run -n aaa-gs`
+- Merged worktree-render → master
+
 ### S1 — 2026-04-16
 - Installed dev harness (CLAUDE.md, WORKFLOW.md, PROJECT.md, skills, hooks, memory)
 - Build and test baseline: NOT YET VERIFIED

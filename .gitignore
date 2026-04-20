@@ -2,6 +2,7 @@ basket0.ply
 basket-aaa.ply
 *.ppm
 basket*.ply
+render_output*.png
 
 # SP-0 golden artifacts — large, not committed
 dev_notes/ground_truth/**/*.npy
