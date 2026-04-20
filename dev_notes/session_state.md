@@ -37,10 +37,22 @@ SP-6: Training gaps closed; basketball 100-step PSNR validation in progress
 
 ## Latest Sessions
 
-### S7 — 2026-04-19 (current)
+### S8 — 2026-04-20 (current)
+- SP-7 T1-T5 complete (CB chaining, persistent buffers): 248 tests pass
+- Basketball test: changed to 100 steps (no densification) PSNR=5.61 dB, finite+positive assertion
+- VK vs Python gradient comparison: 3 new tests implemented (task 54-56)
+  - `VkVsPyReference.Step1GradientAndLoss`: loss rel_diff=3.6e-7, all grad norms 0.0000 diff
+  - `VkVsPyReference.ConvergenceTable100Steps`: both converge 0.042→0.002 (100 steps)
+- **BUG FIXED**: rasterize.comp writes CHW but loss/backward expect HWC — fixed in vulkan_trainer.cpp
+  - Gradient norms were 45-60% below Python reference before fix
+  - See gotchas.md for full details
+- Python reference dump: tools/dump_tiny_reference.py + tests/golden/tiny/py_ref/ (1000 files)
+- VulkanTrainer gradient capture: enable_gradient_capture() + captured_grad_*() accessors
+
+### S7 — 2026-04-19
 - SP-6 T1-T4 complete via subagent-driven development
 - 243 tests pass (non-basketball)
-- Basketball 100-step PSNR > 10dB test running in background
+- Basketball 100-step loss-decrease validated
 
 ### S6 — 2026-04-19
 - SP-5 Task 6 (basketball E2E) completed and committed

@@ -19,3 +19,11 @@ Cross-references to deeper docs use "See also:" lines.
 
 ### Tile Binner / Rasterizer Key Ordering
 - Tile-based rasterization requires Gaussians to be sorted by (tile_id, depth). Wrong sort order = wrong alpha compositing = incorrect rendering. The sorter must run BEFORE the rasterizer.
+
+### rasterize.comp Output Is CHW, Not HWC (discovered 2026-04-20)
+- **Bug**: `rasterize.comp` writes `out_image[ch * HW + px]` (channel-first, CHW layout). The loss function (`compute_combined_loss_gradient`) and `rasterize_backward.comp` both expect HWC (`dL_dpixels[px*3+ch]`).
+- **Fix**: `vulkan_trainer.cpp` converts `image_` CHW→HWC after the forward pass, before loss/backward.
+- **Symptom**: Without fix, gradient L2 norms are ~50% below Python autograd reference for all param groups. Loss values are correct (L1 loss on zero target is layout-invariant, so it cannot detect this).
+- **Why CpuVkCompare didn't catch it**: That test uses an all-zero target. L1 loss = sum|rendered| is invariant to pixel layout permutation, so loss values matched despite scrambled backward gradients.
+- **Long-term fix**: Change `rasterize.comp` to write HWC directly (tracked TODO in vulkan_trainer.cpp line ~283). At 720×960 the current CPU copy is ~8 MB/step.
+- **Detection method**: Compare VK gradient norms against Python autograd reference (`test_vk_vs_py_reference.cpp`). Use a non-zero GT image or gradient norm comparison — loss alone is insufficient.
