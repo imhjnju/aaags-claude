@@ -261,12 +261,26 @@ TEST(VkVsPyReference, Step1GradientAndLoss) {
         << "Step-1 loss mismatch: Python=" << py_loss
         << " VK=" << vk_loss << " rel_diff=" << loss_rd;
 
+    const int N = scene.N;
+
     // --- Gradient norm comparison ---
     const std::vector<float>& vk_grad_pos = trainer.captured_grad_positions();
     const std::vector<float>& vk_grad_sc  = trainer.captured_grad_scales();
     const std::vector<float>& vk_grad_rot = trainer.captured_grad_rotations();
     const std::vector<float>& vk_grad_sh  = trainer.captured_grad_sh();
     const std::vector<float>& vk_grad_op  = trainer.captured_grad_opacities();
+
+    // Verify sizes match before norm comparison
+    ASSERT_EQ(py_grad_pos.size(), trainer.captured_grad_positions().size())
+        << "grad_pos size mismatch: N=" << N;
+    ASSERT_EQ(py_grad_sc.size(), trainer.captured_grad_scales().size())
+        << "grad_sc size mismatch: N=" << N;
+    ASSERT_EQ(py_grad_rot.size(), trainer.captured_grad_rotations().size())
+        << "grad_rot size mismatch";
+    ASSERT_EQ(py_grad_sh.size(), trainer.captured_grad_sh().size())
+        << "grad_sh size mismatch";
+    ASSERT_EQ(py_grad_op.size(), trainer.captured_grad_opacities().size())
+        << "grad_op size mismatch";
 
     struct GradGroup {
         const char* name;
@@ -299,7 +313,12 @@ TEST(VkVsPyReference, Step1GradientAndLoss) {
 
     // --- Post-Adam param norm comparison ---
     const RawGaussianParams& vk_p = trainer.raw_params();
-    const int N = scene.N;
+
+    // Verify parameter sizes
+    ASSERT_EQ(py_raw_pos.size(), static_cast<size_t>(N * 3)) << "py_raw_pos shape mismatch";
+    ASSERT_EQ(py_raw_sc.size(),  static_cast<size_t>(N * 3)) << "py_raw_sc shape mismatch";
+    ASSERT_EQ(py_raw_rot.size(), static_cast<size_t>(N * 4)) << "py_raw_rot shape mismatch";
+    ASSERT_EQ(py_raw_op.size(),  static_cast<size_t>(N))     << "py_raw_op shape mismatch";
 
     struct ParamGroup {
         const char*   name;
