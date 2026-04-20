@@ -284,7 +284,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vulkan_adam.cpp
                 tests/test_densification.cpp
                 tests/test_e2e_basketball.cpp
-                tests/test_cpu_vk_compare.cpp)
+                tests/test_cpu_vk_compare.cpp
+                tests/test_vk_vs_py_reference.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
