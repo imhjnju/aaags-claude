@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -424,4 +425,148 @@ TEST(VkVsPyReference, ConvergenceTable100Steps) {
     EXPECT_LT(vk_losses[N_STEPS - 1], vk_losses[0] * 0.5f)
         << "VK did not converge in 100 steps: init=" << vk_losses[0]
         << " final=" << vk_losses[N_STEPS - 1];
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: PerStepFullComparison
+//
+// Run 100 VK steps with gradient capture. At every step, compare loss,
+// per-group gradient L2 norms, and per-group parameter L2 norms against
+// the Python reference dump.
+//
+// Design: comparing norms (not element-wise) tolerates unavoidable FP
+// accumulation from independent GPU/CPU floating-point evaluation order
+// while still catching wrong formulas (which show up as large norm errors).
+//
+// Tolerances:
+//   - Grad norms  < 20% max over 100 steps  (catches wrong sign/formula)
+//   - Param norms < 10% max over 100 steps  (tighter: Adam state compounds)
+//
+// Loss rel_diff is printed per step but not asserted here (already covered
+// by ConvergenceTable100Steps).
+// ---------------------------------------------------------------------------
+
+TEST(VkVsPyReference, PerStepFullComparison) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists())
+        GTEST_SKIP() << "Python dump missing — run: python tools/dump_tiny_reference.py";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    constexpr int N_STEPS = 100;
+
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, make_vk_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const int N   = scene.N;
+    const int MC3 = scene.max_coeffs * 3;
+
+    // Max divergences across all steps (for final assertions).
+    float max_loss_rd    = 0.0f;
+    float max_gpos_rd    = 0.0f, max_gsc_rd  = 0.0f;
+    float max_grot_rd    = 0.0f, max_gsh_rd  = 0.0f, max_gop_rd = 0.0f;
+    float max_ppos_rd    = 0.0f, max_psc_rd  = 0.0f;
+    float max_prot_rd    = 0.0f, max_pop_rd  = 0.0f;
+
+    std::cout << "\n=== 100-step full comparison: loss + grad norms + param norms ===\n";
+    std::cout << "Step  loss%  gpos%  gsc%  grot%  gsh%  gop%  ppos%  psc%  prot%  pop%\n";
+    std::cout << "----  -----  -----  ----  -----  ----  ----  -----  ----  -----  ----\n";
+
+    for (int s = 0; s < N_STEPS; ++s) {
+        const int step = s + 1;
+        char pref[256];
+        std::snprintf(pref, sizeof(pref), "%s/step_%04d",
+                      py_ref_dir().c_str(), step);
+
+        const std::string sp(pref);
+        float py_loss    = npy_scalar(sp + "_loss.npy");
+        auto  py_gpos    = npy_to_f32(load_npy(sp + "_grad_pos.npy"));
+        auto  py_gsc     = npy_to_f32(load_npy(sp + "_grad_sc.npy"));
+        auto  py_grot    = npy_to_f32(load_npy(sp + "_grad_rot.npy"));
+        auto  py_gsh     = npy_to_f32(load_npy(sp + "_grad_sh.npy"));
+        auto  py_gop     = npy_to_f32(load_npy(sp + "_grad_op.npy"));
+        auto  py_rpos    = npy_to_f32(load_npy(sp + "_raw_pos.npy"));
+        auto  py_rsc     = npy_to_f32(load_npy(sp + "_raw_sc.npy"));
+        auto  py_rrot    = npy_to_f32(load_npy(sp + "_raw_rot.npy"));
+        auto  py_rop     = npy_to_f32(load_npy(sp + "_raw_op.npy"));
+
+        float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+
+        ASSERT_FALSE(std::isnan(vk_loss)) << "VK NaN at step " << step;
+        ASSERT_FALSE(std::isinf(vk_loss)) << "VK Inf at step " << step;
+
+        // Gradient norm divergences (VK vs Python, after regularization, before Adam).
+        float loss_rd = rel_diff(vk_loss, py_loss);
+        float gpos_rd = rel_diff(l2_norm(trainer.captured_grad_positions().data(), N * 3),
+                                 l2_norm(py_gpos));
+        float gsc_rd  = rel_diff(l2_norm(trainer.captured_grad_scales().data(),    N * 3),
+                                 l2_norm(py_gsc));
+        float grot_rd = rel_diff(l2_norm(trainer.captured_grad_rotations().data(), N * 4),
+                                 l2_norm(py_grot));
+        float gsh_rd  = rel_diff(l2_norm(trainer.captured_grad_sh().data(),        N * MC3),
+                                 l2_norm(py_gsh));
+        float gop_rd  = rel_diff(l2_norm(trainer.captured_grad_opacities().data(), N),
+                                 l2_norm(py_gop));
+
+        // Parameter norm divergences (after Adam step).
+        const RawGaussianParams& vk_p = trainer.raw_params();
+        float ppos_rd = rel_diff(l2_norm(vk_p.raw_positions, N * 3), l2_norm(py_rpos));
+        float psc_rd  = rel_diff(l2_norm(vk_p.raw_scales,    N * 3), l2_norm(py_rsc));
+        float prot_rd = rel_diff(l2_norm(vk_p.raw_rotations, N * 4), l2_norm(py_rrot));
+        float pop_rd  = rel_diff(l2_norm(vk_p.raw_opacities, N),     l2_norm(py_rop));
+
+        max_loss_rd  = std::max(max_loss_rd,  loss_rd);
+        max_gpos_rd  = std::max(max_gpos_rd,  gpos_rd);
+        max_gsc_rd   = std::max(max_gsc_rd,   gsc_rd);
+        max_grot_rd  = std::max(max_grot_rd,  grot_rd);
+        max_gsh_rd   = std::max(max_gsh_rd,   gsh_rd);
+        max_gop_rd   = std::max(max_gop_rd,   gop_rd);
+        max_ppos_rd  = std::max(max_ppos_rd,  ppos_rd);
+        max_psc_rd   = std::max(max_psc_rd,   psc_rd);
+        max_prot_rd  = std::max(max_prot_rd,  prot_rd);
+        max_pop_rd   = std::max(max_pop_rd,   pop_rd);
+
+        if (step <= 10 || step % 10 == 0) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "%4d  %4.2f%%  %4.2f%%  %3.2f%%  %4.2f%%  %3.2f%%  %3.2f%%  "
+                "%4.2f%%  %3.2f%%  %4.2f%%  %3.2f%%\n",
+                step,
+                loss_rd * 100.f, gpos_rd * 100.f, gsc_rd * 100.f,
+                grot_rd * 100.f, gsh_rd * 100.f,  gop_rd * 100.f,
+                ppos_rd * 100.f, psc_rd * 100.f,  prot_rd * 100.f, pop_rd * 100.f);
+            std::cout << buf;
+        }
+    }
+
+    std::cout << "\n=== Max divergence across 100 steps ===\n";
+    char sbuf[512];
+    std::snprintf(sbuf, sizeof(sbuf),
+        "  loss:      %.3f%%\n"
+        "  grad_pos:  %.3f%%  grad_sc: %.3f%%  grad_rot: %.3f%%\n"
+        "  grad_sh:   %.3f%%  grad_op: %.3f%%\n"
+        "  param_pos: %.3f%%  param_sc: %.3f%%  param_rot: %.3f%%  param_op: %.3f%%\n",
+        max_loss_rd * 100.f,
+        max_gpos_rd * 100.f, max_gsc_rd * 100.f, max_grot_rd * 100.f,
+        max_gsh_rd * 100.f,  max_gop_rd * 100.f,
+        max_ppos_rd * 100.f, max_psc_rd * 100.f,
+        max_prot_rd * 100.f, max_pop_rd * 100.f);
+    std::cout << sbuf;
+
+    EXPECT_LT(max_gpos_rd, 0.20f) << "grad_pos max norm divergence > 20%";
+    EXPECT_LT(max_gsc_rd,  0.20f) << "grad_sc max norm divergence > 20%";
+    EXPECT_LT(max_grot_rd, 0.20f) << "grad_rot max norm divergence > 20%";
+    EXPECT_LT(max_gsh_rd,  0.20f) << "grad_sh max norm divergence > 20%";
+    EXPECT_LT(max_gop_rd,  0.20f) << "grad_op max norm divergence > 20%";
+    EXPECT_LT(max_ppos_rd, 0.10f) << "param_pos max norm divergence > 10%";
+    EXPECT_LT(max_psc_rd,  0.10f) << "param_sc max norm divergence > 10%";
+    EXPECT_LT(max_prot_rd, 0.10f) << "param_rot max norm divergence > 10%";
+    EXPECT_LT(max_pop_rd,  0.10f) << "param_op max norm divergence > 10%";
 }
