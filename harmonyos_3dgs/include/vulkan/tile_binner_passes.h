@@ -45,9 +45,20 @@ public:
     /// Rewire the descriptor set to the given buffer handles. Safe to call
     /// per-frame — updates in place rather than allocating a new set.
     /// `workgroup_sums` must hold at least `ceil(num_elements / 256)` uints.
+    /// This single-buffer overload supports up to 65536 elements.
     void bind_buffers(VkBuffer input_array,
                       VkBuffer output_array,
                       VkBuffer workgroup_sums);
+
+    /// Extended bind for 2-level scan (N up to ~16M).
+    /// `workgroup_sums`  must hold at least `ceil(N / 256)` uints.
+    /// `workgroup_sums2` must hold at least `ceil(ceil(N/256) / 256)` uints.
+    /// After calling this, scan_sync / record will use the 2-level path
+    /// automatically when num_elements > 65536.
+    void bind_buffers_2level(VkBuffer input_array,
+                             VkBuffer output_array,
+                             VkBuffer workgroup_sums,
+                             VkBuffer workgroup_sums2);
 
     /// Layer 1: synchronous exclusive scan of `num_elements` uints.
     /// Allocates a transient command buffer, records all 3 phases with
@@ -64,14 +75,18 @@ private:
     VulkanContext& ctx_;
     std::unique_ptr<VulkanShader>           shader_;
     std::unique_ptr<VulkanComputePipeline>  pipeline_;
-    VkDescriptorSet                         descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet                         descriptor_set_  = VK_NULL_HANDLE;
+    // Second descriptor set for 2-level scan: bound to {wg_sums1, wg_sums1, wg_sums2}.
+    VkDescriptorSet                         descriptor_set2_ = VK_NULL_HANDLE;
+    bool                                    has_2level_      = false;
 
     // Dispatch one of phases 0/1/2 into `cmd`. `num_wgs` is the grid size in
     // x (1 for phase 1).
     void dispatch_phase(VkCommandBuffer cmd,
                         uint32_t num_elements,
                         uint32_t phase,
-                        uint32_t num_wgs);
+                        uint32_t num_wgs,
+                        VkDescriptorSet ds = VK_NULL_HANDLE);
 };
 
 // ---------------------------------------------------------------------------

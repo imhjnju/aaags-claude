@@ -188,11 +188,13 @@ def run_dump(n_steps: int, output_dir: str, fixture_dir: str) -> None:
                 raw_rot.detach().numpy().reshape(N, 4).astype(np.float32))
         np.save(f"{prefix}_raw_op.npy",
                 raw_op.detach().numpy().reshape(N).astype(np.float32))
+        np.save(f"{prefix}_raw_sh.npy",
+                raw_sh.detach().numpy().reshape(N, max_coeffs * 3).astype(np.float32))
 
         if step <= 5 or step % 10 == 0 or step == n_steps:
             print(f"  step {step:4d}: loss={loss.item():.8f}  pos_lr={pos_lr_at_step(step):.2e}")
 
-    print(f"\nDone. Saved {n_steps * 10} files to {output_dir}")
+    print(f"\nDone. Saved {n_steps * 11} files to {output_dir}")
 
 
 def main():

@@ -53,6 +53,8 @@ PrefixScanPass::PrefixScanPass(VulkanContext& ctx)
         /*max_descriptor_sets=*/4);
 
     descriptor_set_ = pipeline_->allocate_empty_descriptor_set();
+    // Second DS for 2-level support; allocated here so it's always available.
+    descriptor_set2_ = pipeline_->allocate_empty_descriptor_set();
 }
 
 void PrefixScanPass::bind_buffers(VkBuffer input_array,
@@ -61,18 +63,38 @@ void PrefixScanPass::bind_buffers(VkBuffer input_array,
     pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::INPUT_ARRAY,    input_array);
     pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::OUTPUT_ARRAY,   output_array);
     pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::WORKGROUP_SUMS, workgroup_sums);
+    has_2level_ = false;
+}
+
+void PrefixScanPass::bind_buffers_2level(VkBuffer input_array,
+                                         VkBuffer output_array,
+                                         VkBuffer workgroup_sums,
+                                         VkBuffer workgroup_sums2) {
+    // DS1: {input, output, wg_sums1}  — used for phase 0 on N and phase 2 on N.
+    pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::INPUT_ARRAY,    input_array);
+    pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::OUTPUT_ARRAY,   output_array);
+    pipeline_->update_ssbo(descriptor_set_, prefix_sum_bind::WORKGROUP_SUMS, workgroup_sums);
+    // DS2: {wg_sums1, wg_sums1, wg_sums2}  — used for the mid-level 3-phase scan.
+    // Binding wg_sums1 as both INPUT and OUTPUT is safe: the shader copies to
+    // shared memory before writing, so there is no intra-invocation aliasing.
+    pipeline_->update_ssbo(descriptor_set2_, prefix_sum_bind::INPUT_ARRAY,    workgroup_sums);
+    pipeline_->update_ssbo(descriptor_set2_, prefix_sum_bind::OUTPUT_ARRAY,   workgroup_sums);
+    pipeline_->update_ssbo(descriptor_set2_, prefix_sum_bind::WORKGROUP_SUMS, workgroup_sums2);
+    has_2level_ = true;
 }
 
 void PrefixScanPass::dispatch_phase(VkCommandBuffer cmd,
                                     uint32_t num_elements,
                                     uint32_t phase,
-                                    uint32_t num_wgs) {
+                                    uint32_t num_wgs,
+                                    VkDescriptorSet ds) {
+    if (ds == VK_NULL_HANDLE) ds = descriptor_set_;
     PrefixSumPushConstants pc{};
     pc.num_elements = num_elements;
     pc.phase        = phase;
     pc.stride       = 0u;
     pc._pad         = 0u;
-    pipeline_->record(cmd, descriptor_set_,
+    pipeline_->record(cmd, ds,
                       num_wgs, 1u, 1u,
                       &pc, sizeof(pc));
 }
@@ -84,28 +106,60 @@ void PrefixScanPass::record(VkCommandBuffer cmd, uint32_t num_elements) {
     if (num_elements == 0u)
         return;  // nothing to scan; leave output untouched.
 
-    const uint32_t num_wgs =
+    const uint32_t num_wg1 =
         (num_elements + kPrefixSumLocalSize - 1u) / kPrefixSumLocalSize;
 
-    // Phase 1's single workgroup constraint: each phase-0 WG contributes one
-    // slot into workgroup_sums, and phase 1 scans that in a single 256-thread
-    // WG. So num_wgs must be <= 256 (i.e. N <= 65536). Enforce here to fail
-    // fast with a clear message instead of garbage results.
-    if (num_wgs > kPrefixSumLocalSize)
-        throw std::runtime_error(
-            "PrefixScanPass: num_elements exceeds single-level scan capacity "
-            "(N > 256*256 = 65536). Multi-level recursion not implemented.");
+    if (num_wg1 <= kPrefixSumLocalSize) {
+        // ---------------------------------------------------------------
+        // Single-level path (N ≤ 65536): original 3-phase protocol.
+        // ---------------------------------------------------------------
+        dispatch_phase(cmd, num_elements, /*phase=*/0u, num_wg1);
+        insert_compute_barrier(cmd);
+        dispatch_phase(cmd, num_wg1, /*phase=*/1u, /*num_wgs=*/1u);
+        insert_compute_barrier(cmd);
+        dispatch_phase(cmd, num_elements, /*phase=*/2u, num_wg1);
+    } else {
+        // ---------------------------------------------------------------
+        // Two-level path (65536 < N ≤ 256³ ≈ 16M):
+        //   DS1 = {input, output, wg_sums1}
+        //   DS2 = {wg_sums1, wg_sums1, wg_sums2}  (set by bind_buffers_2level)
+        //
+        //   Step 1 (DS1 ph0, num_wg1 WGs): local scan of input[N] → output[N],
+        //          produce wg_sums1[num_wg1] = per-WG totals.
+        //   Step 2 (DS2 ph0, num_wg2 WGs): local scan of wg_sums1 in-place,
+        //          produce wg_sums2[num_wg2] = level-2 WG totals.
+        //   Step 3 (DS2 ph1, 1 WG):        scan wg_sums2 in a single WG.
+        //   Step 4 (DS2 ph2, num_wg2 WGs): add wg_sums2 back to wg_sums1
+        //          → wg_sums1 now holds the correct exclusive prefix of level-1 totals.
+        //   Step 5 (DS1 ph2, num_wg1 WGs): add wg_sums1 back to output[N].
+        // ---------------------------------------------------------------
+        if (!has_2level_)
+            throw std::runtime_error(
+                "PrefixScanPass: N > 65536 requires bind_buffers_2level() "
+                "before record(). Call bind_buffers_2level with wg_sums2.");
 
-    // Phase 0: per-workgroup local scan.
-    dispatch_phase(cmd, num_elements, /*phase=*/0u, num_wgs);
-    insert_compute_barrier(cmd);
+        const uint32_t num_wg2 =
+            (num_wg1 + kPrefixSumLocalSize - 1u) / kPrefixSumLocalSize;
+        if (num_wg2 > kPrefixSumLocalSize)
+            throw std::runtime_error(
+                "PrefixScanPass: N exceeds two-level scan capacity "
+                "(N > 256^3 ≈ 16M). Not implemented.");
 
-    // Phase 1: scan workgroup_sums in a single workgroup.
-    dispatch_phase(cmd, num_wgs, /*phase=*/1u, /*num_wgs=*/1u);
-    insert_compute_barrier(cmd);
-
-    // Phase 2: add workgroup offsets back onto output_array.
-    dispatch_phase(cmd, num_elements, /*phase=*/2u, num_wgs);
+        // Step 1
+        dispatch_phase(cmd, num_elements, /*phase=*/0u, num_wg1, descriptor_set_);
+        insert_compute_barrier(cmd);
+        // Step 2
+        dispatch_phase(cmd, num_wg1, /*phase=*/0u, num_wg2, descriptor_set2_);
+        insert_compute_barrier(cmd);
+        // Step 3
+        dispatch_phase(cmd, num_wg2, /*phase=*/1u, /*num_wgs=*/1u, descriptor_set2_);
+        insert_compute_barrier(cmd);
+        // Step 4
+        dispatch_phase(cmd, num_wg1, /*phase=*/2u, num_wg2, descriptor_set2_);
+        insert_compute_barrier(cmd);
+        // Step 5
+        dispatch_phase(cmd, num_elements, /*phase=*/2u, num_wg1, descriptor_set_);
+    }
 }
 
 void PrefixScanPass::scan_sync(uint32_t num_elements) {

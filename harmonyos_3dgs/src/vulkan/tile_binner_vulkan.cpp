@@ -44,7 +44,7 @@ TileBinnerVulkan::TileBinnerVulkan(VulkanContext& ctx)
 // the include).
 TileBinnerVulkan::~TileBinnerVulkan() = default;
 
-// Allocate/grow the 7 scan-phase buffers (all N-or-wg-sized).
+// Allocate/grow the scan-phase buffers (all N-or-wg-sized).
 // Scatter output buffers (bin_keys_buf_, bin_vals_buf_) are NOT allocated here;
 // prepare_for_scatter() handles them after the scan gives us actual R.
 void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t num_wgs) {
@@ -52,6 +52,7 @@ void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t num_wgs) {
 
     const uint32_t N_new  = std::max(N,       bin_N_);
     const uint32_t wg_new = std::max(num_wgs, bin_wg_);
+    const uint32_t wg2_new = std::max((wg_new + 255u) / 256u, 1u);
 
     bin_tt_buf_  = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * sizeof(int32_t),
@@ -61,6 +62,9 @@ void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t num_wgs) {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     bin_ws_buf_  = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(wg_new) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_ws2_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(wg2_new) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     bin_m2d_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
@@ -137,9 +141,10 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     // -------------------------------------------------------------------
     // 2. Exclusive prefix scan: tiles_touched -> point_offsets.
     // -------------------------------------------------------------------
-    scan_pass_->bind_buffers(bin_tt_buf_->handle(),
-                             bin_po_buf_->handle(),
-                             bin_ws_buf_->handle());
+    scan_pass_->bind_buffers_2level(bin_tt_buf_->handle(),
+                                    bin_po_buf_->handle(),
+                                    bin_ws_buf_->handle(),
+                                    bin_ws2_buf_->handle());
     scan_pass_->scan_sync(static_cast<uint32_t>(N));
 
     // -------------------------------------------------------------------
@@ -250,6 +255,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     // Release old buffers first.
     r_po_buf_.reset();
     r_ws_buf_.reset();
+    r_ws2_buf_.reset();
     r_keys_buf_.reset();
     r_vals_buf_.reset();
 
@@ -259,10 +265,13 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // workgroup_sums: one uint per phase-0 workgroup, min 1.
-    const uint32_t num_wgs = (N + 255u) / 256u;
-    const uint32_t wg_sums_count = num_wgs == 0u ? 1u : num_wgs;
+    const uint32_t num_wgs  = std::max((N + 255u) / 256u, 1u);
+    const uint32_t num_wgs2 = std::max((num_wgs + 255u) / 256u, 1u);
     r_ws_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(wg_sums_count) * sizeof(uint32_t),
+        ctx_, static_cast<VkDeviceSize>(num_wgs) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_ws2_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(num_wgs2) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // keys_unsorted[R_max] + values_unsorted[R_max].
@@ -273,10 +282,11 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Bind scan (input=tiles_touched, output=point_offsets, wg_sums).
-    scan_pass_->bind_buffers(tiles_touched,
-                             r_po_buf_->handle(),
-                             r_ws_buf_->handle());
+    // Bind scan (input=tiles_touched, output=point_offsets, wg_sums, wg_sums2).
+    scan_pass_->bind_buffers_2level(tiles_touched,
+                                    r_po_buf_->handle(),
+                                    r_ws_buf_->handle(),
+                                    r_ws2_buf_->handle());
 
     // Bind scatter (inputs + outputs).
     ScatterPass::Buffers sb{};

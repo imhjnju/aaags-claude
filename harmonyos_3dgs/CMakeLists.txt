@@ -258,6 +258,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         target_compile_definitions(gs3d_vulkan_hello PRIVATE
             ADD_ONE_SPV_PATH="${_spv_add_one}")
 
+        add_executable(gs3d_vk_render src/vulkan/vk_render_main.cpp)
+        add_dependencies(gs3d_vk_render gs3d_vulkan_shaders)
+        target_link_libraries(gs3d_vk_render PRIVATE gs3d_vk_core gs3d_core)
+
         if(BUILD_TESTS)
             add_executable(gs3d_vk_tests
                 tests/test_vk_compute.cpp
