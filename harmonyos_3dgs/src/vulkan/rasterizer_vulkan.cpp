@@ -202,6 +202,22 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // Download outputs.
     // -------------------------------------------------------------------
     img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+
+    // Convert GPU CHW layout to CPU HWC layout.
+    // rasterize.comp writes: out_image[ch * HW + px]  (CHW)
+    // Rasterizer interface: output_image[px * 3 + ch]  (HWC)
+    {
+        std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
+        std::memcpy(chw.data(), output_image,
+                    static_cast<std::size_t>(HW) * 3u * sizeof(float));
+        for (int px = 0; px < HW; ++px) {
+            for (int ch = 0; ch < 3; ++ch) {
+                output_image[static_cast<std::size_t>(px) * 3 + ch] =
+                    chw[static_cast<std::size_t>(ch) * HW + px];
+            }
+        }
+    }
+
     if (cache) {
         if (cache->T_final) {
             t_buf->download(cache->T_final,
