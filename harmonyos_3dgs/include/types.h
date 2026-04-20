@@ -21,6 +21,9 @@ public:
     }
 
     void reset();
+    // Grow the buffer to at least new_capacity bytes. No-op if already large enough.
+    // Safe to call after reset() (offset must be 0). Invalidates all prior pointers.
+    void grow(size_t new_capacity);
     size_t used() const;
     size_t capacity() const;
 

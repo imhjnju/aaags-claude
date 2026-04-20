@@ -208,6 +208,9 @@ float VulkanTrainer::step(const Camera& cam,
                           int H)
 {
     alloc_.reset();
+    // Grow arena if N has increased since last step (e.g. after densification).
+    // Budget: 6 MB base (HW pixels) + 2 KB/Gaussian covers cache + binner/sorter R pairs + grads.
+    alloc_.grow((6u << 20) + static_cast<size_t>(N_) * 2048u);
     activate_params();
 
     // Pre-allocate ForwardCache fields that the backward passes need.
