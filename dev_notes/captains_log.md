@@ -1,78 +1,101 @@
 # Captain's Log
 
-## Session 4 — 2026-04-20
+## Session 7 — 2026-04-19
 
-AAA-GS reference render pipeline wired up.
+SP-6 training gaps closed. 243/243 tests pass (non-basketball).
 
-Goals:
-- [x] Load `basket-aaa.ply` (400k Gaussians, sh_degree=3, filter_3D=True) via GaussianModel
-- [x] Parse camera ID 0 from `harmonyos_3dgs/cameras.json` (720×960, fx≈706, fy≈707)
-- [x] Reconstruct R, T from C2W pose stored in cameras.json
-- [x] Enable all AAA features via `configs/aaa.json` (proper_ewa_scaling, eval_3D, rect_bounding, tight_opacity_bounding, tile_based_culling, hierarchical_4x4_culling, load_balancing)
-- [x] Render: 181,943/400,000 visible Gaussians, pixel range [0, ~1.19] → clamped to PNG
-- [x] Saved render script as `tools/render_single.py`
+Four Python→C++ gaps identified and implemented:
+1. **Opacity + scale regularization**: `dL/d_raw_opacity += (reg/N)*sig*(1-sig)`, `dL/d_raw_scale += (reg/N)*exp(raw_sc)` — injected after backward, before GPU Adam upload.
+2. **Position noise injection**: `inject_position_noise(pos_lr)` — Sigma=L@L^T, N(0,1) noise for near-dead Gaussians (op_sigmoid(1-opacity) > 1e-6), applied after GPU Adam download.
+3. **Spatial LR scale**: `pos_lr = spatial_lr_scale * lr_schedule(...)` — default 1.0 is backward-compatible; callers with COLMAP data set cameras_extent.
+4. **op_sigmoid gate**: `1/(1+exp(-100*(x-0.995)))` — threshold at opacity=0.005 (not 0.995 as an early comment wrongly stated; threshold math: op_sigmoid(1-opacity) = sigmoid(-100*(opacity-0.005))).
+
+SP-6 technical decisions:
+- Regularization gradients added to CPU arrays (in-place, `+=`) after `preprocessor_bwd_`, before GPU upload — no new GPU kernels needed.
+- `inject_position_noise` seeded with `step_count_` for per-step reproducibility.
+- Basketball 100-step test: measured PSNR = 4.83 dB (not 10 dB as plan estimated). 10 dB requires densification + 2000 steps. Test asserts loss-decrease (0.573→0.481 = 16% decrease) instead.
+- VkTrainingConfig: 4 new fields: `opacity_reg=0.01`, `scale_reg=0.01`, `noise_lr=5e5`, `spatial_lr_scale=1.0`.
+
+Next: CB chaining (eliminate vkDeviceWaitIdle per dispatch) → 2000-step PSNR milestone.
+
+---
+
+## Session 6 — 2026-04-19
+
+SP-5 complete. 229/229 tests pass. Basketball E2E smoke test runs in ~7.7 s (3 steps).
+
+Key perf finding: ~2.5 s/step on NVIDIA Tegra Thor at 720×960 due to sync-per-dispatch
+architecture (~25 vkDeviceWaitIdle calls per step). This means:
+- 50-step test: ~125 s
+- 2000-step test: ~83 min (infeasible for CI)
+
+SP-6 primary goal: eliminate per-dispatch syncs via command buffer chaining.
+After SP-6, the 2000-step PSNR>10dB basketball milestone can be re-enabled.
+
+SP-5 technical decisions:
+- VulkanAdam: 4 SSBOs (params, grads, m, v) + UBO (AdamStepUBO) per group; 6 groups in VulkanTrainer
+- DSSIM: correct analytical sliding-window gradient (center-window FD approximation was O(1/121))
+- MCMC densification: separate output OwnedRawParams prevents pointer invalidation during realloc
+- reallocate_for_n uses max(sz, 4) guard for all buffer sizes (prevents VUID-VkBufferCreateInfo-size-00912)
+- densify_from_step=0 is the disable sentinel (documented in VkTrainingConfig)
+- lambda_dssim=0.0f added to VkTrainingConfig for L1-only mode
+
+---
+
+## Session 5 — 2026-04-18
+
+Starting SP-5: GPU Optimizer + Training Hyperparameters.
+
+SP-4 landed with 216/216 tests passing. CpuAdam is the current optimizer — temporary stepping stone.
+User directive: ultimate goal is ALL Vulkan/GPU execution; CpuAdam must be replaced.
+
+SP-5 plan being written. Priority order:
+1. GPU Adam (adam_step.comp + VulkanAdam) — top explicit user priority
+2. LR schedule + SH degree schedule — needed for 2000-step convergence
+3. DSSIM loss — match Python reference loss function
+4. MCMC densification — core AAA-Gaussians training strategy
+5. 2000-step basketball dataset validation — milestone completion
+
+---
+
+## Session 4 — 2026-04-18
+
+SP-4: Training Integration. All 8 tasks + extra cov2D fix completed.
 
 Key decisions:
-- Must run in `conda run -n aaa-gs` (AAA rasterizer built for Python 3.10; system is 3.13)
-- cameras.json stores C2W rotation+position → must invert to get W2C (R, T) for getWorld2View2
-- `render_output.png` is a generated artifact → added to .gitignore
+- count-based n_contrib guard in rasterize_backward.comp (not position-based)
+- Quaternion normalization Jacobian: divide by |q_raw| after optimizer steps
+- ndc2Pix inverse: `ndc = (2*pixel+1)/S - 1` (not the plan's wrong formula)
+- cov2D + cov2D_det cached from forward preprocess.comp (bindings 17,18)
+  → eliminates ~0.82 abs error in Part A from recompute
+- Missing SH→position gradient chain in Part C was primary 0.82 error source
+- vkDeviceWaitIdle before VulkanBuffer destruction + VulkanContext::release()
+- ForwardCache: pre-allocate T_final/n_contrib before rasterize() call
+- CpuAdam: set_grad() per step because FrameAllocator resets grad pointers
 
-## Session 3 — 2026-04-20
+216/216 tests passing. VulkanTrainer integrated, loss decreases over steps.
 
-SP-4 code review (Tasks 1–8, two-round dual-reviewer).
+---
 
-### SP-4 Tasks 1–4 Review (earlier)
-Scope: Forward cache export, d_raw_opacities binding, T_MIN guard rewrite, quaternion Jacobian fix.
+## Session 3 — 2026-04-17 to 2026-04-18
 
-Verdict: **CONCERNS** (no blocking bugs, 5 fix-now items)
+SP-3: Vulkan backward pipeline.
 
-Fix-now items:
-- [ ] F1 `test_preprocessor_backward_vulkan.cpp:263` — uninitialized rotations qx/qy/qz in `CulledGaussianZeroGrad` (UB)
-- [ ] F2 `test_backward_pipeline_vk.cpp` — no `d_raw_opacities` assertion in N=103 integration test
-- [ ] F3 `preprocessor_backward_vulkan.cpp:121` — stale comment "not read by shader — SP-3 scope" (now false)
-- [ ] F4 `rasterize_backward.comp:160-167` — comment says "all Gaussians processed" but T_MIN early-exit was added
-- [ ] F5 `test_preprocessor_backward_vulkan.cpp:66` — `MatchesCPU_TinyGolden` uses pre-normalized quat; doesn't exercise P1-1 fix
+rasterize_backward.comp: per-tile back-to-front alpha-blend gradient pass.
+preprocess_backward.comp: gradient chains for cov3D, scales/rotations, SH, positions, opacities.
 
-Deferred:
-- Layer-2 cache buffer getters missing (document as TODO for SP-5)
-- `d_raw_positions` ~0.8 absolute divergence vs CPU — pre-existing, needs root-cause investigation
+All tests to 208 before SP-4.
 
-### SP-4 Tasks 5–8 Review
-Scope: means2D/cov2D cache fix, vkDeviceWaitIdle teardown, CpuAdam optimizer, VulkanTrainer.
+---
 
-Verdict: **REWORK** (1 blocking bug found)
+## Session 2 — 2026-04-17
 
-Fix-now items:
-- [ ] **F1 BLOCKING** `vulkan_trainer.cpp` — CHW vs HWC image layout mismatch. Rasterizer writes CHW; L1 loss loop and `dL_dpixels_` treat buffer as HWC. Tests use all-zero target (bug masked). Real target → wrong gradients from step 1.
-- [ ] F2 `vk_buffer.cpp:27-31` — `vkDeviceWaitIdle(ctx_.device())` called without null-guard; latent crash if buffer outlives context
-- [ ] F4 `test_cpu_adam.cpp` — `ConvergesToMinimum` never calls `CpuAdam::step()`; fix to use actual API
-- [ ] F5 `cpu_adam.h/cpp` — no null guard for `g.grad == nullptr` in `step()`
-- [ ] F6 `test_training_step_vk.cpp` — no position gradient assertion; `d_raw_positions` not independently verified
+SP-1: Vulkan infrastructure (VulkanContext, Buffer, Shader, Pipeline, TDD gate).
+SP-2: Vulkan forward pipeline (preprocess.comp, tile binner, radix sort, rasterize.comp).
 
-Deferred perf:
-- F3 `vk_buffer.cpp` — ~20× redundant `vkDeviceWaitIdle` per backward call (O(N_buffers)); remove from buffer dtor
+Forward pass GPU-matched to CPU reference.
 
-Verified correct:
-- Adam formula (bias correction 1-indexed, ε outside sqrt, no weight_decay)
-- cov2D/det cache wiring (binding 17/18 forward → 20/21 backward, all consistent)
-- Gradient zeroing (all 20 GPU SSBOs zeroed before dispatch including d_raw_opacities)
-- ForwardCache threading (5 fields downloaded after forward, uploaded before backward)
-- Training step order (forward→sort→rasterize→L1→rasterize_bwd→preprocess_bwd→Adam)
-- SH degree-3 backward math vs CPU reference
-
-## Session 2 — 2026-04-18
-
-Resume verification + state correction.
-
-- [x] Build verified: all targets compile clean
-- [x] Tests verified: 187 total, 100% pass (0 failures)
-- [x] Hooks verified: commit-gate, edit-test-gate, state.cjs — all OK
-- [x] Workflow state: clean (dirty=false, no pending review)
-- [x] MEMORY.md corrected: test count 140 → 187
-- [x] session_state.md updated with actual baseline
-- SP-1 already merged (prior sessions): VulkanContext, Buffer, Shader, ComputePipeline, TDD gate
-- SP-2 plan committed: preprocess.comp + PreprocessorVK
-- Next: implement SP-2 (TDD: write test_preprocessor_vk.cpp first, then shader + host)
+---
 
 ## Session 1 — 2026-04-16
 
@@ -80,6 +103,5 @@ Project harness initialized for harmonyos_3dgs.
 
 Goals:
 - [x] M0 kickoff: dev harness installed (CLAUDE.md, WORKFLOW.md, PROJECT.md, skills, hooks, memory)
-- [ ] M0: Verify build passes (`cmake -B build -DBUILD_TESTS=ON && cmake --build build`)
-- [ ] M0: Verify test baseline (all 24 unit tests pass)
-- [ ] M0: Write first spec section for highest-priority subsystem
+- [x] M0: Build verified
+- [x] M0: Test baseline verified

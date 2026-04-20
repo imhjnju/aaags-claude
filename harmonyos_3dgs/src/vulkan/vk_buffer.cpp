@@ -23,8 +23,10 @@ VulkanBuffer::VulkanBuffer(VulkanContext& ctx, VkDeviceSize bytes,
 }
 
 VulkanBuffer::~VulkanBuffer() {
-    if (buffer_ != VK_NULL_HANDLE)
+    if (buffer_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(ctx_.device());   // ensure GPU is idle before freeing
         vkDestroyBuffer(ctx_.device(), buffer_, nullptr);
+    }
     if (memory_ != VK_NULL_HANDLE)
         vkFreeMemory(ctx_.device(), memory_, nullptr);
 }

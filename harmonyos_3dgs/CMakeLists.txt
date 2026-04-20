@@ -37,6 +37,10 @@ add_library(gs3d_core
     src/optimizer.cpp
     src/trainer.cpp
     src/density_controller.cpp
+    src/cpu_adam.cpp
+    src/dssim.cpp
+    src/densification.cpp
+    src/train_utils.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
@@ -104,6 +108,9 @@ if(BUILD_TESTS)
         tests/test_compare.cpp
         tests/test_manifest.cpp
         tests/test_golden_roundtrip.cpp
+        tests/test_cpu_adam.cpp
+        tests/test_dssim.cpp
+        tests/test_training_gap_sp6.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
@@ -177,13 +184,42 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         endfunction()
 
         gs3d_compile_glsl(add_one    _spv_add_one)
-        gs3d_compile_glsl(preprocess _spv_preprocess)
         gs3d_embed_spirv(add_one _hdr_add_one)
         gs3d_compile_glsl(hello _spv_hello)
         gs3d_embed_spirv(hello _hdr_hello)
+        gs3d_compile_glsl(preprocess _spv_preprocess)
+        gs3d_embed_spirv(preprocess _hdr_preprocess)
+        gs3d_compile_glsl(prefix_sum _spv_prefix_sum)
+        gs3d_embed_spirv(prefix_sum _hdr_prefix_sum)
+        gs3d_compile_glsl(scatter _spv_scatter)
+        gs3d_embed_spirv(scatter _hdr_scatter)
+        gs3d_compile_glsl(radix_sort_count _spv_radix_count)
+        gs3d_embed_spirv(radix_sort_count _hdr_radix_count)
+        gs3d_compile_glsl(radix_sort_scatter _spv_radix_scatter)
+        gs3d_embed_spirv(radix_sort_scatter _hdr_radix_scatter)
+        gs3d_compile_glsl(tile_range _spv_tile_range)
+        gs3d_embed_spirv(tile_range _hdr_tile_range)
+        gs3d_compile_glsl(rasterize _spv_rasterize)
+        gs3d_embed_spirv(rasterize _hdr_rasterize)
+        gs3d_compile_glsl(rasterize_backward _spv_rasterize_backward)
+        gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
+        gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
+        gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
+        gs3d_compile_glsl(adam_step _spv_adam_step)
+        gs3d_embed_spirv(adam_step _hdr_adam_step)
         add_custom_target(gs3d_vulkan_shaders
-            DEPENDS ${_spv_add_one} ${_spv_preprocess} ${_hdr_add_one}
-                    ${_spv_hello} ${_hdr_hello})
+            DEPENDS ${_spv_add_one} ${_hdr_add_one}
+                    ${_spv_hello} ${_hdr_hello}
+                    ${_spv_preprocess} ${_hdr_preprocess}
+                    ${_spv_prefix_sum} ${_hdr_prefix_sum}
+                    ${_spv_scatter} ${_hdr_scatter}
+                    ${_spv_radix_count} ${_hdr_radix_count}
+                    ${_spv_radix_scatter} ${_hdr_radix_scatter}
+                    ${_spv_tile_range} ${_hdr_tile_range}
+                    ${_spv_rasterize} ${_hdr_rasterize}
+                    ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
+                    ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
+                    ${_spv_adam_step} ${_hdr_adam_step})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
@@ -191,15 +227,40 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/vk_buffer.cpp
             src/vulkan/vk_shader.cpp
             src/vulkan/vk_pipeline.cpp
-            src/vulkan/preprocessor_vk.cpp)
+            src/vulkan/preprocess_pass.cpp
+            src/vulkan/preprocessor_vulkan.cpp
+            src/vulkan/prefix_scan_pass.cpp
+            src/vulkan/scatter_pass.cpp
+            src/vulkan/tile_binner_vulkan.cpp
+            src/vulkan/radix_sort_pass.cpp
+            src/vulkan/tile_range_pass.cpp
+            src/vulkan/sorter_vulkan.cpp
+            src/vulkan/rasterize_pass.cpp
+            src/vulkan/rasterizer_vulkan.cpp
+            src/vulkan/rasterize_backward_pass.cpp
+            src/vulkan/rasterizer_backward_vulkan.cpp
+            src/vulkan/preprocess_backward_pass.cpp
+            src/vulkan/preprocessor_backward_vulkan.cpp
+            src/vulkan/vulkan_adam.cpp
+            src/vulkan_trainer.cpp)
+        add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
-        target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan)
+        # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
+        # produced into ${_vk_shader_dir}.
+        target_include_directories(gs3d_vk_core PRIVATE ${_vk_shader_dir})
+        # gs3d_vk_core depends on gs3d_core for CPU helpers (math_utils, types).
+        # PreprocessorVulkan::process() uses invertMatrix4x4 from math_utils.cpp.
+        target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan gs3d_core)
 
         add_executable(gs3d_vulkan_hello src/vulkan/hello_vulkan_main.cpp)
         add_dependencies(gs3d_vulkan_hello gs3d_vulkan_shaders)
         target_link_libraries(gs3d_vulkan_hello PRIVATE gs3d_vk_core)
         target_compile_definitions(gs3d_vulkan_hello PRIVATE
             ADD_ONE_SPV_PATH="${_spv_add_one}")
+
+        add_executable(gs3d_vk_render src/vulkan/vk_render_main.cpp)
+        add_dependencies(gs3d_vk_render gs3d_vulkan_shaders)
+        target_link_libraries(gs3d_vk_render PRIVATE gs3d_vk_core gs3d_core)
 
         if(BUILD_TESTS)
             add_executable(gs3d_vk_tests
@@ -208,20 +269,53 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_device_selection.cpp
                 tests/test_vk_pipeline_dispatch.cpp
                 tests/test_vk_hello.cpp
-                tests/test_preprocessor_vk.cpp)
+                tests/test_preprocess_pass_vk.cpp
+                tests/test_prefix_scan_pass_vk.cpp
+                tests/test_scatter_pass_vk.cpp
+                tests/test_tile_binner_vulkan.cpp
+                tests/test_radix_sort_pass_vk.cpp
+                tests/test_tile_range_pass_vk.cpp
+                tests/test_sorter_vulkan.cpp
+                tests/test_rasterize_pass_vk.cpp
+                tests/test_forward_pipeline_vk.cpp
+                tests/test_rasterize_backward_pass_vk.cpp
+                tests/test_rasterizer_backward_vulkan.cpp
+                tests/test_preprocess_backward_pass_vk.cpp
+                tests/test_preprocessor_backward_vulkan.cpp
+                tests/test_backward_pipeline_vk.cpp
+                tests/test_forward_cache_vk.cpp
+                tests/test_training_step_vk.cpp
+                tests/test_vulkan_adam.cpp
+                tests/test_densification.cpp
+                tests/test_e2e_basketball.cpp
+                tests/test_cpu_vk_compare.cpp
+                tests/test_vk_vs_py_reference.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
                 gs3d_vk_core gs3d_core GTest::gtest_main)
             target_include_directories(gs3d_vk_tests PRIVATE
                 ${_vk_shader_dir}   # xxd-embedded headers (hello_spv.h etc.)
-                tests)
+                tests
+                include)            # extern/stb_image.h
+            # TEST_DATA_DIR is needed by test_preprocess_pass_vk.cpp to
+            # locate the tiny golden fixture (../golden/tiny/step.../cam...).
             target_compile_definitions(gs3d_vk_tests PRIVATE
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
-                SHADER_DIR="${_vk_shader_dir}")
-            gtest_discover_tests(gs3d_vk_tests)
+                SHADER_DIR="${_vk_shader_dir}"
+                TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
+            # E2E basketball test runs 2000 training steps — allow up to 2 hours.
+            # The synchronous GPU dispatch model makes it slow on the dev machine;
+            # a pipeline-recorded dispatch path would reduce this significantly.
+            # All gs3d_vk_tests get a generous timeout; the basketball test needs
+            # the most headroom.
+            gtest_discover_tests(gs3d_vk_tests PROPERTIES TIMEOUT 7200)
+
+            add_executable(test_sp7_cb_chain tests/test_sp7_cb_chain.cpp)
+            target_link_libraries(test_sp7_cb_chain PRIVATE gs3d_core gs3d_vk_core GTest::gtest_main)
+            add_test(NAME Sp7Chain COMMAND test_sp7_cb_chain)
         endif()
-        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, preprocess)")
+        message(STATUS "Vulkan enabled: gs3d_vk_core, gs3d_vulkan_hello, gs3d_vk_tests (shaders: add_one, hello, preprocess)")
     else()
         message(STATUS "Vulkan SKIPPED (Vulkan=${Vulkan_FOUND}, glslangValidator=${GLSLANG_VALIDATOR})")
     endif()

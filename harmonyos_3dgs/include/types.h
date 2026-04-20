@@ -21,6 +21,9 @@ public:
     }
 
     void reset();
+    // Grow the buffer to at least new_capacity bytes. No-op if already large enough.
+    // Safe to call after reset() (offset must be 0). Invalidates all prior pointers.
+    void grow(size_t new_capacity);
     size_t used() const;
     size_t capacity() const;
 
@@ -74,6 +77,7 @@ struct PreprocessOutput {
     float* rgb;              // [N * 3]
     int* radii;              // [N]
     int* tiles_touched;      // [N]
+    float* radius_f = nullptr;  // [N] float eigenvalue radius from preprocess (nullptr for CPU paths)
     float* gauss2screen;     // [N * 16] AAA-Gaussians: 4x4 matrix per Gaussian (nullptr if not eval_3D)
     float* cov3D_inv;       // [N * 6] inverse 3D covariance upper triangle (eval_3D only, nullptr otherwise)
     float* mean_offset;     // [N * 3] world-space (pos - cam_pos) per Gaussian (eval_3D only)

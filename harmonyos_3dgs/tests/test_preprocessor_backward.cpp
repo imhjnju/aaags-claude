@@ -321,9 +321,15 @@ TEST(PreprocessorBackward, BackwardIntegration) {
     pre.radii[0] = 5;   // visible
     pre.radii[1] = 0;   // invisible
 
-    // ForwardCache
+    // ForwardCache — cov2D/cov2D_det must be valid arrays: backward reads them
+    // before the `if (det==0) continue` guard. Zero-init makes det=0, which
+    // causes the conic/position chains to skip (they are not under test here).
     ForwardCache cache;
     cache.pre = &pre;
+    cache.cov2D     = alloc.allocate_array<float>(N * 3);
+    cache.cov2D_det = alloc.allocate_array<float>(N);
+    std::memset(cache.cov2D,     0, N * 3 * sizeof(float));
+    std::memset(cache.cov2D_det, 0, N     * sizeof(float));
 
     // RasterGradOutput
     RasterGradOutput rgrad;

@@ -162,6 +162,135 @@
       "layout": "row_major"
     },
     {
+      "filename": "input_positions.npy",
+      "operator": "input",
+      "tensor": "positions",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_scales.npy",
+      "operator": "input",
+      "tensor": "scales",
+      "shape": [
+        20,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_rotations.npy",
+      "operator": "input",
+      "tensor": "rotations",
+      "shape": [
+        20,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_opacities.npy",
+      "operator": "input",
+      "tensor": "opacities",
+      "shape": [
+        20,
+        1
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_sh.npy",
+      "operator": "input",
+      "tensor": "sh",
+      "shape": [
+        20,
+        16,
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_filter_3D.npy",
+      "operator": "input",
+      "tensor": "filter_3D",
+      "shape": [
+        20
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_viewmatrix.npy",
+      "operator": "input",
+      "tensor": "viewmatrix",
+      "shape": [
+        4,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_projmatrix.npy",
+      "operator": "input",
+      "tensor": "projmatrix",
+      "shape": [
+        4,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_inv_viewprojmatrix.npy",
+      "operator": "input",
+      "tensor": "inv_viewprojmatrix",
+      "shape": [
+        4,
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_campos.npy",
+      "operator": "input",
+      "tensor": "campos",
+      "shape": [
+        3
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_fov_size.npy",
+      "operator": "input",
+      "tensor": "fov_size",
+      "shape": [
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
+      "filename": "input_meta.npy",
+      "operator": "input",
+      "tensor": "meta",
+      "shape": [
+        4
+      ],
+      "dtype": "float32",
+      "layout": "row_major"
+    },
+    {
       "filename": "backward_dL_dout_color.npy",
       "operator": "backward",
       "tensor": "dL_dout_color",

@@ -213,6 +213,8 @@ bool VulkanContext::init() {
 }
 
 void VulkanContext::release() {
+    if (device_ != VK_NULL_HANDLE)
+        vkDeviceWaitIdle(device_);   // ensure GPU is idle before releasing resources
     if (command_pool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, command_pool_, nullptr);
         command_pool_ = VK_NULL_HANDLE;

@@ -1,0 +1,209 @@
+#version 450
+
+// SP-2 rasterize.comp — per-tile alpha blending (spec §4.8.7).
+//
+// One workgroup = one 16x16 tile. Each invocation = one pixel. The workgroup
+// cooperatively loads batches of up to 256 Gaussians from the sorted list for
+// its tile into shared memory, then every pixel-thread walks the batch in
+// sort order and front-to-back alpha-blends Gaussians that cover it until
+// transmittance T falls below a threshold or the tile's Gaussian list ends.
+//
+// CUDA reference: AAA-Gaussians/submodules/diff-gaussian-rasterization/
+//   cuda_rasterizer/forward.cu: renderCUDA(...) — the algorithm we mirror.
+//
+// Bindings match rasterize_bind:: in include/vulkan/preprocess_bindings.h.
+//
+// NUMERICAL CONTRACTS (match CUDA bit-for-bit given identical inputs):
+//   - alpha threshold    : ALPHA_THRESHOLD = 1.0 / 255.0
+//   - T  (early-out)     : T_MIN           = 0.0001
+//   - alpha cap          : min(0.99, opacity * exp(power))   (forward.cu:366)
+//   - power              : -0.5*(a*dx^2 + c*dy^2) - b*dx*dy
+//     Note: conic_opacity_packed[b] is the raw off-diagonal cov2D_inv[0][1],
+//     NOT pre-halved. Formula matches forward.cu:
+//       float power = -0.5f*(con_o.x*d.x*d.x + con_o.z*d.y*d.y)
+//                     - con_o.y*d.x*d.y;
+//   - power > 0 skip     : Gaussian evaluated behind its own peak — skip.
+//   - n_contrib          : count of Gaussians actually blended into C
+//                          (those passing both alpha >= 1/255 AND test_T >= T_MIN).
+//                          The Gaussian that first trips T < T_MIN is NOT counted.
+//   - output layout      : CHW. out_image[ch*H*W + y*W + x].
+//   - background         : final color = C_accum + T_final * bg_color (always
+//                          applied, even when bg is zero).
+//
+// Shared memory footprint: 10 arrays * 256 floats (or uints) = 10 * 1024 B =
+// 10.24 KB. Safely under Vulkan 1.1 guaranteed 16 KB shared memory minimum.
+//
+// Synchronisation: barriers bracket each batch's cooperative load; pixels
+// whose tile has early-terminated still participate in barriers so divergent
+// pixel_done states don't hang the workgroup (no barrier inside the per-pixel
+// k-loop — that loop is fully divergent but contains no barrier calls).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// binding 0 — sorted Gaussian indices (one per (Gaussian, tile) pair).
+layout(std430, set = 0, binding = 0) readonly buffer ValuesSorted {
+    uint values_sorted[];
+};
+
+// binding 1 — [start0, end0, start1, end1, ...] inclusive/exclusive per tile.
+layout(std430, set = 0, binding = 1) readonly buffer TileRanges {
+    uint tile_ranges[];
+};
+
+// binding 2 — means2D interleaved [x0,y0, x1,y1, ...].
+layout(std430, set = 0, binding = 2) readonly buffer Means2D {
+    float means2D[];
+};
+
+// binding 3 — packed [a, b, c, opacity] per Gaussian (stride 4 floats).
+layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity {
+    float conic_opacity[];
+};
+
+// binding 4 — per-Gaussian RGB [r,g,b] interleaved (stride 3 floats).
+layout(std430, set = 0, binding = 4) readonly buffer RGB {
+    float rgb[];
+};
+
+// binding 5 — output image, CHW: [R-plane | G-plane | B-plane], each H*W.
+layout(std430, set = 0, binding = 5) writeonly buffer OutImage {
+    float out_image[];
+};
+
+// binding 6 — per-pixel final transmittance (H*W floats).
+layout(std430, set = 0, binding = 6) writeonly buffer Transmittance {
+    float transmittance[];
+};
+
+// binding 7 — per-pixel blended-Gaussian count (H*W uints).
+layout(std430, set = 0, binding = 7) writeonly buffer NContrib {
+    uint n_contrib[];
+};
+
+// binding 8 — background colour UBO (std140, 16 bytes).
+layout(std140, set = 0, binding = 8) uniform RasterUBO {
+    vec4 bg_color;  // (R, G, B, unused)
+};
+
+// RasterizePushConstants — 20 bytes (spec §4.8.7).
+layout(push_constant) uniform PC {
+    uint num_gaussians;  // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
+    uint image_width;
+    uint image_height;
+    uint num_tiles_x;
+    uint num_tiles_y;    // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
+} pc;
+
+// --- Shared cache of the current batch (up to 256 Gaussians) ---
+shared float s_mean_x [256];
+shared float s_mean_y [256];
+shared float s_conic_a[256];
+shared float s_conic_b[256];
+shared float s_conic_c[256];
+shared float s_opacity[256];
+shared float s_rgb_r  [256];
+shared float s_rgb_g  [256];
+shared float s_rgb_b  [256];
+shared uint  s_gid    [256];
+
+const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
+const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
+const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
+
+void main() {
+    // --- Tile → range lookup ---
+    uint tile_id = gl_WorkGroupID.y * pc.num_tiles_x + gl_WorkGroupID.x;
+    uint range_start = tile_ranges[tile_id * 2u + 0u];
+    uint range_end   = tile_ranges[tile_id * 2u + 1u];
+
+    // --- Per-pixel coordinates ---
+    uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    bool valid_pixel = (pixel_x < pc.image_width) && (pixel_y < pc.image_height);
+
+    // Linear index into shared cache for cooperative loads (0..255).
+    uint local_idx = gl_LocalInvocationIndex;
+
+    // Per-pixel accumulators.
+    float T = 1.0;
+    vec3  C = vec3(0.0);
+    uint  n = 0u;
+    // Pixels outside the image still participate in cooperative loads/barriers
+    // but contribute nothing; treat them as already-done for the blending loop.
+    bool pixel_done = !valid_pixel;
+
+    // --- Batched march through this tile's sorted Gaussian list ---
+    // TODO(SP-3-perf): add subgroup-wide early-exit when all pixels in tile are done
+    // (CUDA equivalent: __syncthreads_count(done) at forward.cu:386-388; Vulkan uses
+    // subgroupAllEqual() or a shared counter + barrier + uniform read).
+    for (uint batch_start = range_start;
+         batch_start < range_end;
+         batch_start += BATCH_SIZE)
+    {
+        // 1. Cooperative load: each of 256 threads grabs one Gaussian if in range.
+        uint load_idx = batch_start + local_idx;
+        if (load_idx < range_end) {
+            uint gid = values_sorted[load_idx];
+            s_gid    [local_idx] = gid;
+            s_mean_x [local_idx] = means2D      [gid * 2u + 0u];
+            s_mean_y [local_idx] = means2D      [gid * 2u + 1u];
+            s_conic_a[local_idx] = conic_opacity[gid * 4u + 0u];
+            s_conic_b[local_idx] = conic_opacity[gid * 4u + 1u];
+            s_conic_c[local_idx] = conic_opacity[gid * 4u + 2u];
+            s_opacity[local_idx] = conic_opacity[gid * 4u + 3u];
+            s_rgb_r  [local_idx] = rgb          [gid * 3u + 0u];
+            s_rgb_g  [local_idx] = rgb          [gid * 3u + 1u];
+            s_rgb_b  [local_idx] = rgb          [gid * 3u + 2u];
+        }
+        barrier();  // wait for all loads before any thread reads shared arrays
+
+        // 2. Per-pixel alpha blend for this batch.
+        uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+        if (!pixel_done) {
+            for (uint k = 0u; k < batch_size; ++k) {
+                float dx = float(pixel_x) - s_mean_x[k];
+                float dy = float(pixel_y) - s_mean_y[k];
+                // Power of unnormalised 2D Gaussian in inverse-covariance form.
+                // con_o.y (b) is the raw off-diagonal, not pre-halved — matches
+                // CUDA forward.cu exactly.
+                float power = -0.5 * (s_conic_a[k] * dx * dx
+                                    + s_conic_c[k] * dy * dy)
+                              - s_conic_b[k] * dx * dy;
+                if (power > 0.0) {
+                    continue;  // pixel behind peak of this (degenerate-eval'd) Gaussian
+                }
+                float alpha = min(0.99, s_opacity[k] * exp(power));
+                if (alpha < ALPHA_THRESHOLD) {
+                    continue;  // negligible contribution
+                }
+                float test_T = T * (1.0 - alpha);
+                if (test_T < T_MIN) {
+                    // Transmittance exhausted: stop blending further Gaussians
+                    // for this pixel. The triggering Gaussian is NOT counted
+                    // (matches forward.cu: `done = true; continue;` before the
+                    //  accumulation block).
+                    pixel_done = true;
+                    break;
+                }
+                C.r += s_rgb_r[k] * alpha * T;
+                C.g += s_rgb_g[k] * alpha * T;
+                C.b += s_rgb_b[k] * alpha * T;
+                T = test_T;
+                n += 1u;
+            }
+        }
+        barrier();  // ensure every thread finishes before next load overwrites shared
+    }
+
+    // --- Write final outputs ---
+    if (valid_pixel) {
+        uint px = pixel_y * pc.image_width + pixel_x;
+        uint HW = pc.image_width * pc.image_height;
+        // Always composite against bg; for golden fixtures bg=(0,0,0,0).
+        out_image[0u * HW + px] = C.r + T * bg_color.x;
+        out_image[1u * HW + px] = C.g + T * bg_color.y;
+        out_image[2u * HW + px] = C.b + T * bg_color.z;
+        transmittance[px] = T;
+        n_contrib[px]     = n;
+    }
+}
