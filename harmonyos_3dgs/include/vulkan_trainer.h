@@ -117,6 +117,12 @@ private:
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;
 
+    // Tracks actual binner R (total Gaussian-tile pairs) from the previous step.
+    // Used to size the FrameAllocator at the start of each step. After densification
+    // N grows, so we scale by the N ratio and add a 4× safety margin.
+    size_t last_bin_R_ = 0u;
+    size_t last_bin_N_ = 0u;
+
     // Learning rates per group — stored so step() doesn't hardcode them.
     float group_lrs_[6] = {1.6e-4f, 2.5e-3f, 1.25e-4f, 0.05f, 0.005f, 0.001f};
 

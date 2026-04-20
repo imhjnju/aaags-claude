@@ -208,9 +208,18 @@ float VulkanTrainer::step(const Camera& cam,
                           int H)
 {
     alloc_.reset();
-    // Grow arena if N has increased since last step (e.g. after densification).
-    // Budget: 6 MB base (HW pixels) + 2 KB/Gaussian covers cache + binner/sorter R pairs + grads.
-    alloc_.grow((6u << 20) + static_cast<size_t>(N_) * 2048u);
+    // Grow arena to hold this step's allocations. The dominant cost is binner+sorter
+    // R-pair arrays (R × 32 bytes). We estimate R by scaling last step's actual R by
+    // the N ratio (densification can double N) with a 4× safety margin.
+    // First step: use R/N = 100 as conservative default.
+    {
+        const size_t cur_N = static_cast<size_t>(N_);
+        const size_t est_R = (last_bin_N_ > 0)
+            ? last_bin_R_ * cur_N * 4u / last_bin_N_
+            : cur_N * 100u;
+        const size_t needed = (6u << 20) + cur_N * 300u + est_R * 32u;
+        alloc_.grow(needed);
+    }
     activate_params();
 
     // Pre-allocate ForwardCache fields that the backward passes need.
@@ -237,6 +246,9 @@ float VulkanTrainer::step(const Camera& cam,
     // 2. Tile binning
     BinningOutput bin = binner_.bin(pre, N_, cam, active_cfg, alloc_);
     cache.bin = &bin;
+    // Record actual R for next step's arena estimate.
+    last_bin_R_ = static_cast<size_t>(bin.total_pairs);
+    last_bin_N_ = static_cast<size_t>(N_);
 
     // 3. Sort
     sorter_.sort(bin, alloc_);
