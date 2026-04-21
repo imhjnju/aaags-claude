@@ -33,7 +33,7 @@ namespace {
 // TEST_DATA_DIR points at harmonyos_3dgs/tests/test_data; tiny fixture lives
 // at harmonyos_3dgs/tests/golden/tiny/step000001/cam0000 (sibling directory).
 std::string tiny_cam0_dir() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 
 // Convenience wrappers that copy an NpyArray's payload into a std::vector

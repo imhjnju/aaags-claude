@@ -56,10 +56,10 @@
 
 namespace {
 
-// Tiny fixture lives at harmonyos_3dgs/tests/golden/tiny/step000001/cam0000
-// (sibling to test_data/). Same convention as test_preprocess_pass_vk.cpp.
+// Tiny fixture lives at harmonyos_3dgs/tests/golden/tiny/step000001/cam0000.
+// TEST_DATA_DIR = harmonyos_3dgs/tests (set by CMakeLists.txt line 311).
 std::string tiny_cam0_dir() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 
 std::vector<float> npy_to_f32_vec(const NpyArray& a) {

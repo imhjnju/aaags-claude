@@ -254,7 +254,8 @@ void main() {
                 if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
                 // Per-pixel depth for k-buffer sorting.
-                // Use z_ndc + 8.0 (same +8 bias as scatter.comp sort key; ensures positivity).
+                // Use z_ndc + 8.0 (same +8 bias as scatter.comp; w_ndc is ~ constant per tile,
+                // so z_ndc alone gives correct relative ordering within a tile's pre-sorted list).
                 float sort_depth = z_ndc + 8.0;
 
                 // If k-buffer full: blend the shallowest entry, pop it.

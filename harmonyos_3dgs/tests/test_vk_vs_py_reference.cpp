@@ -43,11 +43,11 @@ namespace {
 // ---------------------------------------------------------------------------
 
 std::string tiny_cam0_dir() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 
 std::string py_ref_dir() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/py_ref";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/py_ref";
 }
 
 bool py_ref_exists() {

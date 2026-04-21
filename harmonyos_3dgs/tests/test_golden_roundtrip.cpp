@@ -7,7 +7,7 @@ namespace {
 std::string tiny_root() {
     // TEST_DATA_DIR points at harmonyos_3dgs/tests/test_data, tiny fixture at
     // harmonyos_3dgs/tests/golden/tiny/step000001/cam0000
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 }
 

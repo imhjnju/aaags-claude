@@ -36,7 +36,7 @@
 namespace {
 
 std::string tiny_cam0_dir() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 
 bool file_exists(const std::string& path) {

@@ -133,7 +133,7 @@ TEST(Densification, PruneAllOpacityBelowThresh) {
 namespace {
 
 std::string tiny_cam0_dir_dense() {
-    return std::string(TEST_DATA_DIR) + "/../golden/tiny/step000001/cam0000";
+    return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
 }
 
 std::vector<float> npy_to_f32_dense(const NpyArray& a) {
