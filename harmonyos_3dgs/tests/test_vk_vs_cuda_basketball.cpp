@@ -39,8 +39,10 @@ namespace {
 // Measured P0=25.308 dB (3-run reproducible, delta=0.000 dB) on 2026-04-21.
 // Task 9 (proper_ewa_scaling=true): P1=36.864 dB (+11.556 dB) on 2026-04-21.
 // G1 baseline locked at 36.3 dB (floor(36.864*10)/10 - 0.5).
+// Task 12 (per-pixel k-buffer HEAD_WINDOW=4): P2=40.266 dB (+3.402 dB) on 2026-04-21.
+// G2 baseline locked at 39.7 dB (floor(40.266*10)/10 - 0.5).
 // DO NOT lower this without documenting why.
-constexpr float kBaselinePSNR = 36.3f;
+constexpr float kBaselinePSNR = 39.7f;
 
 constexpr int kW = 720;
 constexpr int kH = 960;

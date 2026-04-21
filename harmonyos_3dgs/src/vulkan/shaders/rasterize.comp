@@ -180,13 +180,27 @@ void main() {
 
     if (spec_eval_3D == 1u) {
     // =================================================================
-    // eval_3D path: vanilla front-to-back blending with 3D Gaussian
-    // evaluation via gauss2screen plane equations.
-    // Reference: CUDA forward.cu:renderCUDA (EVAL_3D=true, SortMode::GLOBAL).
-    // Gaussians arrive pre-sorted by maxContribGaussianFrustum3D per-tile
-    // depth key (scatter.comp). We blend in that order — no per-pixel
-    // depth re-sorting (matches CUDA GLOBAL sort mode).
+    // eval_3D path: per-pixel k-buffer sort (HEAD_WINDOW=4).
+    // Port of CUDA PER_PIXEL_KBUFFER mode (resorted_render.cuh).
+    // Each pixel maintains a 4-entry sorted window by per-pixel NDC depth.
+    // Gaussians arrive pre-sorted by tile-center depth (global sort key).
+    // The k-buffer corrects per-pixel ordering within that global order.
     // =================================================================
+
+    // Per-pixel k-buffer: 4 sorted slots (ascending depth).
+    // All private (per-thread) — no shared memory needed.
+    const int HEAD_W = 4;
+    float kbuf_depth[HEAD_W];
+    float kbuf_alpha[HEAD_W];
+    float kbuf_r[HEAD_W];
+    float kbuf_g[HEAD_W];
+    float kbuf_b[HEAD_W];
+    int kbuf_size = 0;
+    for (int i = 0; i < HEAD_W; i++) {
+        kbuf_depth[i] = 1e30;
+        kbuf_alpha[i] = 0.0;
+        kbuf_r[i] = 0.0; kbuf_g[i] = 0.0; kbuf_b[i] = 0.0;
+    }
 
     for (uint batch_start = range_start;
          batch_start < range_end;
@@ -197,34 +211,31 @@ void main() {
         if (load_idx < range_end) {
             uint gid = values_sorted[load_idx];
             s_gid[local_idx] = gid;
-            // Load gauss2screen rows 0, 1, 3 (row 2 + row 3 for depth clip).
             for (int j = 0; j < 4; j++) {
-                s_g2s[local_idx * 16u + uint(j)]         = gauss2screen[gid * 16u + 0u * 4u + uint(j)]; // row 0
-                s_g2s[local_idx * 16u + 4u + uint(j)]    = gauss2screen[gid * 16u + 1u * 4u + uint(j)]; // row 1
-                s_g2s[local_idx * 16u + 8u + uint(j)]    = gauss2screen[gid * 16u + 2u * 4u + uint(j)]; // row 2
-                s_g2s[local_idx * 16u + 12u + uint(j)]   = gauss2screen[gid * 16u + 3u * 4u + uint(j)]; // row 3
+                s_g2s[local_idx * 16u + uint(j)]       = gauss2screen[gid * 16u + 0u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 4u + uint(j)]  = gauss2screen[gid * 16u + 1u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 8u + uint(j)]  = gauss2screen[gid * 16u + 2u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 12u + uint(j)] = gauss2screen[gid * 16u + 3u * 4u + uint(j)];
             }
-            // Read opacity from conic_opacity (slot 3) — preprocess.comp writes
-            // the dilated opacity there for both 2D and eval_3D paths.
-            s_opa[local_idx]     = conic_opacity[gid * 4u + 3u];
-            s_rgb_r[local_idx]   = rgb[gid * 3u + 0u];
-            s_rgb_g[local_idx]   = rgb[gid * 3u + 1u];
-            s_rgb_b[local_idx]   = rgb[gid * 3u + 2u];
+            s_opa[local_idx]   = conic_opacity[gid * 4u + 3u];
+            s_rgb_r[local_idx] = rgb[gid * 3u + 0u];
+            s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
+            s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
         }
         barrier();
 
-        // 2. Per-pixel eval_3D evaluation + front-to-back blending.
+        // 2. Per-pixel k-buffer insert for this batch.
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
         if (!pixel_done) {
             float fpx = float(pixel_x);
             float fpy = float(pixel_y);
 
             for (uint k = 0u; k < batch_size; ++k) {
-                // Plane equations from gauss2screen rows 0,1,3 (16-float stride).
+                // Compute per-pixel plane equations.
                 float plane_x[4], plane_y[4];
                 for (int j = 0; j < 4; j++) {
-                    plane_x[j] = s_g2s[k * 16u + uint(j)]        - s_g2s[k * 16u + 12u + uint(j)] * fpx;
-                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)]   - s_g2s[k * 16u + 12u + uint(j)] * fpy;
+                    plane_x[j] = s_g2s[k * 16u + uint(j)]      - s_g2s[k * 16u + 12u + uint(j)] * fpx;
+                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)] - s_g2s[k * 16u + 12u + uint(j)] * fpy;
                 }
 
                 float max_pos[4];
@@ -234,9 +245,7 @@ void main() {
                 float alpha = min(0.99, s_opa[k] * exp(power));
                 if (alpha < ALPHA_THRESHOLD) continue;
 
-                // Depth clip: NDC z/w must be in [-1, 1] (CUDA forward.cu:451-454).
-                // w = dot(g2s_row3, max_pos), depth = dot(g2s_row2, max_pos).
-                // Reject if depth < -w || depth > w.
+                // Depth clip.
                 float w_ndc = 0.0, z_ndc = 0.0;
                 for (int j = 0; j < 4; j++) {
                     w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
@@ -244,17 +253,63 @@ void main() {
                 }
                 if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
-                // Front-to-back alpha blending (matches CUDA vanilla path).
-                float test_T = T * (1.0 - alpha);
-                if (test_T < T_MIN) { pixel_done = true; continue; }
-                C.r += s_rgb_r[k] * alpha * T;
-                C.g += s_rgb_g[k] * alpha * T;
-                C.b += s_rgb_b[k] * alpha * T;
-                T = test_T;
-                n += 1u;
+                // Per-pixel depth for k-buffer sorting.
+                // Use z_ndc + 8.0 (same +8 bias as scatter.comp sort key; ensures positivity).
+                float sort_depth = z_ndc + 8.0;
+
+                // If k-buffer full: blend the shallowest entry, pop it.
+                if (kbuf_size == HEAD_W) {
+                    float a0 = kbuf_alpha[0];
+                    float test_T0 = T * (1.0 - a0);
+                    if (test_T0 < T_MIN) { pixel_done = true; break; }
+                    C.r += kbuf_r[0] * a0 * T;
+                    C.g += kbuf_g[0] * a0 * T;
+                    C.b += kbuf_b[0] * a0 * T;
+                    T = test_T0; n += 1u;
+                    for (int i = 1; i < HEAD_W; i++) {
+                        kbuf_depth[i-1] = kbuf_depth[i]; kbuf_alpha[i-1] = kbuf_alpha[i];
+                        kbuf_r[i-1] = kbuf_r[i]; kbuf_g[i-1] = kbuf_g[i]; kbuf_b[i-1] = kbuf_b[i];
+                    }
+                    kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+                }
+
+                if (pixel_done) break;
+
+                // Insertion-sort (ascending depth) into k-buffer.
+                float id = sort_depth, ia = alpha;
+                float ir = s_rgb_r[k], ig = s_rgb_g[k], ib = s_rgb_b[k];
+                for (int i = 0; i < HEAD_W; i++) {
+                    if (id < kbuf_depth[i]) {
+                        float td = kbuf_depth[i]; kbuf_depth[i] = id; id = td;
+                        float ta = kbuf_alpha[i]; kbuf_alpha[i] = ia; ia = ta;
+                        float tr = kbuf_r[i]; kbuf_r[i] = ir; ir = tr;
+                        float tg = kbuf_g[i]; kbuf_g[i] = ig; ig = tg;
+                        float tb = kbuf_b[i]; kbuf_b[i] = ib; ib = tb;
+                    }
+                }
+                kbuf_size += 1;
             }
         }
         barrier();
+    }
+
+    // Flush remaining k-buffer entries.
+    if (!pixel_done) {
+        for (int i = 0; i < HEAD_W; i++) {
+            if (kbuf_size <= 0) break;
+            float a0 = kbuf_alpha[0];
+            float test_T0 = T * (1.0 - a0);
+            if (test_T0 < T_MIN) { pixel_done = true; break; }
+            C.r += kbuf_r[0] * a0 * T;
+            C.g += kbuf_g[0] * a0 * T;
+            C.b += kbuf_b[0] * a0 * T;
+            T = test_T0; n += 1u;
+            for (int j = 1; j < HEAD_W; j++) {
+                kbuf_depth[j-1] = kbuf_depth[j]; kbuf_alpha[j-1] = kbuf_alpha[j];
+                kbuf_r[j-1] = kbuf_r[j]; kbuf_g[j-1] = kbuf_g[j]; kbuf_b[j-1] = kbuf_b[j];
+            }
+            kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+        }
     }
 
     } else {
