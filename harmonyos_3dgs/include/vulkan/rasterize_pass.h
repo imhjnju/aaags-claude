@@ -37,6 +37,11 @@ public:
         VkBuffer transmittance;         // WO float[H*W]
         VkBuffer n_contrib;             // WO uint[H*W]
         VkBuffer raster_ubo;            // UB  RasterizeUBO (16 bytes)
+        VkBuffer gauss2screen;          // RO float[N*16]  (binding 9, eval_3D only)
+        VkBuffer opacities_2d;          // RO float[N]     (binding 10, eval_3D only)
+        VkBuffer cov3D_inv;             // RO float[N*6]   (binding 11, eval_3D only)
+        VkBuffer mean_offset;           // RO float[N*3]   (binding 12, eval_3D only)
+        VkBuffer raster_eval3d_ubo;     // UB  96 bytes    (binding 13, eval_3D only)
     };
 
     explicit RasterizePass(VulkanContext& ctx);

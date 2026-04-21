@@ -65,7 +65,7 @@ void ScatterPass::dispatch_sync(uint32_t num_gaussians,
     pc.num_tiles_y   = num_tiles_y;
     pc.tile_w        = 16u;  // SP-2 tile size is hard-coded per spec §4.4.
     pc.tile_h        = 16u;
-    pc._pad          = 0u;
+    pc.eval_3D       = 0u;  // 2D path (eval_3D not yet wired)
 
     const uint32_t groups =
         (num_gaussians + kScatterLocalSize - 1u) / kScatterLocalSize;
@@ -89,7 +89,7 @@ void ScatterPass::record(VkCommandBuffer cmd,
     pc.num_tiles_y   = num_tiles_y;
     pc.tile_w        = 16u;
     pc.tile_h        = 16u;
-    pc._pad          = 0u;
+    pc.eval_3D       = 0u;  // 2D path (eval_3D not yet wired)
 
     const uint32_t groups =
         (num_gaussians + kScatterLocalSize - 1u) / kScatterLocalSize;

@@ -25,6 +25,9 @@ constexpr uint32_t P_VIEW_CACHE        = 15;  // [N*3] view-space position cache
 constexpr uint32_t P_HOM_W_CACHE       = 16;  // [N]   clip-space w cache for backward
 constexpr uint32_t COV2D_CACHE         = 17;  // WO float[N*3]  (fa, fb, fc) dilated cov2D
 constexpr uint32_t COV2D_DET_CACHE     = 18;  // WO float[N]    det = fa*fc - fb*fb
+constexpr uint32_t GAUSS2SCREEN = 19; // WO float[N*16] gauss2screen row-major (eval_3D only)
+constexpr uint32_t COV3D_INV    = 20; // WO float[N*6]  inverse 3D covariance upper tri (eval_3D only)
+constexpr uint32_t MEAN_OFFSET  = 21; // WO float[N*3]  world-space (pos - cam_pos) (eval_3D only)
 }  // namespace preprocess_bind
 
 // Push constants (24 bytes, spec §4.8.1)
@@ -69,6 +72,9 @@ constexpr uint32_t TILES_TOUCHED   = 4;
 constexpr uint32_t KEYS_UNSORTED   = 5;
 constexpr uint32_t VALUES_UNSORTED = 6;
 constexpr uint32_t RADIUS_F        = 7;  // float eigenvalue radius (read-only)
+constexpr uint32_t COV3D_INV    = 8;  // RO float[N*6]  inverse 3D covariance (eval_3D per-tile depth)
+constexpr uint32_t MEAN_OFFSET  = 9;  // RO float[N*3]  world-space (pos - cam_pos)
+constexpr uint32_t SCATTER_UBO  = 10; // UB ScatterUBO  (inverse_vp + eval_3D flag)
 }
 struct ScatterPushConstants {
     uint32_t num_gaussians;
@@ -76,9 +82,15 @@ struct ScatterPushConstants {
     uint32_t num_tiles_y;
     uint32_t tile_w;
     uint32_t tile_h;
-    uint32_t _pad;  // align to 24 bytes
+    uint32_t eval_3D;   // 1 = use depthAlongRay per-tile, 0 = use view-space z
 };
-static_assert(sizeof(ScatterPushConstants) == 24, "ScatterPushConstants must be 24 bytes per spec §4.8.3");
+static_assert(sizeof(ScatterPushConstants) == 24, "ScatterPushConstants must be 24 bytes");
+struct alignas(16) ScatterUBO {
+    float inverse_vp[16];   // 64B: inverse viewproj matrix (column-major)
+    float cam_pos[4];       // 16B: xyz=cam_pos, w=0
+    float img_size[4];      // 16B: x=width, y=height, z=0, w=0
+};
+static_assert(sizeof(ScatterUBO) == 96, "ScatterUBO must be 96 bytes (std140)");
 
 // --- radix_sort_count.comp bindings (spec §4.8.4) ---
 namespace radix_count_bind {
@@ -125,6 +137,11 @@ constexpr uint32_t OUT_IMAGE          = 5;
 constexpr uint32_t TRANSMITTANCE      = 6;
 constexpr uint32_t N_CONTRIB          = 7;
 constexpr uint32_t RASTER_UBO         = 8;
+constexpr uint32_t GAUSS2SCREEN      = 9;  // RO float[N*16] gauss2screen row-major
+constexpr uint32_t OPACITIES_2D      = 10; // RO float[N]    pre-dilated opacity (eval_3D)
+constexpr uint32_t COV3D_INV         = 11; // RO float[N*6]  inverse 3D covariance
+constexpr uint32_t MEAN_OFFSET       = 12; // RO float[N*3]  world-space offset
+constexpr uint32_t RASTER_EVAL3D_UBO = 13; // UB  RasterEval3DUBO (inverse_vp + cam info)
 }
 struct RasterizePushConstants {
     uint32_t num_gaussians;
@@ -143,3 +160,14 @@ struct alignas(16) RasterizeUBO {
     float _pad = 0.f;
 };
 static_assert(sizeof(RasterizeUBO) == 16, "RasterizeUBO must be 16 bytes (std140)");
+
+struct alignas(16) RasterEval3DUBO {
+    float inverse_vp[16];   // 64B: inverse viewproj matrix
+    float cam_pos[4];       // 16B: xyz=cam_pos, w=0
+    float img_size[4];      // 16B: x=width, y=height, z=0, w=0
+};
+static_assert(sizeof(RasterEval3DUBO) == 96, "RasterEval3DUBO must be 96 bytes (std140)");
+
+namespace rasterize_spec {
+constexpr uint32_t EVAL_3D = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
+}  // namespace rasterize_spec

@@ -48,6 +48,9 @@ public:
         VkBuffer p_hom_w_cache;      // binding 16, [N]   floats
         VkBuffer cov2D_cache;        // binding 17, [N*3] floats (fa, fb, fc) dilated cov2D
         VkBuffer cov2D_det_cache;    // binding 18, [N]   floats det = fa*fc - fb*fb
+        VkBuffer gauss2screen;       // WO float[N*16]  (binding 19, eval_3D only)
+        VkBuffer cov3D_inv;          // WO float[N*6]   (binding 20, eval_3D only)
+        VkBuffer mean_offset;        // WO float[N*3]   (binding 21, eval_3D only)
     };
 
     /// @param spec_training 1=training (skip SH RGB clamp), 0=inference (clamp)
