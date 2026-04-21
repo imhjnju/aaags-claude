@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     float bg_val = (bg_env && bg_env[0] == '1') ? 1.0f : 0.0f;
     config.bg_color[0] = config.bg_color[1] = config.bg_color[2] = bg_val;
     config.sh_degree = model.data.sh_degree;
-    config.eval_3D = false;
+    config.eval_3D = true;
     config.antialiasing = false;
     // PreprocessorVulkan hardcodes spec_training=1 (no upper SH clamp).
     // Match on the CPU side so Renderer::render sees consistent config.
@@ -72,10 +72,10 @@ int main(int argc, char** argv) {
         alloc_size = 2ULL * 1024 * 1024 * 1024;
 
     auto renderer = std::make_unique<Renderer>(
-        std::make_unique<PreprocessorVulkan>(ctx),
+        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D),
         std::make_unique<TileBinnerVulkan>(ctx),
         std::make_unique<SorterVulkan>(ctx),
-        std::make_unique<RasterizerVulkan>(ctx),
+        std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/config.eval_3D),
         alloc_size);
 
     // 6. Render
