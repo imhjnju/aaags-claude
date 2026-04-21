@@ -59,6 +59,14 @@ layout(std430, set = 0, binding = 4) readonly  buffer TilesIn       { int      t
 layout(std430, set = 0, binding = 5) writeonly buffer KeysOut       { uint64_t keys_unsorted[];    };
 layout(std430, set = 0, binding = 6) writeonly buffer ValuesOut     { uint     values_unsorted[];  };
 layout(std430, set = 0, binding = 7) readonly  buffer RadiusFIn     { float    radius_f_arr[];     };
+layout(std430, set = 0, binding = 8) readonly  buffer Cov3DInvIn   { float    cov3D_inv[];       };  // [N*6] inverse 3D covariance upper tri
+layout(std430, set = 0, binding = 9) readonly  buffer MeanOffsetIn { float    mean_offset[];     };  // [N*3] world-space (pos - cam_pos)
+
+layout(std140, set = 0, binding = 10) uniform ScatterUBO {
+    mat4 inverse_vp;       // 64B: inverse viewproj (column-major)
+    vec4 cam_pos_pad;      // 16B: xyz=cam_pos, w=0
+    vec4 img_size_pad;     // 16B: x=width, y=height
+} scatter_ubo;
 
 layout(push_constant) uniform PC {
     uint num_gaussians;
@@ -66,7 +74,7 @@ layout(push_constant) uniform PC {
     uint num_tiles_y;
     uint tile_w;   // 16 per spec §4.4
     uint tile_h;   // 16
-    uint _pad;
+    uint eval_3D;  // 1 = use depthAlongRay per-tile, 0 = view-space z
 } pc;
 
 // Exact match of preprocess.comp rectMin/rectMax formula & clamp. Extent is
@@ -86,6 +94,47 @@ ivec2 rectMax(vec2 p, float extent, int grid_x, int grid_y, int tile_w_i, int ti
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
+}
+
+// --- eval_3D helpers: per-tile depth via ray-Gaussian intersection ----------
+
+// Port of math_utils.cpp:632-651. Converts tile-center pixel to normalized
+// world-space direction from camera position.
+vec3 pixelToWorldDir(float px, float py) {
+    float W = scatter_ubo.img_size_pad.x;
+    float H = scatter_ubo.img_size_pad.y;
+    float ndc_x = (2.0 * px + 1.0) / W - 1.0;
+    float ndc_y = (2.0 * py + 1.0) / H - 1.0;
+    vec4 p = vec4(ndc_x, ndc_y, 0.0, 1.0);
+    vec4 wp = scatter_ubo.inverse_vp * p;
+    float w_inv = 1.0 / (wp.w + 1e-10);
+    vec3 cam = scatter_ubo.cam_pos_pad.xyz;
+    vec3 dir = vec3(wp.x * w_inv - cam.x, wp.y * w_inv - cam.y, wp.z * w_inv - cam.z);
+    float len = length(dir);
+    if (len > 1e-10) dir /= len;
+    return dir;
+}
+
+// Port of math_utils.cpp:616-630. Computes the depth along a ray direction
+// at which a Gaussian (described by its inverse 3D covariance and mean offset)
+// has maximum contribution.
+float depthAlongRay(uint idx, vec3 viewdir) {
+    float c0 = cov3D_inv[idx * 6u + 0u];
+    float c1 = cov3D_inv[idx * 6u + 1u];
+    float c2 = cov3D_inv[idx * 6u + 2u];
+    float c3 = cov3D_inv[idx * 6u + 3u];
+    float c4 = cov3D_inv[idx * 6u + 4u];
+    float c5 = cov3D_inv[idx * 6u + 5u];
+    // Sigma_inv * viewdir (symmetric 3x3 upper triangle)
+    vec3 Sv = vec3(
+        c0 * viewdir.x + c1 * viewdir.y + c2 * viewdir.z,
+        c1 * viewdir.x + c3 * viewdir.y + c4 * viewdir.z,
+        c2 * viewdir.x + c4 * viewdir.y + c5 * viewdir.z);
+    vec3 mo = vec3(mean_offset[idx * 3u], mean_offset[idx * 3u + 1u], mean_offset[idx * 3u + 2u]);
+    float num = dot(mo, Sv);
+    float den = dot(viewdir, Sv);
+    if (abs(den) < 1e-10) return length(mo);
+    return num / den;
 }
 
 void main() {
@@ -117,8 +166,17 @@ void main() {
     // so we never write past the slot space this Gaussian owns.
     for (int ty = rmn.y; ty < rmx.y && slot < cap; ++ty) {
         for (int tx = rmn.x; tx < rmx.x && slot < cap; ++tx) {
-            uint     tile_id = uint(ty) * pc.num_tiles_x + uint(tx);
-            uint64_t key     = (uint64_t(tile_id) << 32) | uint64_t(depth_bits);
+            uint tile_id = uint(ty) * pc.num_tiles_x + uint(tx);
+            // Per-tile depth key: depthAlongRay when eval_3D, else view-space z.
+            uint depth_bits_tile = depth_bits;
+            if (pc.eval_3D != 0u) {
+                float tile_cx = (float(tx) + 0.5) * float(pc.tile_w);
+                float tile_cy = (float(ty) + 0.5) * float(pc.tile_h);
+                vec3 viewdir = pixelToWorldDir(tile_cx, tile_cy);
+                float ptd = depthAlongRay(i, viewdir);
+                if (ptd > 0.0) depth_bits_tile = floatBitsToUint(ptd);
+            }
+            uint64_t key = (uint64_t(tile_id) << 32) | uint64_t(depth_bits_tile);
             keys_unsorted[offset + slot]   = key;
             values_unsorted[offset + slot] = i;
             slot++;
