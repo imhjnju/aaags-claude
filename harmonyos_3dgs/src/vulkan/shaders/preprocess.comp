@@ -952,11 +952,9 @@ void main() {
             width_3d, height_3d,
             gauss2screen, gauss2view);
 
-        // NOTE: proper_ewa_scaling = false in the CUDA golden (default).
-        // Do NOT multiply opacity by dilation_factor — the golden keeps
-        // opacity untouched.  dilation_factor only affects the gauss2screen
-        // matrix (through scale_dilated), not the opacity.
-        // opacity_3d *= dilation_factor;  // DISABLED: proper_ewa_scaling=false
+        // proper_ewa_scaling=true (matches aaa.json): scale opacity by dilation_factor.
+        // Reference: AAA-Gaussians forward.cu line 157 — `opacity *= dilation_factor`
+        opacity_3d *= dilation_factor;
         const float ALPHA_THRESHOLD = 1.0 / 255.0;
         if (opacity_3d < ALPHA_THRESHOLD) return;
 
@@ -1122,9 +1120,14 @@ void main() {
     vec3 cov2D;
     computeCov2D(position, cov3D, focal_x, focal_y, tan_fovx, tan_fovy, cov2D);
 
-    // 7. Dilate cov2D (AAA 0.3 low-pass filter; antialiasing=false for SP-2).
+    // 7. Dilate cov2D (AAA 0.3 low-pass filter).
+    // Capture pre-dilation det for proper_ewa_scaling convolution factor.
+    // Reference: AAA-Gaussians forward_common.h lines 118–142.
+    float det_orig_2d = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
     cov2D.x += 0.3;
     cov2D.z += 0.3;
+    float det_dilated_2d = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    float convolution_scaling_factor = sqrt(max(0.000025, det_orig_2d / det_dilated_2d));
 
     // 8. Determinant.
     float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
@@ -1184,16 +1187,17 @@ void main() {
     vec3 color = shToRGB(i, position, cam_pos, pc.sh_degree, pc.sh_coeffs_per_g);
 
     // 10. Opacity — GaussianData.opacities is already sigmoid-activated.
-    //     CPU: out.opacities_2d[i] = g.opacities[i] * h_conv_scaling
-    //          with antialiasing=false ⇒ h_conv_scaling = 1.0
+    //     proper_ewa_scaling=true: scale by convolution_scaling_factor.
+    //     Reference: AAA-Gaussians forward_common.h lines 118–142.
     float opacity_activated = opacities[i];
 
     // ---- Writes ----
     // 11. Packed conic_opacity.
+    // Apply convolution_scaling_factor only to stored opacity (not alpha threshold check).
     conic_opacity_packed[i*4u + 0u] = conic.x;
     conic_opacity_packed[i*4u + 1u] = conic.y;
     conic_opacity_packed[i*4u + 2u] = conic.z;
-    conic_opacity_packed[i*4u + 3u] = opacity_activated;
+    conic_opacity_packed[i*4u + 3u] = opacity_activated * convolution_scaling_factor;
 
     // 14. Per-Gaussian outputs.
     means2D[i*2u + 0u] = pixel_x;
