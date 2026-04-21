@@ -291,7 +291,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_e2e_basketball.cpp
                 tests/test_cpu_vk_compare.cpp
                 tests/test_vk_vs_py_reference.cpp
-                tests/test_vk_vs_cpu_render.cpp)
+                tests/test_vk_vs_cpu_render.cpp
+                tests/test_vk_vs_cuda_basketball.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
@@ -302,10 +303,13 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 include)            # extern/stb_image.h
             # TEST_DATA_DIR is needed by test_preprocess_pass_vk.cpp to
             # locate the tiny golden fixture (../golden/tiny/step.../cam...).
+            # CMAKE_BINARY_DIR is needed by test_vk_vs_cuda_basketball.cpp to
+            # write the diff heatmap PPM next to the build artifacts.
             target_compile_definitions(gs3d_vk_tests PRIVATE
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}"
-                TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data"
+                TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
+                CMAKE_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
                 REPO_ROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
             # E2E basketball test runs 2000 training steps — allow up to 2 hours.
             # The synchronous GPU dispatch model makes it slow on the dev machine;

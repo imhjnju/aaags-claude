@@ -209,7 +209,11 @@ git commit -m "data(golden): regenerate CUDA eval_3D golden via render_single.py
 // PSNR + per-channel PSNR + max/mean/p99 abs error, writes a spatial diff
 // heatmap PNG to CMAKE_BINARY_DIR, and asserts PSNR >= kBaselinePSNR.
 //
-// Baseline starts at G0=32.0 dB and is raised as fixes land. Target: >=60 dB.
+// Baseline starts at 5.0 dB (sentinel) and is overwritten in Task 5 after
+// measurement. The canonical golden (aaa.json features enabled) differs from
+// the prior VK-aligned reference by ~25 dB, so the initial VK-vs-canonical PSNR
+// is expected to be substantially lower than the historical 32 dB against the
+// old VK-aligned reference. Target: >=60 dB.
 
 #include <algorithm>
 #include <cmath>
@@ -221,9 +225,6 @@ git commit -m "data(golden): regenerate CUDA eval_3D golden via render_single.py
 #include <vector>
 
 #include <gtest/gtest.h>
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 #include "camera_utils.h"
 #include "image_io.h"
@@ -237,8 +238,9 @@ git commit -m "data(golden): regenerate CUDA eval_3D golden via render_single.py
 
 namespace {
 
-// G0 baseline — raised as fixes land. DO NOT lower this without documenting why.
-constexpr float kBaselinePSNR = 32.0f;
+// Initial sentinel — Task 5 overwrites this with floor(measured_PSNR*10)/10 - 0.5
+// DO NOT lower this once Task 5 has set it without documenting why.
+constexpr float kBaselinePSNR = 5.0f;
 
 constexpr int kW = 720;
 constexpr int kH = 960;
@@ -303,10 +305,11 @@ Metrics compute_metrics_hwc(const std::vector<float>& vk,
 
 void write_diff_heatmap(const std::vector<float>& vk,
                         const std::vector<float>& cuda,
-                        const std::string& out_png) {
-    std::vector<uint8_t> rgb(static_cast<size_t>(kW) * kH * 3);
-    // Max per pixel across channels; scale so 0.05 → full white.
+                        const std::string& out_ppm) {
+    // HWC float in [0,1] — writePPM will clamp + quantize to 8-bit.
+    // Max per pixel across channels; scale so abs_err of 0.05 → full white.
     const float scale = 1.0f / 0.05f;
+    std::vector<float> heat(static_cast<size_t>(kW) * kH * 3);
     for (int y = 0; y < kH; ++y) {
         for (int x = 0; x < kW; ++x) {
             size_t base = (static_cast<size_t>(y) * kW + x) * 3;
@@ -314,14 +317,13 @@ void write_diff_heatmap(const std::vector<float>& vk,
             for (int c = 0; c < 3; ++c) {
                 dmax = std::max(dmax, std::fabs(vk[base + c] - cuda[base + c]));
             }
-            uint8_t v = static_cast<uint8_t>(
-                std::clamp(dmax * scale, 0.0f, 1.0f) * 255.0f);
-            rgb[base + 0] = v;
-            rgb[base + 1] = v;
-            rgb[base + 2] = v;
+            float v = std::clamp(dmax * scale, 0.0f, 1.0f);
+            heat[base + 0] = v;
+            heat[base + 1] = v;
+            heat[base + 2] = v;
         }
     }
-    stbi_write_png(out_png.c_str(), kW, kH, 3, rgb.data(), kW * 3);
+    writePPM(out_ppm.c_str(), heat.data(), kW, kH);
 }
 
 }  // namespace
@@ -335,7 +337,8 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
     }
     if (!std::filesystem::exists(kGoldenPath)) {
         GTEST_SKIP() << "CUDA golden not generated — run "
-                        "tools/render_cuda_basketball.py. Missing: "
+                        "tools/render_single.py --raw-out ... --npy-out ... "
+                        "--hash-out ... Missing: "
                      << kGoldenPath;
     }
 
@@ -380,30 +383,26 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
 
     Metrics m = compute_metrics_hwc(vk_hwc, golden_hwc);
 
-    std::string diff_png =
-        std::string(CMAKE_BINARY_DIR) + "/vk_cuda_diff_cam0.png";
-    write_diff_heatmap(vk_hwc, golden_hwc, diff_png);
+    std::string diff_ppm =
+        std::string(CMAKE_BINARY_DIR) + "/vk_cuda_diff_cam0.ppm";
+    write_diff_heatmap(vk_hwc, golden_hwc, diff_ppm);
 
     std::printf("[VkVsCudaBasketball] PSNR=%.3f dB (R=%.2f G=%.2f B=%.2f)\n",
                 m.psnr, m.psnr_r, m.psnr_g, m.psnr_b);
     std::printf("[VkVsCudaBasketball] max_abs=%.5f mean_abs=%.5f "
                 "p99_abs=%.5f bad_pixels(>1e-3)=%d\n",
                 m.max_abs, m.mean_abs, m.p99_abs, m.num_bad);
-    std::printf("[VkVsCudaBasketball] diff heatmap → %s\n", diff_png.c_str());
+    std::printf("[VkVsCudaBasketball] diff heatmap -> %s\n", diff_ppm.c_str());
 
     EXPECT_GE(m.psnr, kBaselinePSNR)
         << "VK vs CUDA PSNR regressed below baseline " << kBaselinePSNR
-        << " dB. Inspect " << diff_png;
+        << " dB. Inspect " << diff_ppm;
 }
 ```
 
-- [ ] **Step 2: Confirm `stb_image_write.h` is available**
+- [ ] **Step 2: No extra dependencies — `writePPM` is already declared in `image_io.h`**
 
-```bash
-find harmonyos_3dgs -name "stb_image_write.h" | head -3
-```
-
-Expected: at least one path, likely `harmonyos_3dgs/third_party/stb/stb_image_write.h` or similar. If none, adjust the include path in the test. If absent entirely, add it to third_party/ before proceeding.
+The diff heatmap is written as a grayscale PPM via the existing `writePPM(path, float*, W, H)` helper. No new library required.
 
 ---
 
