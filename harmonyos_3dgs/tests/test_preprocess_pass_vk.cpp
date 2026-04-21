@@ -381,8 +381,10 @@ TEST(PreprocessPass, CullPaths_NearPlane) {
 
 // Radius cull (my_radius > max(W, H)).
 // G0 at center screen (z=5) with scale=(1000,1000,1000).
-// Projected radius ≫ max(W=64, H=64) → radius_cull triggers.
-TEST(PreprocessPass, CullPaths_RadiusCull) {
+// Projected radius ≫ max(W=64, H=64).  CUDA does NOT cull large-radius
+// Gaussians, so neither do we.  The Gaussian should be visible and cover
+// many tiles.
+TEST(PreprocessPass, LargeRadius_NotCulled) {
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan device";
 
@@ -402,10 +404,11 @@ TEST(PreprocessPass, CullPaths_RadiusCull) {
     PreprocessorVulkan pp(ctx);
     auto out = pp.process(g, makePerspCamera(), makeBasicCfg(), alloc);
 
-    EXPECT_EQ(out.radii[0], 0)         << "G0 (radius-culled) radii != 0";
-    EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (radius-culled) tiles_touched != 0";
+    // Should NOT be culled — CUDA renders large-radius Gaussians.
+    EXPECT_GT(out.radii[0], 0)         << "Large Gaussian should be visible";
+    EXPECT_GT(out.tiles_touched[0], 0) << "Large Gaussian should touch tiles";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (radius-culled) radius_f != 0.0";
+    EXPECT_GT(out.radius_f[0], 0.0f)   << "Large Gaussian should have nonzero radius_f";
 }
 
 // Zero-tiles cull (n_tiles == 0).

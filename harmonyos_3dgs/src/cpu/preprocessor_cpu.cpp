@@ -227,9 +227,8 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
             float radius_f_val = 3.33f * std::sqrt(std::max(lambda1, lambda2));
             int my_radius = static_cast<int>(std::ceil(radius_f_val));
 
-            int max_screen_dim = std::max(cam.width, cam.height);
-            if (my_radius > max_screen_dim)
-                continue;
+            // Note: no max_screen_dim cull — matches CUDA which renders
+            // large-radius Gaussians (near camera) without this check.
 
             float point_image[2] = {pixel_x, pixel_y};
             int rect_min[2], rect_max[2];

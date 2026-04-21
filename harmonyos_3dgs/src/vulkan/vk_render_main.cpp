@@ -58,8 +58,13 @@ int main(int argc, char** argv) {
     config.sh_degree = model.data.sh_degree;
     config.eval_3D = false;
     config.antialiasing = false;
-    std::printf("Config: eval_3D=%s, bg=%.0f, sh_degree=%d\n",
-                config.eval_3D ? "ON" : "OFF", bg_val, config.sh_degree);
+    // PreprocessorVulkan hardcodes spec_training=1 (no upper SH clamp).
+    // Match on the CPU side so Renderer::render sees consistent config.
+    config.training = true;
+    std::printf("Config: eval_3D=%s, training=%s, bg=%.0f, sh_degree=%d\n",
+                config.eval_3D ? "ON" : "OFF",
+                config.training ? "ON" : "OFF",
+                bg_val, config.sh_degree);
 
     // 5. Create Vulkan renderer
     size_t alloc_size = 512ULL * 1024 * 1024;
@@ -87,6 +92,20 @@ int main(int argc, char** argv) {
     const char* out_path = "output_vk.ppm";
     writePPM(out_path, image.data(), W, H);
     std::printf("Saved → %s\n", out_path);
+
+    // Dump raw float32 for precision comparison with CUDA golden.
+    // Format: raw little-endian float32, HWC layout, shape (H, W, 3).
+    {
+        const char* raw_path = "vk_float.raw";
+        size_t npx = static_cast<size_t>(W) * H * 3;
+        FILE* fp = std::fopen(raw_path, "wb");
+        if (fp) {
+            std::fwrite(image.data(), sizeof(float), npx, fp);
+            std::fclose(fp);
+            std::printf("Saved raw floats → %s (%zu floats, HWC %dx%dx3)\n",
+                        raw_path, npx, H, W);
+        }
+    }
 
     model.free();
     return 0;

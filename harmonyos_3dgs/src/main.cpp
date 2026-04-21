@@ -137,9 +137,14 @@ int main(int argc, char** argv) {
         config.eval_3D = (eval3d_env[0] == '1');
     else
         config.eval_3D = (model.data.filter_3D != nullptr);
-    printf("Antialiasing: %s, eval_3D: %s\n",
+    // TRAINING=1 disables upper SH color clamp (matches Python training mode).
+    const char* train_env = getenv("TRAINING");
+    if (train_env && train_env[0] == '1')
+        config.training = true;
+    printf("Antialiasing: %s, eval_3D: %s, training: %s\n",
            config.antialiasing ? "ON" : "OFF",
-           config.eval_3D ? "ON" : "OFF");
+           config.eval_3D ? "ON" : "OFF",
+           config.training ? "ON" : "OFF");
 
     // Diagnostic: dump first few Gaussians' raw data for cross-platform comparison
     if (getenv("DUMP_DIAG")) {

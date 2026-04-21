@@ -481,9 +481,8 @@ void main() {
     float radius_f = 3.33 * sqrt(lambda);   // float radius (used for rect)
     int   my_radius = int(ceil(radius_f));  // int radius (written to radii[])
 
-    // Radius cull: if radius > max(W,H), drop (matches CPU).
-    int max_screen_dim = int(max(width, height));
-    if (my_radius > max_screen_dim) return;
+    // Note: no max_screen_dim cull — matches CUDA which renders
+    // large-radius Gaussians (near camera) without this check.
 
     // 13. Tile AABB — uses the FLOAT radius per CUDA's rect_dims convention.
     // tile_w/tile_h fixed to 16 per spec §4.4 SP-2. Grid comes from push consts.
