@@ -26,8 +26,8 @@ ScatterPass::ScatterPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(scatter_spv),
         static_cast<std::size_t>(scatter_spv_len));
 
-    // 11 bindings: 10 SSBOs + 1 UBO (binding 10 = ScatterUBO).
-    std::vector<VkDescriptorType> binding_types(11,
+    // 12 bindings: 11 SSBOs + 1 UBO (binding 10 = ScatterUBO).
+    std::vector<VkDescriptorType> binding_types(12,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[scatter_bind::SCATTER_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
@@ -52,6 +52,7 @@ void ScatterPass::bind_buffers(const Buffers& b) {
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::RADIUS_F,        b.radius_f);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::COV3D_INV,      b.cov3D_inv);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::MEAN_OFFSET,    b.mean_offset);
+    pipeline_->update_ssbo(descriptor_set_, scatter_bind::GAUSS2SCREEN,  b.gauss2screen);
     pipeline_->update_ubo(descriptor_set_,  scatter_bind::SCATTER_UBO,
                           b.scatter_ubo, sizeof(ScatterUBO));
 }

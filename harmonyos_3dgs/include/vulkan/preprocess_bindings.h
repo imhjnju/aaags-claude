@@ -75,6 +75,7 @@ constexpr uint32_t RADIUS_F        = 7;  // float eigenvalue radius (read-only)
 constexpr uint32_t COV3D_INV    = 8;  // RO float[N*6]  inverse 3D covariance (eval_3D per-tile depth)
 constexpr uint32_t MEAN_OFFSET  = 9;  // RO float[N*3]  world-space (pos - cam_pos)
 constexpr uint32_t SCATTER_UBO  = 10; // UB ScatterUBO  (inverse_vp + eval_3D flag)
+constexpr uint32_t GAUSS2SCREEN = 11; // RO float[N*16] gauss2screen row-major (eval_3D sort key)
 }
 struct ScatterPushConstants {
     uint32_t num_gaussians;

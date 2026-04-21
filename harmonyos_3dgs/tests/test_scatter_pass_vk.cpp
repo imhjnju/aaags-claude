@@ -114,11 +114,14 @@ TEST(ScatterPassVk, TinyFixture) {
     VulkanBuffer vals_buf(ctx, static_cast<VkDeviceSize>(R) * sizeof(uint32_t));
 
     // radius_f: best approximation from int radii (no GPU preprocess output here)
-    std::vector<float> rf_host(N);
-    for (uint32_t k = 0; k < N; ++k)
-        rf_host[k] = static_cast<float>(rad_npy.i32()[k]);
-    VulkanBuffer rf_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
-    rf_buf.upload(rf_host.data(), static_cast<std::size_t>(N) * sizeof(float));
+    std::vector<float> rf_host(N * 2u);
+    for (uint32_t k = 0; k < N; ++k) {
+        float r = static_cast<float>(rad_npy.i32()[k]);
+        rf_host[k * 2u + 0u] = r;  // extent_x
+        rf_host[k * 2u + 1u] = r;  // extent_y (symmetric in 2D)
+    }
+    VulkanBuffer rf_buf(ctx, static_cast<VkDeviceSize>(N) * 2u * sizeof(float));
+    rf_buf.upload(rf_host.data(), static_cast<std::size_t>(N) * 2u * sizeof(float));
 
     m2d_buf.upload(m2d_npy.f32(), static_cast<std::size_t>(N) * 2 * sizeof(float));
     dep_buf.upload(dep_npy.f32(), static_cast<std::size_t>(N) * sizeof(float));

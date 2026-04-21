@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     // 5. Create Vulkan renderer
     size_t alloc_size = 512ULL * 1024 * 1024;
     if (model.data.count > 500000)
-        alloc_size = 2ULL * 1024 * 1024 * 1024;
+        alloc_size = 4ULL * 1024 * 1024 * 1024;
 
     auto renderer = std::make_unique<Renderer>(
         std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D),

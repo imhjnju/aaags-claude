@@ -104,10 +104,11 @@ public:
         VkBuffer tiles_touched;   // RO int[N]
         VkBuffer keys_unsorted;   // WO uint64[R]
         VkBuffer values_unsorted; // WO uint[R]
-        VkBuffer radius_f;        // RO float[N]  — float eigenvalue radius from preprocess
+        VkBuffer radius_f;        // RO float[N*2] — (extent_x, extent_y) per Gaussian from preprocess
         VkBuffer cov3D_inv;       // RO float[N*6]   (binding 8, eval_3D only)
         VkBuffer mean_offset;     // RO float[N*3]   (binding 9, eval_3D only)
         VkBuffer scatter_ubo;     // UB ScatterUBO   (binding 10, eval_3D only)
+        VkBuffer gauss2screen;    // RO float[N*16]  (binding 11, eval_3D sort key)
     };
 
     explicit ScatterPass(VulkanContext& ctx);

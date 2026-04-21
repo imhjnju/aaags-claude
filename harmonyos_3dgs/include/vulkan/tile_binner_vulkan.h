@@ -61,6 +61,7 @@ public:
                         VkBuffer radius_f,
                         VkBuffer cov3D_inv,
                         VkBuffer mean_offset,
+                        VkBuffer gauss2screen,
                         bool eval_3D,
                         const Camera& cam);
 
@@ -106,7 +107,7 @@ private:
     std::unique_ptr<VulkanBuffer> bin_m2d_buf_;   // means2D [N*2] f32
     std::unique_ptr<VulkanBuffer> bin_dep_buf_;   // depths [N] f32
     std::unique_ptr<VulkanBuffer> bin_rad_buf_;   // radii [N] i32
-    std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N] f32
+    std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N*2] f32 (extent_x, extent_y)
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
 

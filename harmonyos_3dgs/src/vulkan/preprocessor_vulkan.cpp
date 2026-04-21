@@ -101,7 +101,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto rf_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        ctx_, static_cast<VkDeviceSize>(N) * 2u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto cam_buf = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO),
@@ -227,7 +227,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     out.rgb           = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
     out.radii         = alloc.allocate_array<int>  (static_cast<std::size_t>(N));
     out.tiles_touched = alloc.allocate_array<int>  (static_cast<std::size_t>(N));
-    out.radius_f      = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    out.radius_f      = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 2);
     out.eval_3D       = eval_3D_;
     if (eval_3D_) {
         out.gauss2screen = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 16);
@@ -244,7 +244,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     rgb_buf->download(out.rgb,           static_cast<std::size_t>(N) * 3 * sizeof(float));
     rad_buf->download(out.radii,         static_cast<std::size_t>(N) * sizeof(int32_t));
     tt_buf ->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
-    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * sizeof(float));
+    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * 2 * sizeof(float));
 
     if (eval_3D_) {
         gauss2screen_buf_->download(out.gauss2screen, static_cast<std::size_t>(N) * 16 * sizeof(float));
@@ -388,7 +388,7 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     record_bufs_[kCameraUBO]           = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     record_bufs_[kRadiusF]             =
-        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 2u * sizeof(float));
     // ForwardCache output scratch buffers (bindings 14..18).
     // Always allocated so the descriptor set is fully bound. Layer-2 callers
     // that use record() don't download these — that is a Layer-1 concern.

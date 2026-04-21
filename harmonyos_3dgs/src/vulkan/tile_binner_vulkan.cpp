@@ -78,7 +78,7 @@ void TileBinnerVulkan::prepare_for_bin(uint32_t N, uint32_t num_wgs) {
         static_cast<VkDeviceSize>(N_new) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     bin_rf_buf_  = std::make_unique<VulkanBuffer>(ctx_,
-        static_cast<VkDeviceSize>(N_new) * sizeof(float),
+        static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     bin_N_ = N_new; bin_wg_ = wg_new;
@@ -197,20 +197,25 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     bin_dep_buf_->upload(pre.depths,  static_cast<std::size_t>(bytes_float_N));
     bin_rad_buf_->upload(pre.radii,   static_cast<std::size_t>(bytes_int_N));
     if (pre.radius_f != nullptr) {
-        bin_rf_buf_->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N));
+        bin_rf_buf_->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N) * 2u);
     } else {
-        std::vector<float> rf_host(static_cast<std::size_t>(N));
-        for (int k = 0; k < N; ++k)
-            rf_host[static_cast<std::size_t>(k)] = static_cast<float>(pre.radii[k]);
-        bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N));
+        // Fallback: no float extents from preprocess, use int radius for both x/y.
+        std::vector<float> rf_host(static_cast<std::size_t>(N) * 2u);
+        for (int k = 0; k < N; ++k) {
+            float r = static_cast<float>(pre.radii[k]);
+            rf_host[static_cast<std::size_t>(k) * 2u + 0u] = r;
+            rf_host[static_cast<std::size_t>(k) * 2u + 1u] = r;
+        }
+        bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N) * 2u);
     }
 
-    // eval_3D scatter buffers: upload cov3D_inv, mean_offset, and build ScatterUBO.
-    // For the 2D path, allocate minimal dummy buffers to keep descriptor set valid.
+    // eval_3D scatter buffers: upload cov3D_inv, mean_offset, gauss2screen, and
+    // build ScatterUBO. For 2D, allocate minimal dummy buffers.
     std::unique_ptr<VulkanBuffer> bin_cov3d_inv_buf;
     std::unique_ptr<VulkanBuffer> bin_mean_offset_buf;
+    std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
     std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
-    if (cfg.eval_3D && pre.cov3D_inv && pre.mean_offset) {
+    if (cfg.eval_3D && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
         bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
             static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -221,10 +226,17 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         bin_mean_offset_buf->upload(pre.mean_offset,
             static_cast<std::size_t>(N) * 3u * sizeof(float));
+        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N) * 16u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_gauss2screen_buf->upload(pre.gauss2screen,
+            static_cast<std::size_t>(N) * 16u * sizeof(float));
     } else {
         bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
     // Build ScatterUBO with inverse_vp, cam_pos, img_size.
@@ -260,6 +272,7 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     sb.cov3D_inv       = bin_cov3d_inv_buf->handle();
     sb.mean_offset     = bin_mean_offset_buf->handle();
     sb.scatter_ubo     = bin_scatter_ubo_buf->handle();
+    sb.gauss2screen    = bin_gauss2screen_buf->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
@@ -296,6 +309,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
                                       VkBuffer radius_f,
                                       VkBuffer cov3D_inv,
                                       VkBuffer mean_offset,
+                                      VkBuffer gauss2screen,
                                       bool eval_3D,
                                       const Camera& cam) {
     if (N == 0u)
@@ -359,15 +373,17 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     r_scatter_ubo_->upload(&subo, sizeof(ScatterUBO));
 
-    // For the 2D path, cov3D_inv/mean_offset may be VK_NULL_HANDLE.
+    // For the 2D path, cov3D_inv/mean_offset/gauss2screen may be VK_NULL_HANDLE.
     // Allocate a 4-byte dummy so the descriptor set stays valid.
     VkBuffer cov3d_handle   = cov3D_inv;
     VkBuffer mo_handle      = mean_offset;
+    VkBuffer g2s_handle     = gauss2screen;
     if (!eval_3D || cov3D_inv == VK_NULL_HANDLE) {
         r_dummy4_ = std::make_unique<VulkanBuffer>(
             ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         cov3d_handle = r_dummy4_->handle();
         mo_handle    = r_dummy4_->handle();
+        g2s_handle   = r_dummy4_->handle();
     }
 
     // Bind scan (input=tiles_touched, output=point_offsets, wg_sums, wg_sums2).
@@ -389,6 +405,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     sb.cov3D_inv       = cov3d_handle;
     sb.mean_offset     = mo_handle;
     sb.scatter_ubo     = r_scatter_ubo_->handle();
+    sb.gauss2screen    = g2s_handle;
     scatter_pass_->bind_buffers(sb);
 
     (void)num_tiles_x;

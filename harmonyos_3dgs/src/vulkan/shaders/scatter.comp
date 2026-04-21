@@ -27,7 +27,7 @@
 //   binding 4 = tiles_touched  (RO)   int[N]      — authoritative per-Gaussian count
 //   binding 5 = keys_unsorted  (WO)   uint64_t[R]
 //   binding 6 = values_unsorted(WO)   uint[R]
-//   binding 7 = radius_f       (RO)   float[N]    — float eigenvalue radius from preprocess
+//   binding 7 = radius_f       (RO)   float[N*2]  — (extent_x, extent_y) per Gaussian from preprocess
 // where R = sum(tiles_touched[0..N-1]).
 //
 // NUMERICAL CONTRACT (P0 scatter float-radius fix applied):
@@ -61,6 +61,7 @@ layout(std430, set = 0, binding = 6) writeonly buffer ValuesOut     { uint     v
 layout(std430, set = 0, binding = 7) readonly  buffer RadiusFIn     { float    radius_f_arr[];     };
 layout(std430, set = 0, binding = 8) readonly  buffer Cov3DInvIn   { float    cov3D_inv[];       };  // [N*6] inverse 3D covariance upper tri
 layout(std430, set = 0, binding = 9) readonly  buffer MeanOffsetIn { float    mean_offset[];     };  // [N*3] world-space (pos - cam_pos)
+layout(std430, set = 0, binding = 11) readonly buffer Gauss2ScreenIn { float  gauss2screen_arr[];};  // [N*16] gauss2screen row-major
 
 layout(std140, set = 0, binding = 10) uniform ScatterUBO {
     mat4 inverse_vp;       // 64B: inverse viewproj (column-major)
@@ -77,64 +78,179 @@ layout(push_constant) uniform PC {
     uint eval_3D;  // 1 = use depthAlongRay per-tile, 0 = view-space z
 } pc;
 
-// Exact match of preprocess.comp rectMin/rectMax formula & clamp. Extent is
-// the float radius; upper clamp is grid_x (EXCLUSIVE) so iteration [min, max)
-// covers at most `grid_x` columns.
-ivec2 rectMin(vec2 p, float extent, int grid_x, int grid_y, int tile_w_i, int tile_h_i) {
-    int mx = int(floor((p.x - extent) / float(tile_w_i)));
-    int my = int(floor((p.y - extent) / float(tile_h_i)));
+// Exact match of preprocess.comp rectMin/rectMax formula & clamp, with separate
+// x/y extents matching CUDA's getRect(p, float2 rect_extent, ...). Upper clamp
+// is grid_x/grid_y (EXCLUSIVE) so iteration [min, max) covers the correct tiles.
+ivec2 rectMin(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w_i, int tile_h_i) {
+    int mx = int(floor((p.x - extent_x) / float(tile_w_i)));
+    int my = int(floor((p.y - extent_y) / float(tile_h_i)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
 }
 
-ivec2 rectMax(vec2 p, float extent, int grid_x, int grid_y, int tile_w_i, int tile_h_i) {
-    int mx = int(ceil((p.x + extent) / float(tile_w_i)));
-    int my = int(ceil((p.y + extent) / float(tile_h_i)));
+ivec2 rectMax(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w_i, int tile_h_i) {
+    int mx = int(ceil((p.x + extent_x) / float(tile_w_i)));
+    int my = int(ceil((p.y + extent_y) / float(tile_h_i)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
 }
 
-// --- eval_3D helpers: per-tile depth via ray-Gaussian intersection ----------
+// --- eval_3D helpers: frustum-based per-tile depth key ---------------------
+// Ported from preprocess.comp (math_utils.cpp). These implement the
+// maxContribGaussianFrustum3D algorithm used by CUDA AAA-Gaussians to compute
+// per-tile sort keys that find the closest approach depth of each Gaussian
+// within a tile's pixel frustum.
 
-// Port of math_utils.cpp:632-651. Converts tile-center pixel to normalized
-// world-space direction from camera position.
-vec3 pixelToWorldDir(float px, float py) {
-    float W = scatter_ubo.img_size_pad.x;
-    float H = scatter_ubo.img_size_pad.y;
-    float ndc_x = (2.0 * px + 1.0) / W - 1.0;
-    float ndc_y = (2.0 * py + 1.0) / H - 1.0;
-    vec4 p = vec4(ndc_x, ndc_y, 0.0, 1.0);
-    vec4 wp = scatter_ubo.inverse_vp * p;
-    float w_inv = 1.0 / (wp.w + 1e-10);
-    vec3 cam = scatter_ubo.cam_pos_pad.xyz;
-    vec3 dir = vec3(wp.x * w_inv - cam.x, wp.y * w_inv - cam.y, wp.z * w_inv - cam.z);
-    float len = length(dir);
-    if (len > 1e-10) dir /= len;
-    return dir;
+// Port of math_utils.cpp:186-207.
+float maxContribRay(float plane_a[4], float plane_b[4], out float max_pos[4]) {
+    float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
+    float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
+    float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
+
+    float mx = plane_a[3]*plane_b[0] - plane_a[0]*plane_b[3];
+    float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
+    float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
+
+    float dd = dx*dx + dy*dy + dz*dz;
+    float m_div_dd[3] = float[3](mx/dd, my/dd, mz/dd);
+
+    max_pos[0] = dy*m_div_dd[2] - dz*m_div_dd[1];
+    max_pos[1] = dz*m_div_dd[0] - dx*m_div_dd[2];
+    max_pos[2] = dx*m_div_dd[1] - dy*m_div_dd[0];
+    max_pos[3] = 1.0;
+
+    return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
 }
 
-// Port of math_utils.cpp:616-630. Computes the depth along a ray direction
-// at which a Gaussian (described by its inverse 3D covariance and mean offset)
-// has maximum contribution.
-float depthAlongRay(uint idx, vec3 viewdir) {
-    float c0 = cov3D_inv[idx * 6u + 0u];
-    float c1 = cov3D_inv[idx * 6u + 1u];
-    float c2 = cov3D_inv[idx * 6u + 2u];
-    float c3 = cov3D_inv[idx * 6u + 3u];
-    float c4 = cov3D_inv[idx * 6u + 4u];
-    float c5 = cov3D_inv[idx * 6u + 5u];
-    // Sigma_inv * viewdir (symmetric 3x3 upper triangle)
-    vec3 Sv = vec3(
-        c0 * viewdir.x + c1 * viewdir.y + c2 * viewdir.z,
-        c1 * viewdir.x + c3 * viewdir.y + c4 * viewdir.z,
-        c2 * viewdir.x + c4 * viewdir.y + c5 * viewdir.z);
-    vec3 mo = vec3(mean_offset[idx * 3u], mean_offset[idx * 3u + 1u], mean_offset[idx * 3u + 2u]);
-    float num = dot(mo, Sv);
-    float den = dot(viewdir, Sv);
-    if (abs(den) < 1e-10) return length(mo);
-    return num / den;
+// Port of consistent_common.cuh:80-87 max_contrib_plane.
+// g2s is stored row-major: g2s[r*4+c] = M_{r,c} where M = W2S * G2W.
+// CUDA stores transpose(M) in column-major then does transpose(g2s)*v = M*v.
+// With our row-major layout, M*v = sum_j g2s[i*4+j] * v[j].
+float maxContribPlane(float plane[4], float g2s[16], out float max_pos_screen[4]) {
+    float norm = plane[3] / (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]);
+    // CUDA: max_pos_gauss = -plane * norm (all 4 components)
+    // but screen transform uses vec4(vec3(max_pos_gauss), 1.0) — w forced to 1.0.
+    float max_pos_gauss_screen[4] = float[4](-plane[0]*norm, -plane[1]*norm, -plane[2]*norm, 1.0);
+
+    for (int ii = 0; ii < 4; ii++) {
+        max_pos_screen[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++)
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss_screen[jj];
+    }
+    return plane[3] * norm;  // = -(-plane.w * norm) = -max_pos_gauss.w
+}
+
+// Port of math_utils.cpp:224-234.
+bool inScreenRange_d(float pos_screen[4], float range_from[3],
+                     float extent[3], int dim, out float d) {
+    d = pos_screen[dim] - range_from[dim] * pos_screen[3];
+    return d > 0.0 && d < extent[dim] * pos_screen[3];
+}
+
+bool inScreenRange(float pos_screen[4], float range_from[3],
+                   float extent[3], int dim) {
+    float d;
+    return inScreenRange_d(pos_screen, range_from, extent, dim, d);
+}
+
+// Port of consistent_common.cuh:108-113 max_contrib_ray (screen version).
+// Row-major g2s: M*v = sum_j g2s[i*4+j] * v[j].
+float maxContribRayScreen(float plane_a[4], float plane_b[4],
+                           float g2s[16], out float max_pos_screen[4]) {
+    float max_pos_gauss[4];
+    float contrib = maxContribRay(plane_a, plane_b, max_pos_gauss);
+    for (int ii = 0; ii < 4; ii++) {
+        max_pos_screen[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++)
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss[jj];
+    }
+    return contrib;
+}
+
+// Port of math_utils.cpp:253-340. Returns 0.5 * max_contrib.
+float maxContribGaussianFrustum3D(
+    float screen_min_x, float screen_min_y,
+    float screen_max_x, float screen_max_y,
+    float g2s[16], out float max_pos_depth)
+{
+    float max_contrib = 1e30;
+    float max_pos_screen[4] = float[4](1.0, 1.0, 1.0, 1.0);
+
+    float RANGE_FROM[3] = float[3](screen_min_x, screen_min_y, -1.0);
+    float EXTENT[3] = float[3](screen_max_x - screen_min_x, screen_max_y - screen_min_y, 2.0);
+
+    float mean_screen[4] = float[4](g2s[0*4+3], g2s[1*4+3], g2s[2*4+3], g2s[3*4+3]);
+
+    float d[3];
+    bool between_x = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 0, d[0]);
+    bool between_y = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 1, d[1]);
+    bool between_z = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 2, d[2]);
+
+    if (between_x && between_y && between_z) {
+        for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = mean_screen[ii];
+        max_contrib = 0.0;
+    } else {
+        float dx_sign = (d[0] - (EXTENT[0]*0.5 * mean_screen[3])) >= 0.0 ? EXTENT[0]*0.5 : -EXTENT[0]*0.5;
+        float dy_sign = (d[1] - (EXTENT[1]*0.5 * mean_screen[3])) >= 0.0 ? EXTENT[1]*0.5 : -EXTENT[1]*0.5;
+
+        float cx = RANGE_FROM[0] + EXTENT[0]*0.5 + dx_sign;
+        float cy = RANGE_FROM[1] + EXTENT[1]*0.5 + dy_sign;
+
+        float closer_plane_x[4];
+        float closer_plane_y[4];
+        for (int ii = 0; ii < 4; ii++) {
+            closer_plane_x[ii] = g2s[0*4+ii] - g2s[3*4+ii] * cx;
+            closer_plane_y[ii] = g2s[1*4+ii] - g2s[3*4+ii] * cy;
+        }
+
+        float pos_screen[4];
+        float contrib;
+
+        contrib = maxContribPlane(closer_plane_x, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 1) &&
+            inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        contrib = maxContribPlane(closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 0) &&
+            inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        contrib = maxContribRayScreen(closer_plane_x, closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        float other_plane_y[4];
+        float ocy = RANGE_FROM[1] + EXTENT[1]*0.5 - dy_sign;
+        for (int ii = 0; ii < 4; ii++)
+            other_plane_y[ii] = g2s[1*4+ii] - g2s[3*4+ii] * ocy;
+        contrib = maxContribRayScreen(closer_plane_x, other_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        float other_plane_x[4];
+        float ocx = RANGE_FROM[0] + EXTENT[0]*0.5 - dx_sign;
+        for (int ii = 0; ii < 4; ii++)
+            other_plane_x[ii] = g2s[0*4+ii] - g2s[3*4+ii] * ocx;
+        contrib = maxContribRayScreen(other_plane_x, closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+    }
+
+    max_pos_depth = max_pos_screen[2] / max_pos_screen[3];
+    return 0.5 * max_contrib;
 }
 
 void main() {
@@ -147,34 +263,49 @@ void main() {
     if (n_slots == 0) return;
 
     vec2  pix = vec2(means2D[i*2u + 0u], means2D[i*2u + 1u]);
-    float r   = radius_f_arr[i];  // float eigenvalue radius from preprocess (binding 7)
+    float extent_x = radius_f_arr[i*2u + 0u];  // separate x/y extents from preprocess
+    float extent_y = radius_f_arr[i*2u + 1u];
 
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);
     int tw     = int(pc.tile_w);
     int th     = int(pc.tile_h);
 
-    ivec2 rmn = rectMin(pix, r, grid_x, grid_y, tw, th);
-    ivec2 rmx = rectMax(pix, r, grid_x, grid_y, tw, th);
+    ivec2 rmn = rectMin(pix, extent_x, extent_y, grid_x, grid_y, tw, th);
+    ivec2 rmx = rectMax(pix, extent_x, extent_y, grid_x, grid_y, tw, th);
 
     uint depth_bits = floatBitsToUint(depths[i]);
     uint offset     = point_offsets[i];
     uint slot       = 0u;
     uint cap        = uint(n_slots);
 
+    // Load gauss2screen 4x4 matrix once per Gaussian for eval_3D sort key.
+    float g2s[16];
+    if (pc.eval_3D != 0u) {
+        for (int k = 0; k < 16; k++)
+            g2s[k] = gauss2screen_arr[i * 16u + uint(k)];
+    }
+
     // Iterate [rmn, rmx) row-major. Hard-cap writes at cap=tiles_touched[i]
     // so we never write past the slot space this Gaussian owns.
     for (int ty = rmn.y; ty < rmx.y && slot < cap; ++ty) {
         for (int tx = rmn.x; tx < rmx.x && slot < cap; ++tx) {
             uint tile_id = uint(ty) * pc.num_tiles_x + uint(tx);
-            // Per-tile depth key: depthAlongRay when eval_3D, else view-space z.
+            // Per-tile depth key: frustum closest-approach when eval_3D, else view-space z.
             uint depth_bits_tile = depth_bits;
             if (pc.eval_3D != 0u) {
-                float tile_cx = (float(tx) + 0.5) * float(pc.tile_w);
-                float tile_cy = (float(ty) + 0.5) * float(pc.tile_h);
-                vec3 viewdir = pixelToWorldDir(tile_cx, tile_cy);
-                float ptd = depthAlongRay(i, viewdir);
-                if (ptd > 0.0) depth_bits_tile = floatBitsToUint(ptd);
+                float screen_min_x = float(tx) * float(pc.tile_w);
+                float screen_min_y = float(ty) * float(pc.tile_h);
+                float screen_max_x = float(tx + 1) * float(pc.tile_w) - 1.0;
+                float screen_max_y = float(ty + 1) * float(pc.tile_h) - 1.0;
+                float max_pos_depth;
+                maxContribGaussianFrustum3D(
+                    screen_min_x, screen_min_y,
+                    screen_max_x, screen_max_y,
+                    g2s, max_pos_depth);
+                // +8.0 bias matches CUDA (AAA-Gaussians forward.cu).
+                // Makes negative depths sort correctly as positive IEEE floats.
+                depth_bits_tile = floatBitsToUint(max_pos_depth + 8.0);
             }
             uint64_t key = (uint64_t(tile_id) << 32) | uint64_t(depth_bits_tile);
             keys_unsorted[offset + slot]   = key;
@@ -183,14 +314,17 @@ void main() {
         }
     }
 
-    // If the scatter-computed rect had fewer tiles than `cap` (the
-    // theoretically-smaller preprocess rect touched more), the remaining
-    // slots remain unwritten. This should not happen — preprocess uses the
-    // smaller float radius, so its rect is a SUBSET of ours. Formally:
-    //   slot == min(rect_area, cap) at loop exit, and rect_area >= cap.
-    // We don't zero-fill the tail: the caller allocated exactly R slots and
-    // the radix sort that follows is stable on whichever keys are written.
-    // (If slot < cap, subsequent slots contain stale memory. T10 test MUST
-    //  verify slot == cap post-dispatch via a host-side assert, or this
-    //  shader must be upgraded to read a true `radii_f` SSBO.)
+    // Invariant: slot == cap at loop exit.
+    //
+    // Preprocess and scatter MUST compute identical tile rects:
+    //   preprocess: rectMin/Max(center_3d, r_3d, ...)  [preprocess.comp]
+    //   scatter:    rectMin/Max(pix, r, ...)            [this file]
+    //   where pix = means2D = AABB center, r = radius_f_arr = r_3d.
+    //
+    // For 2D path: r = radius_f (float eigenvalue radius), pix = projected pixel.
+    // For eval_3D: r = max(extent_x, extent_y), pix = AABB center.
+    // Both paths: preprocess stores the same (pix, r) that scatter reads.
+    //
+    // If this invariant breaks (slot < cap), unwritten slots contain stale
+    // memory that pollutes the radix sort input — a silent correctness bug.
 }

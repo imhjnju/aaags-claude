@@ -367,12 +367,13 @@ TEST(PreprocessPass, CullPaths_NearPlane) {
     EXPECT_EQ(out.radii[0], 0)         << "G0 (near-plane) radii != 0";
     EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (near-plane) tiles_touched != 0";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (near-plane) radius_f != 0.0";
+    EXPECT_EQ(out.radius_f[0*2], 0.0f)   << "G0 (near-plane) radius_f_x != 0.0";
+    EXPECT_EQ(out.radius_f[0*2+1], 0.0f) << "G0 (near-plane) radius_f_y != 0.0";
 
     // G1: visible — control check.
     EXPECT_GT(out.radii[1], 0)         << "G1 (visible) radii should be > 0";
     EXPECT_GT(out.tiles_touched[1], 0) << "G1 (visible) tiles_touched should be > 0";
-    EXPECT_GT(out.radius_f[1], 0.0f)   << "G1 (visible) radius_f should be > 0";
+    EXPECT_GT(out.radius_f[1*2], 0.0f)   << "G1 (visible) radius_f_x should be > 0";
 }
 
 // Radius cull (my_radius > max(W, H)).
@@ -404,7 +405,7 @@ TEST(PreprocessPass, LargeRadius_NotCulled) {
     EXPECT_GT(out.radii[0], 0)         << "Large Gaussian should be visible";
     EXPECT_GT(out.tiles_touched[0], 0) << "Large Gaussian should touch tiles";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_GT(out.radius_f[0], 0.0f)   << "Large Gaussian should have nonzero radius_f";
+    EXPECT_GT(out.radius_f[0*2], 0.0f)   << "Large Gaussian should have nonzero radius_f";
 }
 
 // Zero-tiles cull (n_tiles == 0).
@@ -435,5 +436,5 @@ TEST(PreprocessPass, CullPaths_ZeroTiles) {
     EXPECT_EQ(out.radii[0], 0)         << "G0 (zero-tiles) radii != 0";
     EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (zero-tiles) tiles_touched != 0";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (zero-tiles) radius_f != 0.0";
+    EXPECT_EQ(out.radius_f[0*2], 0.0f)   << "G0 (zero-tiles) radius_f != 0.0";
 }

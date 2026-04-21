@@ -120,12 +120,11 @@ shared float s_rgb_g  [256];
 shared float s_rgb_b  [256];
 shared uint  s_gid    [256];
 
-// eval_3D shared memory: gauss2screen rows 0,1,3 (12 floats per Gaussian),
-// opacity, depth fallback. s_rgb_r/g/b and s_gid are reused from 2D path.
-// Total eval_3D: 12*256*4 + 2*256*4 + reused = ~14.5 KB + 4 KB reused.
-shared float s_g2s  [256 * 12];  // rows 0,1,3 of gauss2screen (skip row 2)
+// eval_3D shared memory: gauss2screen all 4 rows (16 floats per Gaussian),
+// opacity. s_rgb_r/g/b and s_gid are reused from 2D path.
+// Total eval_3D: 16*256*4 + 1*256*4 + reused = ~17 KB + 4 KB reused.
+shared float s_g2s  [256 * 16];  // all 4 rows of gauss2screen (need row 2 for depth)
 shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
-shared float s_depth_f[256];     // depth fallback for depthAlongRay
 
 const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
 const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
@@ -133,9 +132,11 @@ const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
 
 // --- eval_3D helper functions ------------------------------------------------
 
-// Port of math_utils.cpp:186-207 (simplified: no max_pos output).
-// Returns squared Mahalanobis distance for pixel evaluation.
-float maxContribRayPixel(float plane_a[4], float plane_b[4]) {
+// Port of CUDA consistent_common.cuh:max_contrib_ray.
+// Returns squared Mahalanobis distance (peak exponent) and sets max_pos to
+// the closest-approach point on the ray (in Gaussian homogeneous coordinates).
+// Caller uses max_pos with g2s rows 2,3 to compute NDC depth.
+float maxContribRayPixel(float plane_a[4], float plane_b[4], out float max_pos[4]) {
     float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
     float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
     float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
@@ -143,44 +144,16 @@ float maxContribRayPixel(float plane_a[4], float plane_b[4]) {
     float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
     float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
     float dd = dx*dx + dy*dy + dz*dz;
-    // Bug review §4: guard dd→0 (Gaussian center near pixel ray → NaN).
-    if (dd < 1e-8) return 0.0;
-    return (mx*mx + my*my + mz*mz) / dd;
-}
-
-// Port of math_utils.cpp:616-630. Per-pixel depth along ray.
-float depthAlongRayGlobal(uint idx, vec3 viewdir) {
-    float c0 = cov3D_inv[idx * 6u + 0u];
-    float c1 = cov3D_inv[idx * 6u + 1u];
-    float c2 = cov3D_inv[idx * 6u + 2u];
-    float c3 = cov3D_inv[idx * 6u + 3u];
-    float c4 = cov3D_inv[idx * 6u + 4u];
-    float c5 = cov3D_inv[idx * 6u + 5u];
-    vec3 Sv = vec3(
-        c0 * viewdir.x + c1 * viewdir.y + c2 * viewdir.z,
-        c1 * viewdir.x + c3 * viewdir.y + c4 * viewdir.z,
-        c2 * viewdir.x + c4 * viewdir.y + c5 * viewdir.z);
-    vec3 mo = vec3(mean_offset[idx * 3u], mean_offset[idx * 3u + 1u], mean_offset[idx * 3u + 2u]);
-    float num = dot(mo, Sv);
-    float den = dot(viewdir, Sv);
-    if (abs(den) < 1e-10) return length(mo);
-    return num / den;
-}
-
-// Port of math_utils.cpp:632-651.
-vec3 pixelToWorldDir(float px, float py) {
-    float W = eval3d_ubo.img_size_pad.x;
-    float H = eval3d_ubo.img_size_pad.y;
-    float ndc_x = (2.0 * px + 1.0) / W - 1.0;
-    float ndc_y = (2.0 * py + 1.0) / H - 1.0;
-    vec4 p = vec4(ndc_x, ndc_y, 0.0, 1.0);
-    vec4 wp = eval3d_ubo.inverse_vp * p;
-    float w_inv = 1.0 / (wp.w + 1e-10);
-    vec3 cam = eval3d_ubo.cam_pos_pad.xyz;
-    vec3 dir = vec3(wp.x * w_inv - cam.x, wp.y * w_inv - cam.y, wp.z * w_inv - cam.z);
-    float len = length(dir);
-    if (len > 1e-10) dir /= len;
-    return dir;
+    if (dd < 1e-8) {
+        max_pos = float[4](0.0, 0.0, 0.0, 1.0);
+        return 0.0;
+    }
+    float m_div_dd[3] = float[3](mx/dd, my/dd, mz/dd);
+    max_pos[0] = dy*m_div_dd[2] - dz*m_div_dd[1];
+    max_pos[1] = dz*m_div_dd[0] - dx*m_div_dd[2];
+    max_pos[2] = dx*m_div_dd[1] - dy*m_div_dd[0];
+    max_pos[3] = 1.0;
+    return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
 }
 
 void main() {
@@ -207,17 +180,13 @@ void main() {
 
     if (spec_eval_3D == 1u) {
     // =================================================================
-    // eval_3D path: StopThePop per-pixel k-buffer sorting (K=16).
-    // Reference: rasterizer_cpu.cpp:61-135.
+    // eval_3D path: vanilla front-to-back blending with 3D Gaussian
+    // evaluation via gauss2screen plane equations.
+    // Reference: CUDA forward.cu:renderCUDA (EVAL_3D=true, SortMode::GLOBAL).
+    // Gaussians arrive pre-sorted by maxContribGaussianFrustum3D per-tile
+    // depth key (scatter.comp). We blend in that order — no per-pixel
+    // depth re-sorting (matches CUDA GLOBAL sort mode).
     // =================================================================
-    const int KBUF_K = 16;
-    float kbuf_depth[16];
-    float kbuf_alpha[16];
-    uint  kbuf_gid  [16];
-    int kcount = 0;
-
-    // Per-pixel ray direction for depthAlongRay (pixel center convention).
-    vec3 ray_dir = pixelToWorldDir(float(pixel_x) + 0.5, float(pixel_y) + 0.5);
 
     for (uint batch_start = range_start;
          batch_start < range_end;
@@ -228,11 +197,12 @@ void main() {
         if (load_idx < range_end) {
             uint gid = values_sorted[load_idx];
             s_gid[local_idx] = gid;
-            // Load gauss2screen rows 0, 1, 3 (skip row 2 — not used for plane equations).
+            // Load gauss2screen rows 0, 1, 3 (row 2 + row 3 for depth clip).
             for (int j = 0; j < 4; j++) {
-                s_g2s[local_idx * 12u + uint(j)]        = gauss2screen[gid * 16u + 0u * 4u + uint(j)]; // row 0
-                s_g2s[local_idx * 12u + 4u + uint(j)]   = gauss2screen[gid * 16u + 1u * 4u + uint(j)]; // row 1
-                s_g2s[local_idx * 12u + 8u + uint(j)]   = gauss2screen[gid * 16u + 3u * 4u + uint(j)]; // row 3
+                s_g2s[local_idx * 16u + uint(j)]         = gauss2screen[gid * 16u + 0u * 4u + uint(j)]; // row 0
+                s_g2s[local_idx * 16u + 4u + uint(j)]    = gauss2screen[gid * 16u + 1u * 4u + uint(j)]; // row 1
+                s_g2s[local_idx * 16u + 8u + uint(j)]    = gauss2screen[gid * 16u + 2u * 4u + uint(j)]; // row 2
+                s_g2s[local_idx * 16u + 12u + uint(j)]   = gauss2screen[gid * 16u + 3u * 4u + uint(j)]; // row 3
             }
             // Read opacity from conic_opacity (slot 3) — preprocess.comp writes
             // the dilated opacity there for both 2D and eval_3D paths.
@@ -240,88 +210,51 @@ void main() {
             s_rgb_r[local_idx]   = rgb[gid * 3u + 0u];
             s_rgb_g[local_idx]   = rgb[gid * 3u + 1u];
             s_rgb_b[local_idx]   = rgb[gid * 3u + 2u];
-            s_depth_f[local_idx] = 0.0; // placeholder; actual depth computed per-pixel
         }
         barrier();
 
-        // 2. Per-pixel k-buffer processing.
+        // 2. Per-pixel eval_3D evaluation + front-to-back blending.
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
         if (!pixel_done) {
-            float fpx = float(pixel_x) + 0.5;
-            float fpy = float(pixel_y) + 0.5;
+            float fpx = float(pixel_x);
+            float fpy = float(pixel_y);
 
             for (uint k = 0u; k < batch_size; ++k) {
-                // Plane equations from gauss2screen rows 0,1,3.
+                // Plane equations from gauss2screen rows 0,1,3 (16-float stride).
                 float plane_x[4], plane_y[4];
                 for (int j = 0; j < 4; j++) {
-                    plane_x[j] = s_g2s[k * 12u + uint(j)]        - s_g2s[k * 12u + 8u + uint(j)] * fpx;
-                    plane_y[j] = s_g2s[k * 12u + 4u + uint(j)]   - s_g2s[k * 12u + 8u + uint(j)] * fpy;
+                    plane_x[j] = s_g2s[k * 16u + uint(j)]        - s_g2s[k * 16u + 12u + uint(j)] * fpx;
+                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)]   - s_g2s[k * 16u + 12u + uint(j)] * fpy;
                 }
 
-                float power = -0.5 * maxContribRayPixel(plane_x, plane_y);
+                float max_pos[4];
+                float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
                 if (power > 0.0) continue;
 
                 float alpha = min(0.99, s_opa[k] * exp(power));
                 if (alpha < ALPHA_THRESHOLD) continue;
 
-                // Per-pixel depth via depthAlongRay (global memory read).
-                uint gid = s_gid[k];
-                float pix_depth = depthAlongRayGlobal(gid, ray_dir);
-                // Fallback: if depthAlongRay returns non-positive, not useful for sorting.
-                // We still insert with whatever depth we got (the Gaussian contributes).
+                // Depth clip: NDC z/w must be in [-1, 1] (CUDA forward.cu:451-454).
+                // w = dot(g2s_row3, max_pos), depth = dot(g2s_row2, max_pos).
+                // Reject if depth < -w || depth > w.
+                float w_ndc = 0.0, z_ndc = 0.0;
+                for (int j = 0; j < 4; j++) {
+                    w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
+                    z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                }
+                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
-                // Pop front if k-buffer is full: blend oldest (smallest depth) entry.
-                if (kcount >= KBUF_K) {
-                    float a = kbuf_alpha[0];
-                    uint  blend_gid = kbuf_gid[0];
-                    float test_T = T * (1.0 - a);
-                    if (test_T < T_MIN) { pixel_done = true; continue; }
-                    // RGB for popped entry: load from global memory (may be from a prior batch).
-                    C.r += rgb[blend_gid * 3u + 0u] * a * T;
-                    C.g += rgb[blend_gid * 3u + 1u] * a * T;
-                    C.b += rgb[blend_gid * 3u + 2u] * a * T;
-                    T = test_T;
-                    n += 1u;
-                    // Shift buffer left (remove front).
-                    for (int m = 0; m < KBUF_K - 1; m++) {
-                        kbuf_depth[m] = kbuf_depth[m + 1];
-                        kbuf_alpha[m] = kbuf_alpha[m + 1];
-                        kbuf_gid[m]   = kbuf_gid[m + 1];
-                    }
-                    kcount = KBUF_K - 1;
-                }
-                // Sorted insertion by depth.
-                int pos = kcount;
-                for (int m = kcount - 1; m >= 0; m--) {
-                    if (kbuf_depth[m] > pix_depth) pos = m; else break;
-                }
-                for (int m = kcount; m > pos; m--) {
-                    kbuf_depth[m] = kbuf_depth[m - 1];
-                    kbuf_alpha[m] = kbuf_alpha[m - 1];
-                    kbuf_gid[m]   = kbuf_gid[m - 1];
-                }
-                kbuf_depth[pos] = pix_depth;
-                kbuf_alpha[pos] = alpha;
-                kbuf_gid[pos]   = gid;
-                kcount++;
+                // Front-to-back alpha blending (matches CUDA vanilla path).
+                float test_T = T * (1.0 - alpha);
+                if (test_T < T_MIN) { pixel_done = true; continue; }
+                C.r += s_rgb_r[k] * alpha * T;
+                C.g += s_rgb_g[k] * alpha * T;
+                C.b += s_rgb_b[k] * alpha * T;
+                T = test_T;
+                n += 1u;
             }
         }
         barrier();
-    }
-
-    // Flush remaining k-buffer entries (front-to-back).
-    if (!pixel_done) {
-        for (int k = 0; k < kcount; k++) {
-            float a = kbuf_alpha[k];
-            uint gid = kbuf_gid[k];
-            float test_T = T * (1.0 - a);
-            if (test_T < T_MIN) break;
-            C.r += rgb[gid * 3u + 0u] * a * T;
-            C.g += rgb[gid * 3u + 1u] * a * T;
-            C.b += rgb[gid * 3u + 2u] * a * T;
-            T = test_T;
-            n += 1u;
-        }
     }
 
     } else {

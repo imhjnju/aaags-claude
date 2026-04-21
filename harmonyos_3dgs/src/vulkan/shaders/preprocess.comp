@@ -375,16 +375,16 @@ float maxContribRay(float plane_a[4], float plane_b[4], out float max_pos[4]) {
 // -----------------------------------------------------------------------------
 float maxContribPlane(float plane[4], float g2s[16], out float max_pos_screen[4]) {
     float norm = plane[3] / (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]);
-    float max_pos_gauss[4] = float[4](-plane[0]*norm, -plane[1]*norm, -plane[2]*norm, -plane[3]*norm);
+    // CUDA: max_pos_gauss = -plane * norm; screen uses vec4(vec3(..), 1.0) — w=1.0.
+    float max_pos_gauss_screen[4] = float[4](-plane[0]*norm, -plane[1]*norm, -plane[2]*norm, 1.0);
 
-    // max_pos_screen = transpose(g2s_rowmajor) * max_pos_gauss
-    // g2s is row-major: g2s[j*4+i] = element (row j, col i)
+    // max_pos_screen = M * v  where g2s is row-major: g2s[i*4+j] = M_{i,j}.
     for (int ii = 0; ii < 4; ii++) {
         max_pos_screen[ii] = 0.0;
         for (int jj = 0; jj < 4; jj++)
-            max_pos_screen[ii] += g2s[jj*4+ii] * max_pos_gauss[jj];
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss_screen[jj];
     }
-    return -max_pos_gauss[3];
+    return plane[3] * norm;  // = -max_pos_gauss.w
 }
 
 // -----------------------------------------------------------------------------
@@ -413,11 +413,11 @@ float maxContribRayScreen(float plane_a[4], float plane_b[4],
                            float g2s[16], out float max_pos_screen[4]) {
     float max_pos_gauss[4];
     float contrib = maxContribRay(plane_a, plane_b, max_pos_gauss);
-    // max_pos_screen = transpose(g2s_rowmajor) * max_pos_gauss
+    // max_pos_screen = M * v  where g2s is row-major: g2s[i*4+j] = M_{i,j}.
     for (int ii = 0; ii < 4; ii++) {
         max_pos_screen[ii] = 0.0;
         for (int jj = 0; jj < 4; jj++)
-            max_pos_screen[ii] += g2s[jj*4+ii] * max_pos_gauss[jj];
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss[jj];
     }
     return contrib;
 }
@@ -794,17 +794,17 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
 // the "+tile-1" trick; Vulkan intentionally diverges from CPU here so the
 // SP-0 tiny-fixture golden match (T7) is bit-exact.
 // -----------------------------------------------------------------------------
-ivec2 rectMin(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int(floor((p.x - extent) / float(tile_w)));
-    int my = int(floor((p.y - extent) / float(tile_h)));
+ivec2 rectMin(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(floor((p.x - extent_x) / float(tile_w)));
+    int my = int(floor((p.y - extent_y) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
 }
 
-ivec2 rectMax(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int(ceil((p.x + extent) / float(tile_w)));
-    int my = int(ceil((p.y + extent) / float(tile_h)));
+ivec2 rectMax(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(ceil((p.x + extent_x) / float(tile_w)));
+    int my = int(ceil((p.y + extent_y) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
@@ -887,7 +887,8 @@ void main() {
     // Default outputs for culled paths.
     radii[i]         = 0;
     tiles_touched[i] = 0;
-    radius_f_arr[i]  = 0.0;
+    radius_f_arr[i*2u + 0u] = 0.0;
+    radius_f_arr[i*2u + 1u] = 0.0;
 
     // Zero-fill ForwardCache fields for culled paths.
     cov3D_cache[i*6u+0u]=0.0; cov3D_cache[i*6u+1u]=0.0; cov3D_cache[i*6u+2u]=0.0;
@@ -951,7 +952,11 @@ void main() {
             width_3d, height_3d,
             gauss2screen, gauss2view);
 
-        opacity_3d *= dilation_factor;
+        // NOTE: proper_ewa_scaling = false in the CUDA golden (default).
+        // Do NOT multiply opacity by dilation_factor — the golden keeps
+        // opacity untouched.  dilation_factor only affects the gauss2screen
+        // matrix (through scale_dilated), not the opacity.
+        // opacity_3d *= dilation_factor;  // DISABLED: proper_ewa_scaling=false
         const float ALPHA_THRESHOLD = 1.0 / 255.0;
         if (opacity_3d < ALPHA_THRESHOLD) return;
 
@@ -1019,31 +1024,32 @@ void main() {
         precise float pixel_x_3d = ndc2Pix(p_hom_3d.x * p_w_3d, width_3d);
         precise float pixel_y_3d = ndc2Pix(p_hom_3d.y * p_w_3d, height_3d);
 
-        // Screen-space AABB for extent estimation
+        // View-space AABB for extent estimation.
+        // CUDA default: new_aabb=true → always uses compute_aabb_view, never
+        // compute_aabb_screen.  We must match this to produce identical tile
+        // assignments and Gaussian-tile pair counts.
         float mean2D_aabb[2];
         float extent_aabb[2];
-        bool aabb_ok = computeAABBScreen(gauss2screen, cutoff_3d, mean2D_aabb, extent_aabb);
-        if (!aabb_ok) {
-            // Fallback: view-space AABB (handles near-plane overflow)
-            aabb_ok = computeAABBView(gauss2view, p_view, focal_x_3d, focal_y_3d,
-                                      width_3d, height_3d, cutoff_3d,
-                                      mean2D_aabb, extent_aabb);
-            if (!aabb_ok) return;
-        }
+        bool aabb_ok = computeAABBView(gauss2view, p_view, focal_x_3d, focal_y_3d,
+                                       width_3d, height_3d, cutoff_3d,
+                                       mean2D_aabb, extent_aabb);
+        if (!aabb_ok) return;
 
-        int my_radius_3d = int(ceil(max(extent_aabb[0], extent_aabb[1])));
-        my_radius_3d = max(my_radius_3d, 1);
-
-        // Tile rect using integer radius
+        // Tile rect — separate x/y extents matching CUDA's getRect(p, float2).
+        // scatter.comp reads radius_f_arr[i*2+0/1] to reconstruct the identical rect.
+        float extent_x_3d = extent_aabb[0];
+        float extent_y_3d = extent_aabb[1];
         const int TILE_W = 16;
         const int TILE_H = 16;
         int grid_x_3d = int(pc.num_tiles_x);
         int grid_y_3d = int(pc.num_tiles_y);
-        vec2 pix_3d = vec2(pixel_x_3d, pixel_y_3d);
-        ivec2 rmn_3d = rectMin(pix_3d, float(my_radius_3d), grid_x_3d, grid_y_3d, TILE_W, TILE_H);
-        ivec2 rmx_3d = rectMax(pix_3d, float(my_radius_3d), grid_x_3d, grid_y_3d, TILE_W, TILE_H);
+        vec2 center_3d = vec2(mean2D_aabb[0], mean2D_aabb[1]);
+        ivec2 rmn_3d = rectMin(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
+        ivec2 rmx_3d = rectMax(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
         int n_tiles_3d = (rmx_3d.x - rmn_3d.x) * (rmx_3d.y - rmn_3d.y);
         if (n_tiles_3d == 0) return;
+        int my_radius_3d = int(ceil(max(extent_x_3d, extent_y_3d)));
+        my_radius_3d = max(my_radius_3d, 1);
 
         // SH color evaluation
         vec3 color_3d = shToRGB(i, position, cam_pos_3d, pc.sh_degree, pc.sh_coeffs_per_g);
@@ -1055,8 +1061,9 @@ void main() {
         conic_opacity_packed[i*4u + 2u] = 0.0;
         conic_opacity_packed[i*4u + 3u] = opacity_3d;
 
-        means2D[i*2u + 0u] = pixel_x_3d;
-        means2D[i*2u + 1u] = pixel_y_3d;
+        // CUDA stores AABB center as means2D in eval_3D (not projected pixel).
+        means2D[i*2u + 0u] = mean2D_aabb[0];
+        means2D[i*2u + 1u] = mean2D_aabb[1];
         depths[i]          = p_view.z;
         rgb[i*3u + 0u]     = color_3d.x;
         rgb[i*3u + 1u]     = color_3d.y;
@@ -1064,7 +1071,8 @@ void main() {
 
         radii[i]         = my_radius_3d;
         tiles_touched[i] = n_tiles_3d;
-        radius_f_arr[i]  = 0.0;  // eval_3D uses AABB extent, not eigenvalue radius
+        radius_f_arr[i*2u + 0u] = extent_x_3d;  // scatter.comp reads both to reconstruct rect
+        radius_f_arr[i*2u + 1u] = extent_y_3d;
 
         // eval_3D specific outputs
         for (uint j = 0u; j < 16u; j++) gauss2screen_out[i*16u+j] = gauss2screen[j];
@@ -1166,8 +1174,8 @@ void main() {
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);
     vec2 pix  = vec2(pixel_x, pixel_y);
-    ivec2 rmn = rectMin(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
-    ivec2 rmx = rectMax(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmn = rectMin(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmx = rectMax(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
     int n_tiles = (rmx.x - rmn.x) * (rmx.y - rmn.y);
     if (n_tiles == 0) return;
 
@@ -1197,7 +1205,8 @@ void main() {
 
     radii[i]         = my_radius;
     tiles_touched[i] = n_tiles;
-    radius_f_arr[i]  = radius_f;  // exact float radius for scatter.comp (binding 13)
+    radius_f_arr[i*2u + 0u] = radius_f;  // x/y symmetric in 2D path
+    radius_f_arr[i*2u + 1u] = radius_f;
 
     // Cache intermediates for backward pass (bindings 14..16).
     // cov3D: 6-element upper triangle computed by computeCov3D().
