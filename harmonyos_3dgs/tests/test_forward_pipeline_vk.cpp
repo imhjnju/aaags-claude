@@ -239,7 +239,12 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
             sorter.tile_ranges_buf(),
             prep.means2D_buffer(),
             prep.conic_opacity_packed_buffer(),
-            prep.rgb_buffer());
+            prep.rgb_buffer(),
+            prep.gauss2screen_buffer(),
+            VK_NULL_HANDLE,  // opacities_2d (not available in 2D path)
+            prep.cov3D_inv_buffer(),
+            prep.mean_offset_buffer(),
+            cam);
 
         VkCommandBuffer cmd = ctx.allocatePrimary();
         VkCommandBufferBeginInfo bi{};

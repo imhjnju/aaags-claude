@@ -30,7 +30,7 @@ class VulkanBuffer;
 
 class RasterizerVulkan : public Rasterizer {
 public:
-    explicit RasterizerVulkan(VulkanContext& ctx);
+    explicit RasterizerVulkan(VulkanContext& ctx, bool eval_3D = false);
     ~RasterizerVulkan() override;
 
     RasterizerVulkan(const RasterizerVulkan&)            = delete;
@@ -62,7 +62,12 @@ public:
                         VkBuffer tile_ranges,
                         VkBuffer means2D,
                         VkBuffer conic_opacity_packed,
-                        VkBuffer rgb);
+                        VkBuffer rgb,
+                        VkBuffer gauss2screen,
+                        VkBuffer opacities_2d,
+                        VkBuffer cov3D_inv,
+                        VkBuffer mean_offset,
+                        const Camera& cam);
 
     // Record the rasterize dispatch into cmd. prepare_record() must have
     // been called. No internal barrier — caller submits after this returns.
@@ -82,13 +87,16 @@ public:
 
 private:
     VulkanContext& ctx_;
+    bool eval_3D_ = false;
     std::unique_ptr<RasterizePass> pass_;
 
     // Layer-2 persistent buffers.
-    std::unique_ptr<VulkanBuffer> r_img_;       // [3*H*W]   f32 CHW
-    std::unique_ptr<VulkanBuffer> r_tfinal_;    // [H*W]     f32
-    std::unique_ptr<VulkanBuffer> r_ncontrib_;  // [H*W]     u32
-    std::unique_ptr<VulkanBuffer> r_ubo_;       // RasterizeUBO (16 bytes std140)
+    std::unique_ptr<VulkanBuffer> r_img_;           // [3*H*W]   f32 CHW
+    std::unique_ptr<VulkanBuffer> r_tfinal_;        // [H*W]     f32
+    std::unique_ptr<VulkanBuffer> r_ncontrib_;      // [H*W]     u32
+    std::unique_ptr<VulkanBuffer> r_ubo_;           // RasterizeUBO (16 bytes std140)
+    std::unique_ptr<VulkanBuffer> r_eval3d_ubo_;    // RasterEval3DUBO (96 bytes std140)
+    std::unique_ptr<VulkanBuffer> r_dummy4_;        // 4-byte dummy for unbound eval_3D SSBOs
     uint32_t r_W_   = 0;
     uint32_t r_H_   = 0;
     uint32_t r_ntx_ = 0;
