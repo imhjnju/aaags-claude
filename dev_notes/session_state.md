@@ -1,12 +1,11 @@
 # Session State
 
 ## Current Phase
-SP-6: Training gaps closed; basketball 100-step PSNR validation in progress
+VK eval_3D CUDA parity: PSNR 42.8 dB (target ≥60 dB). 17.2 dB gap remains.
 
 ## Test Counts
-- Total passing: 243 / 243 (non-Basketball, as of SP-6 T4 completion, 2026-04-19)
-- GPU tests: skipped when no device (expected)
-- Basketball test: 100-step run in progress (SP-6 T5; ~250s expected)
+- Total passing: 243 / 243 + 1 VK-vs-CUDA basketball test (PSNR=42.8 dB, baseline=42.1 dB)
+- As of 2026-04-21 (Session 8)
 
 ## Milestones
 | Milestone | Status | Sessions | Summary |
@@ -18,16 +17,20 @@ SP-6: Training gaps closed; basketball 100-step PSNR validation in progress
 | SP-4: Training integration | DONE | S4 | ForwardCache caching, GPU Adam skeleton (CpuAdam), VulkanTrainer, 216 tests |
 | SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam kernel, LR+SH schedules, DSSIM, MCMC densification, basketball E2E smoke test, 229 tests |
 | SP-6: Training gaps closed | DONE | S7 | T1-T5 done; 243/243 + basketball loss-decrease pass |
+| VK-CUDA parity (PSNR≥60dB) | IN PROGRESS | S8 | 25.3→42.8 dB; proper_ewa, tile_culling, sub-tile sort done. Need persistent TAIL buffer |
 | M0: Foundation | IN PROGRESS | — | Interleaved with Vulkan migration |
 
-## SP-6 Task Status
-| Task | Status | Commit | Tests |
-|------|--------|--------|-------|
-| T1: VkTrainingConfig + train_utils | DONE | 78ab0d1 | 241/241 |
-| T2: Regularization gradients | DONE | 63e54c9 | 241/241 |
-| T3: Position noise injection | DONE | c66afc0 | 243/243 |
-| T4: Spatial LR scale | DONE | 57ad86b | 243/243 |
-| T5: Basketball 100-step loss-decrease | DONE | 4b036e7 | PASSED 250s |
+## VK-CUDA Parity Task Status (Session 8)
+| Task | Status | PSNR Impact | Commit |
+|------|--------|-------------|--------|
+| Harness (render_single.py + gtest) | DONE | baseline=25.3 | a4dc240, fa6adc9 |
+| proper_ewa_scaling (eval_3D + 2D) | DONE | +11.6 dB | ed303bd |
+| rect_bounding + tight_opacity_bounding | DONE | 0 dB | 6ff257b |
+| tile_based_culling (INVALID sentinel) | DONE | +3.4 dB | 83ca5b1 |
+| Hierarchical sub-tile TAIL re-sort | DONE | +2.3 dB | b4cd239 |
+| HEAD_W=8, subtile_cx+2.0, z/w key | DONE | +0.2 dB | 72bd4bf |
+| Persistent cross-batch TAIL buffer | TODO | ? | — |
+| Verify ≥60 dB + lock baseline | TODO | — | — |
 
 ## Python → C++ Gaps Closed (SP-6)
 1. **Opacity reg**: `dL/d_raw_opacity += (0.01/N)*sig*(1-sig)` — after backward, before Adam upload

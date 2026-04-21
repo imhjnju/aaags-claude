@@ -1,5 +1,34 @@
 # Captain's Log
 
+## Session 8 — 2026-04-21
+
+VK eval_3D rasterizer vs CUDA golden parity push: PSNR 25.3 → 42.8 dB (17.2 dB gap remains to 60 dB target).
+
+### What was done
+1. **Harness built**: `test_vk_vs_cuda_basketball.cpp` — loads basket-aaa.ply cam0, renders VK, compares against CUDA golden (aaa.json features). PSNR regression gate with `kBaselinePSNR=42.1f`.
+2. **Feature fixes (Tasks 9-12)**:
+   - `proper_ewa_scaling` in preprocess.comp: opacity *= dilation_factor (+11.6 dB, 25.3→36.9)
+   - `rect_bounding` + `tight_opacity_bounding` in 2D path: (0 dB, 36.9→36.9)
+   - `tile_based_culling` in scatter.comp: INVALID sentinel for non-contributing tiles (+3.4 dB, 36.9→40.3)
+   - Hierarchical sub-tile TAIL re-sort in rasterize.comp: per-4×4 sub-tile depth sort (+2.3 dB, 40.3→42.6)
+   - Tuning: HEAD_W=8, subtile_cx+2.0, z/w depth key (+0.2 dB, 42.6→42.8)
+3. **Structural audit**: 5 parallel subagents audited preprocess/rasterize/tile_binning/sort/SH vs CUDA.
+4. **Deep investigation** (`hierarchical_deep_compare.md`): Confirmed opacity, alpha formula, and maxContribRayPixel are identical. HEAD sort depth bias (+8.0) is neutral. Sub-tile coarseness is the remaining structural gap.
+
+### Key findings
+- **CUDA uses 3-level cascade**: TAIL(64/4×4) → MID(8/2×2) → HEAD(4/pixel). VK only has sub-tile sort → HEAD.
+- **VK is systematically brighter** than CUDA (73% of pixels). Root cause: HEAD overflow blends entries prematurely when cross-batch depth ordering is incorrect.
+- **Error concentration**: max_abs=0.89, concentrated in mid-image (depth complexity). Worst pixels: VK ~2.8× brighter than CUDA.
+- The 17 dB gap is primarily from missing **cross-batch persistent TAIL buffer** in the rasterizer. Per-batch sub-tile sort only gives +2.3 dB.
+- `new_aabb=true` (view-space AABB): VK already uses computeAABBView, matching CUDA. ✓
+- `load_balancing=true`: pure performance, no PSNR impact.
+
+### Next steps
+- Implement persistent cross-batch TAIL buffer in rasterize.comp (stores global Gaussian IDs sorted by sub-tile-center depth across batches, flushes shallowest to HEAD with global memory loads)
+- If TAIL alone doesn't reach 60 dB: investigate upstream pipeline (sort key precision, SH evaluation differences)
+
+---
+
 ## Session 7 — 2026-04-19
 
 SP-6 training gaps closed. 243/243 tests pass (non-basketball).
