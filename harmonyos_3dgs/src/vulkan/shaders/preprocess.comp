@@ -1122,8 +1122,12 @@ void main() {
 
     // 7. Dilate cov2D (AAA 0.3 low-pass filter).
     // Capture pre-dilation det for proper_ewa_scaling convolution factor.
+    // Capture pre-dilation diagonal for rect_bounding AABB (matches CUDA which
+    // computes radius from pre-dilation cov2D, forward.cu lines 247-258).
     // Reference: AAA-Gaussians forward_common.h lines 118–142.
     float det_orig_2d = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    float cov2D_pre_dilate_x = cov2D.x;  // pre-dilation diagonal for rect_bounding
+    float cov2D_pre_dilate_z = cov2D.z;
     cov2D.x += 0.3;
     cov2D.z += 0.3;
     float det_dilated_2d = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
@@ -1148,48 +1152,67 @@ void main() {
                       -cov2D.y * det_inv, // b
                       cov2D.x * det_inv); // c
 
+    // 10. Opacity — GaussianData.opacities is already sigmoid-activated.
+    //     proper_ewa_scaling=true: scale by convolution_scaling_factor.
+    //     Reference: AAA-Gaussians forward_common.h lines 118–142.
+    //     Moved before radius computation so tight_opacity_bounding can use it.
+    float opacity_activated = opacities[i];
+    float opacity_scaled = opacity_activated * convolution_scaling_factor;
+
     // 12. Radius from eigenvalues.
     //
-    // CUDA reference (AAA-Gaussians forward.cu:239-244):
-    //   extent = 3.33f; lambda = mid + sqrt(max(0.01f, mid*mid - det));
-    //   radius = extent * sqrt(lambda);        // FLOAT
+    // CUDA reference (AAA-Gaussians forward.cu:239-258):
+    //   tight_opacity_bounding=true: extent = min(3.33, sqrt(2*log(co.w/ALPHA_THRESHOLD)))
+    //   rect_bounding=true: per-axis AABB using pre-dilation cov2D diagonal
+    //   lambda = mid + sqrt(max(0.01f, mid*mid - det));
+    //   radius = extent * sqrt(lambda);        // FLOAT (isotropic bounding radius)
     //   radii[idx] = (int) ceil(radius);        // int, for host consumer
-    //   rect_dims = (radius, radius);           // FLOAT, used by getRect
+    //   rect_dims = (extent_x, extent_y);      // FLOAT asymmetric extents for getRect
     //
     // The CPU preprocessor (preprocessor_cpu.cpp:225) uses 3.0f and 0.1f
     // AND uses the int-ceiled radius for getRect — both divergences from
     // CUDA. The Vulkan shader follows the CUDA reference so
     // PreprocessorVulkan matches the SP-0 tiny-fixture golden bit-exactly
     // (per T7 test MatchesCUDAGolden_Tiny).
+
+    // tight_opacity_bounding=true: adaptive extent from EWA-scaled opacity.
+    // CUDA uses co.w (= opacity * convolution_scaling_factor) for the threshold.
+    // Reference: forward.cu lines 237-247.
+    const float TOB_ALPHA_THRESHOLD = 1.0 / 255.0;
+    float opacity_power_threshold_val = log(opacity_scaled / TOB_ALPHA_THRESHOLD);
+    float extent_2d = min(3.33, sqrt(max(0.0, 2.0 * opacity_power_threshold_val)));
+
     float mid = 0.5 * (cov2D.x + cov2D.z);
     float disc = max(0.01, mid * mid - det);
-    float lambda = mid + sqrt(disc);        // larger eigenvalue
-    float radius_f = 3.33 * sqrt(lambda);   // float radius (used for rect)
-    int   my_radius = int(ceil(radius_f));  // int radius (written to radii[])
+    float lambda = mid + sqrt(disc);          // larger eigenvalue
+    float radius_f = extent_2d * sqrt(lambda); // float radius (isotropic, used for culling)
+    int   my_radius = int(ceil(radius_f));     // int radius (written to radii[])
+
+    // rect_bounding=true: per-axis AABB using POST-dilation cov2D diagonal.
+    // CUDA uses post-dilation values: dilateCov2D() returns dilated cov2D, then
+    // cov2D.x/cov2D.z are used directly for extent_x/y (forward.cu lines 257-258).
+    // extent_x/y clamped to isotropic radius_f to avoid overcounting.
+    float extent_x = min(extent_2d * sqrt(max(0.0, cov2D.x)), radius_f);
+    float extent_y = min(extent_2d * sqrt(max(0.0, cov2D.z)), radius_f);
 
     // Note: no max_screen_dim cull — matches CUDA which renders
     // large-radius Gaussians (near camera) without this check.
 
-    // 13. Tile AABB — uses the FLOAT radius per CUDA's rect_dims convention.
+    // 13. Tile AABB — uses the asymmetric extents per CUDA's rect_bounding convention.
     // tile_w/tile_h fixed to 16 per spec §4.4 SP-2. Grid comes from push consts.
     const int TILE_W = 16;
     const int TILE_H = 16;
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);
     vec2 pix  = vec2(pixel_x, pixel_y);
-    ivec2 rmn = rectMin(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
-    ivec2 rmx = rectMax(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmn = rectMin(pix, extent_x, extent_y, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmx = rectMax(pix, extent_x, extent_y, grid_x, grid_y, TILE_W, TILE_H);
     int n_tiles = (rmx.x - rmn.x) * (rmx.y - rmn.y);
     if (n_tiles == 0) return;
 
     // 15. SH → RGB.
     vec3 cam_pos = cam.campos_pad.xyz;
     vec3 color = shToRGB(i, position, cam_pos, pc.sh_degree, pc.sh_coeffs_per_g);
-
-    // 10. Opacity — GaussianData.opacities is already sigmoid-activated.
-    //     proper_ewa_scaling=true: scale by convolution_scaling_factor.
-    //     Reference: AAA-Gaussians forward_common.h lines 118–142.
-    float opacity_activated = opacities[i];
 
     // ---- Writes ----
     // 11. Packed conic_opacity.
@@ -1209,8 +1232,8 @@ void main() {
 
     radii[i]         = my_radius;
     tiles_touched[i] = n_tiles;
-    radius_f_arr[i*2u + 0u] = radius_f;  // x/y symmetric in 2D path
-    radius_f_arr[i*2u + 1u] = radius_f;
+    radius_f_arr[i*2u + 0u] = extent_x;  // asymmetric per rect_bounding
+    radius_f_arr[i*2u + 1u] = extent_y;
 
     // Cache intermediates for backward pass (bindings 14..16).
     // cov3D: 6-element upper triangle computed by computeCov3D().
