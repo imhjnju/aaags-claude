@@ -131,6 +131,12 @@ def main():
     parser.add_argument("--config",   type=str,
                         default=os.path.join(_AAA_DIR, "configs", "aaa.json"),
                         help="Path to AAA splatting config JSON")
+    parser.add_argument("--raw-out", type=str, default=None,
+                        help="If set, also dump HWC float32 little-endian raw bytes to this path.")
+    parser.add_argument("--npy-out", type=str, default=None,
+                        help="If set, also dump CHW float32 .npy to this path.")
+    parser.add_argument("--hash-out", type=str, default=None,
+                        help="If set, also dump SHA256(ply + cameras + aaa.json + script) to this path.")
     args = parser.parse_args()
 
     # ---- Gaussian model ----
@@ -173,6 +179,39 @@ def main():
     visible = result["visibility_filter"].sum().item()
     print(f"  Visible Gaussians: {visible:,} / {n:,}")
     print(f"  Pixel range: [{img.min():.4f}, {img.max():.4f}]")
+
+    # Optional raw/npy/hash dumps for VK-vs-CUDA harness (Plan Task 1 revised).
+    if args.raw_out or args.npy_out or args.hash_out:
+        import hashlib
+        img_cpu = img.detach().cpu().numpy().astype(np.float32)  # [3, H, W]
+        if args.npy_out:
+            os.makedirs(os.path.dirname(os.path.abspath(args.npy_out)), exist_ok=True)
+            np.save(args.npy_out, img_cpu)
+            print(f"Saved CHW npy -> {args.npy_out}")
+        if args.raw_out:
+            os.makedirs(os.path.dirname(os.path.abspath(args.raw_out)), exist_ok=True)
+            img_hwc = np.transpose(img_cpu, (1, 2, 0)).copy()  # [H, W, 3]
+            img_hwc.astype("<f4").tofile(args.raw_out)
+            print(f"Saved HWC raw -> {args.raw_out} ({os.path.getsize(args.raw_out)} bytes)")
+        if args.hash_out:
+            def _sha256_file(p):
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+            os.makedirs(os.path.dirname(os.path.abspath(args.hash_out)), exist_ok=True)
+            components = [
+                _sha256_file(args.ply),
+                _sha256_file(args.cameras),
+                _sha256_file(args.config),
+                _sha256_file(os.path.abspath(__file__)),
+                str(args.cam_id),
+            ]
+            final = hashlib.sha256("".join(components).encode()).hexdigest()
+            with open(args.hash_out, "w") as fh:
+                fh.write(final + "\n")
+            print(f"Saved hash -> {args.hash_out}")
 
     # ---- Save ----
     out = args.output
