@@ -297,8 +297,15 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
     // header) that can cause a small number of Gaussians to land in different
     // tiles than CUDA. Report the delta for visibility but do not fail.
     {
-        std::vector<float> golden_image(
-            img_npy.f32(), img_npy.f32() + img_npy.numel());
+        // Golden npy is CHW [3,H,W]; convert to HWC to match download_image().
+        const float* g_chw = img_npy.f32();
+        std::vector<float> golden_image(img_npy.numel());
+        for (int px = 0; px < HW; ++px) {
+            for (int ch = 0; ch < 3; ++ch) {
+                golden_image[static_cast<size_t>(px) * 3 + ch] =
+                    g_chw[static_cast<size_t>(ch) * HW + px];
+            }
+        }
         auto r = compare_f32(rec_out_image, golden_image,
                              /*abs_tol=*/1e-5f, /*rel_tol=*/1e-4f);
         if (!r.passed) {

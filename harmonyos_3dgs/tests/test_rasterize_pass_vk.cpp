@@ -140,8 +140,15 @@ TEST(RasterizerVulkan, Rasterize_TinyFixture) {
     std::vector<uint32_t> tile_ranges_vec(
         tr_npy.u32(), tr_npy.u32() + static_cast<size_t>(num_tiles) * 2u);
 
-    // Golden outputs.
-    std::vector<float>    golden_image(img_npy.f32(), img_npy.f32() + img_npy.numel());
+    // Golden outputs — npy is CHW [3,H,W], convert to HWC to match rasterize().
+    std::vector<float>    golden_image_chw(img_npy.f32(), img_npy.f32() + img_npy.numel());
+    std::vector<float>    golden_image(golden_image_chw.size());
+    for (int px = 0; px < H * W; ++px) {
+        for (int ch = 0; ch < 3; ++ch) {
+            golden_image[static_cast<size_t>(px) * 3 + ch] =
+                golden_image_chw[static_cast<size_t>(ch) * H * W + px];
+        }
+    }
     std::vector<float>    golden_tfinal(tfinal_npy.f32(),
                                         tfinal_npy.f32() + tfinal_npy.numel());
     std::vector<uint32_t> golden_nc(ncontrib_npy.u32(),

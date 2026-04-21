@@ -418,9 +418,21 @@ void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) {
     if (!r_img_)
         throw std::runtime_error(
             "RasterizerVulkan::download_image called before prepare_record()");
+    const uint32_t HW = H * W;
     const std::size_t bytes =
-        static_cast<std::size_t>(W) * H * 3u * sizeof(float);
+        static_cast<std::size_t>(HW) * 3u * sizeof(float);
     r_img_->download(dst, bytes);
+
+    // Convert GPU CHW layout to CPU HWC layout to match rasterize() output
+    // convention and the CPU rasterizer's pixel-major format.
+    std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
+    std::memcpy(chw.data(), dst, bytes);
+    for (uint32_t px = 0; px < HW; ++px) {
+        for (int ch = 0; ch < 3; ++ch) {
+            dst[static_cast<std::size_t>(px) * 3 + ch] =
+                chw[static_cast<std::size_t>(ch) * HW + px];
+        }
+    }
 }
 
 void RasterizerVulkan::download_cache(float* T_final, int* n_contrib,
