@@ -237,7 +237,7 @@ void main() {
     // Private (per-thread register/local memory) — no shared memory needed.
     // HEAD_W=4 matches CUDA exactly. Depth refinement comes from the TAIL
     // (sub-tile-center) re-sort upstream, not from a wider HEAD window.
-    const int HEAD_W = 4;
+    const int HEAD_W = 8;
     float kbuf_depth[HEAD_W];
     float kbuf_alpha[HEAD_W];
     float kbuf_r[HEAD_W];
@@ -254,8 +254,8 @@ void main() {
     uint stx = gl_LocalInvocationID.x / 4u;   // 0..3
     uint sty = gl_LocalInvocationID.y / 4u;   // 0..3
     uint subtile_id = sty * 4u + stx;          // 0..15
-    float subtile_cx = float(gl_WorkGroupID.x * 16u + 4u * stx) + 1.5;
-    float subtile_cy = float(gl_WorkGroupID.y * 16u + 4u * sty) + 1.5;
+    float subtile_cx = float(gl_WorkGroupID.x * 16u + 4u * stx) + 2.0;
+    float subtile_cy = float(gl_WorkGroupID.y * 16u + 4u * sty) + 2.0;
 
     // Leader thread for each sub-tile: pixel (0,0) within its 4x4 block.
     bool is_subtile_leader = ((gl_LocalInvocationID.x % 4u) == 0u) &&
@@ -327,7 +327,7 @@ void main() {
                 // behind-camera / far-plane Gaussians).
                 if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
-                float d = z_ndc + 8.0;  // sub-tile-centre depth key.
+                float d = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc) + 8.0;
 
                 // Bubble-up insertion into the ascending-depth permutation.
                 priv_depth[cnt] = d;
@@ -382,7 +382,7 @@ void main() {
                 // Per-pixel depth for HEAD k-buffer.
                 // Use z_ndc + 8.0 (same +8 bias as scatter.comp; w_ndc is ~ constant per tile,
                 // so z_ndc alone gives correct relative ordering within a tile's pre-sorted list).
-                float sort_depth = z_ndc + 8.0;
+                float sort_depth = z_ndc;
 
                 // HEAD overflow: blend shallowest entry, pop.
                 if (kbuf_size == HEAD_W) {
