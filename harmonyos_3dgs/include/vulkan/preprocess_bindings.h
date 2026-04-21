@@ -45,7 +45,7 @@ static_assert(sizeof(PreprocessPushConstants) == 24,
 // Specialization constant IDs (spec §4.5)
 namespace preprocess_spec {
 constexpr uint32_t TRAINING = 0;  // spec_training: 1=training (no clamp), 0=inference (clamp)
-constexpr uint32_t EVAL_3D  = 1;  // spec_eval_3D: always 0 in SP-2
+constexpr uint32_t EVAL_3D  = 1;  // spec_eval_3D: 0=2D conic path, 1=3D evaluation path
 }  // namespace preprocess_spec
 
 // --- prefix_sum.comp bindings (spec §4.8.2) ---

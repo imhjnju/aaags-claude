@@ -1,6 +1,6 @@
 // rasterize_pass.h -- SP-2 T17: thin owner of the rasterize.comp compute
 // pipeline (spec §4.8.7). Wraps the shader module, the compute pipeline
-// (with the 9-binding mixed SSBO+UBO layout), and one descriptor set.
+// (with 14 bindings: 12 SSBO + 2 UBO), and one descriptor set.
 //
 // The rasterize shader uses a 16x16 workgroup where one workgroup = one
 // 16x16 output tile. dispatch_sync() takes the tile grid dimensions and
@@ -8,6 +8,8 @@
 //
 // Bindings 0..7 are SSBOs (5 read-only inputs, 3 write-only outputs).
 // Binding 8 is the RasterizeUBO (background colour, 16 bytes std140).
+// Bindings 9..13 are eval_3D only (gauss2screen, opacities, cov3D_inv,
+// mean_offset, RasterEval3DUBO).
 //
 // Like PreprocessPass / ScatterPass, RasterizePass allocates its descriptor
 // set once in the constructor and updates bindings in place in bind_buffers()
@@ -26,7 +28,7 @@
 
 class RasterizePass {
 public:
-    /// All buffers wired to bindings 0..8. Names mirror rasterize_bind::.
+    /// All buffers wired to bindings 0..13. Names mirror rasterize_bind::.
     struct Buffers {
         VkBuffer values_sorted;         // RO uint[R]
         VkBuffer tile_ranges;           // RO uint[num_tiles*2] (flat pairs)
