@@ -35,9 +35,10 @@
 
 namespace {
 
-// Initial sentinel — Task 5 overwrites this with floor(measured_PSNR*10)/10 - 0.5
-// DO NOT lower this once Task 5 has set it without documenting why.
-constexpr float kBaselinePSNR = 5.0f;
+// G0 baseline locked at 24.8 dB (floor(25.308*10)/10 - 0.5).
+// Measured P0=25.308 dB (3-run reproducible, delta=0.000 dB) on 2026-04-21.
+// DO NOT lower this without documenting why.
+constexpr float kBaselinePSNR = 24.8f;
 
 constexpr int kW = 720;
 constexpr int kH = 960;
