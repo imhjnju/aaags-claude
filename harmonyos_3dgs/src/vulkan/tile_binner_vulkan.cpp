@@ -25,6 +25,8 @@
 
 #include "vulkan/tile_binner_vulkan.h"
 #include "vulkan/vk_buffer.h"
+#include "vulkan/preprocess_bindings.h"   // ScatterUBO
+#include "math_utils.h"                   // invertMatrix4x4
 
 #include <algorithm>
 #include <cstdint>
@@ -203,6 +205,49 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N));
     }
 
+    // eval_3D scatter buffers: upload cov3D_inv, mean_offset, and build ScatterUBO.
+    // For the 2D path, allocate minimal dummy buffers to keep descriptor set valid.
+    std::unique_ptr<VulkanBuffer> bin_cov3d_inv_buf;
+    std::unique_ptr<VulkanBuffer> bin_mean_offset_buf;
+    std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
+    if (cfg.eval_3D && pre.cov3D_inv && pre.mean_offset) {
+        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_cov3d_inv_buf->upload(pre.cov3D_inv,
+            static_cast<std::size_t>(N) * 6u * sizeof(float));
+        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N) * 3u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_mean_offset_buf->upload(pre.mean_offset,
+            static_cast<std::size_t>(N) * 3u * sizeof(float));
+    } else {
+        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    // Build ScatterUBO with inverse_vp, cam_pos, img_size.
+    ScatterUBO subo{};
+    {
+        float inv_vp[16];
+        if (invertMatrix4x4(cam.viewproj_matrix, inv_vp)) {
+            std::memcpy(subo.inverse_vp, inv_vp, sizeof(inv_vp));
+        }
+        subo.cam_pos[0] = cam.cam_pos[0];
+        subo.cam_pos[1] = cam.cam_pos[1];
+        subo.cam_pos[2] = cam.cam_pos[2];
+        subo.cam_pos[3] = 0.0f;
+        subo.img_size[0] = static_cast<float>(cam.width);
+        subo.img_size[1] = static_cast<float>(cam.height);
+        subo.img_size[2] = 0.0f;
+        subo.img_size[3] = 0.0f;
+    }
+    bin_scatter_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
+        sizeof(ScatterUBO),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    bin_scatter_ubo_buf->upload(&subo, sizeof(ScatterUBO));
+
     ScatterPass::Buffers sb{};
     sb.means2D         = bin_m2d_buf_->handle();
     sb.depths          = bin_dep_buf_->handle();
@@ -212,10 +257,14 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     sb.keys_unsorted   = bin_keys_buf_->handle();
     sb.values_unsorted = bin_vals_buf_->handle();
     sb.radius_f        = bin_rf_buf_ ->handle();
+    sb.cov3D_inv       = bin_cov3d_inv_buf->handle();
+    sb.mean_offset     = bin_mean_offset_buf->handle();
+    sb.scatter_ubo     = bin_scatter_ubo_buf->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
-                                 num_tiles_y);
+                                 num_tiles_y,
+                                 cfg.eval_3D);
 
     // -------------------------------------------------------------------
     // 5. Download R valid pairs into FrameAllocator-backed output.
@@ -244,7 +293,11 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
                                       VkBuffer means2D,
                                       VkBuffer depths,
                                       VkBuffer radii,
-                                      VkBuffer radius_f) {
+                                      VkBuffer radius_f,
+                                      VkBuffer cov3D_inv,
+                                      VkBuffer mean_offset,
+                                      bool eval_3D,
+                                      const Camera& cam) {
     if (N == 0u)
         throw std::runtime_error(
             "TileBinnerVulkan::prepare_record: N must be > 0");
@@ -252,12 +305,16 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         throw std::runtime_error(
             "TileBinnerVulkan::prepare_record: R_max must be > 0");
 
+    r_eval_3D_ = eval_3D;
+
     // Release old buffers first.
     r_po_buf_.reset();
     r_ws_buf_.reset();
     r_ws2_buf_.reset();
     r_keys_buf_.reset();
     r_vals_buf_.reset();
+    r_scatter_ubo_.reset();
+    r_dummy4_.reset();
 
     // point_offsets[N]: exclusive scan output.
     r_po_buf_ = std::make_unique<VulkanBuffer>(
@@ -282,6 +339,37 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+    // Build ScatterUBO with inverse_vp, cam_pos, img_size.
+    ScatterUBO subo{};
+    {
+        float inv_vp[16];
+        if (invertMatrix4x4(cam.viewproj_matrix, inv_vp))
+            std::memcpy(subo.inverse_vp, inv_vp, sizeof(inv_vp));
+        subo.cam_pos[0] = cam.cam_pos[0];
+        subo.cam_pos[1] = cam.cam_pos[1];
+        subo.cam_pos[2] = cam.cam_pos[2];
+        subo.cam_pos[3] = 0.0f;
+        subo.img_size[0] = static_cast<float>(cam.width);
+        subo.img_size[1] = static_cast<float>(cam.height);
+        subo.img_size[2] = 0.0f;
+        subo.img_size[3] = 0.0f;
+    }
+    r_scatter_ubo_ = std::make_unique<VulkanBuffer>(
+        ctx_, sizeof(ScatterUBO),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    r_scatter_ubo_->upload(&subo, sizeof(ScatterUBO));
+
+    // For the 2D path, cov3D_inv/mean_offset may be VK_NULL_HANDLE.
+    // Allocate a 4-byte dummy so the descriptor set stays valid.
+    VkBuffer cov3d_handle   = cov3D_inv;
+    VkBuffer mo_handle      = mean_offset;
+    if (!eval_3D || cov3D_inv == VK_NULL_HANDLE) {
+        r_dummy4_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        cov3d_handle = r_dummy4_->handle();
+        mo_handle    = r_dummy4_->handle();
+    }
+
     // Bind scan (input=tiles_touched, output=point_offsets, wg_sums, wg_sums2).
     scan_pass_->bind_buffers_2level(tiles_touched,
                                     r_po_buf_->handle(),
@@ -298,10 +386,11 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     sb.keys_unsorted   = r_keys_buf_->handle();
     sb.values_unsorted = r_vals_buf_->handle();
     sb.radius_f        = radius_f;
+    sb.cov3D_inv       = cov3d_handle;
+    sb.mean_offset     = mo_handle;
+    sb.scatter_ubo     = r_scatter_ubo_->handle();
     scatter_pass_->bind_buffers(sb);
 
-    // num_tiles_x/_y are used only at record() time (push constant) — nothing
-    // else to stash here.
     (void)num_tiles_x;
     (void)num_tiles_y;
 }
@@ -318,7 +407,7 @@ void TileBinnerVulkan::record(VkCommandBuffer cmd,
     // dependency.
     scan_pass_->record(cmd, N);
     insert_compute_barrier(cmd);
-    scatter_pass_->record(cmd, N, num_tiles_x, num_tiles_y);
+    scatter_pass_->record(cmd, N, num_tiles_x, num_tiles_y, r_eval_3D_);
 }
 
 VkBuffer TileBinnerVulkan::keys_unsorted_buf() const {

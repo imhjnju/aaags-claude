@@ -223,7 +223,11 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
             prep.means2D_buffer(),
             prep.depths_buffer(),
             prep.radii_buffer(),
-            prep.radius_f_buffer());
+            prep.radius_f_buffer(),
+            prep.cov3D_inv_buffer(),
+            prep.mean_offset_buffer(),
+            cfg.eval_3D,
+            cam);
         sorter.prepare_record(R_ours, num_tiles,
             binner.keys_unsorted_buf(),
             binner.values_unsorted_buf());

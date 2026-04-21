@@ -120,15 +120,18 @@ public:
 
     /// Layer 1: sync dispatch of scatter.comp over `num_gaussians` threads.
     /// Tile grid parameters are required because scatter recomputes rect.
+    /// eval_3D enables per-tile depthAlongRay keys via cov3D_inv/mean_offset.
     void dispatch_sync(uint32_t num_gaussians,
                        uint32_t num_tiles_x,
-                       uint32_t num_tiles_y);
+                       uint32_t num_tiles_y,
+                       bool eval_3D = false);
 
     /// Layer 2: record into an external cmd buffer.
     void record(VkCommandBuffer cmd,
                 uint32_t num_gaussians,
                 uint32_t num_tiles_x,
-                uint32_t num_tiles_y);
+                uint32_t num_tiles_y,
+                bool eval_3D = false);
 
 private:
     VulkanContext& ctx_;
