@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <vector>
 
-RasterizePass::RasterizePass(VulkanContext& ctx)
+RasterizePass::RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D)
     : ctx_(ctx) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
     shader_ = std::make_unique<VulkanShader>(
@@ -27,22 +27,32 @@ RasterizePass::RasterizePass(VulkanContext& ctx)
         static_cast<const uint8_t*>(rasterize_spv),
         static_cast<std::size_t>(rasterize_spv_len));
 
-    // --- 2. Descriptor layout: 8 SSBOs + 1 UBO (binding 8) -----------------
-    std::vector<VkDescriptorType> binding_types(9,
+    // --- 2. Specialization constant: constant_id 0 = spec_eval_3D ----------
+    VkSpecializationMapEntry spec_entry{};
+    spec_entry.constantID = rasterize_spec::EVAL_3D;
+    spec_entry.offset     = 0u;
+    spec_entry.size       = sizeof(uint32_t);
+    VkSpecializationInfo spec_info{};
+    spec_info.mapEntryCount = 1u;
+    spec_info.pMapEntries   = &spec_entry;
+    spec_info.dataSize      = sizeof(uint32_t);
+    spec_info.pData         = &spec_eval_3D;
+
+    // --- 3. Descriptor layout: 12 SSBOs + 2 UBOs (bindings 8, 13) ----------
+    std::vector<VkDescriptorType> binding_types(14,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    binding_types[rasterize_bind::RASTER_UBO] =
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    binding_types[rasterize_bind::RASTER_UBO]        = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    binding_types[rasterize_bind::RASTER_EVAL3D_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
     pipeline_ = std::make_unique<VulkanComputePipeline>(
         ctx_,
         *shader_,
         binding_types,
         /*push_constant_bytes=*/sizeof(RasterizePushConstants),
-        /*max_descriptor_sets=*/4);
+        /*max_descriptor_sets=*/4,
+        /*spec_info=*/&spec_info);
 
-    // --- 3. Allocate the descriptor set once -------------------------------
-    // Same reasoning as PreprocessPass: the pool is sized for 4 sets and does
-    // not support free-descriptor-set. Allocate up front and update in place.
+    // --- 4. Allocate the descriptor set once -------------------------------
     descriptor_set_ = pipeline_->allocate_empty_descriptor_set();
 }
 
@@ -56,11 +66,20 @@ void RasterizePass::bind_buffers(const Buffers& b) {
     pipeline_->update_ssbo(descriptor_set_, rasterize_bind::OUT_IMAGE,            b.out_image);
     pipeline_->update_ssbo(descriptor_set_, rasterize_bind::TRANSMITTANCE,        b.transmittance);
     pipeline_->update_ssbo(descriptor_set_, rasterize_bind::N_CONTRIB,            b.n_contrib);
-    // Binding 8 is the UBO (RasterizeUBO, 16 bytes).
+    // Binding 8: RasterizeUBO (background colour, 16 bytes).
     pipeline_->update_ubo(descriptor_set_,
                           rasterize_bind::RASTER_UBO,
                           b.raster_ubo,
                           sizeof(RasterizeUBO));
+    // eval_3D bindings 9..13.
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::GAUSS2SCREEN,  b.gauss2screen);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::OPACITIES_2D,  b.opacities_2d);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::COV3D_INV,     b.cov3D_inv);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::MEAN_OFFSET,   b.mean_offset);
+    pipeline_->update_ubo(descriptor_set_,
+                          rasterize_bind::RASTER_EVAL3D_UBO,
+                          b.raster_eval3d_ubo,
+                          sizeof(RasterEval3DUBO));
 }
 
 void RasterizePass::dispatch_sync(uint32_t num_gaussians,

@@ -66,6 +66,11 @@ layout(std430, set = 0, binding = 16) writeonly buffer BufPHomWCache    { float 
 layout(std430, set = 0, binding = 17) writeonly buffer BufCov2DCache    { float cov2D_cache[];    };  // [N*3] dilated cov2D (fa, fb, fc)
 layout(std430, set = 0, binding = 18) writeonly buffer BufCov2DDetCache { float cov2D_det_cache[];};  // [N]   det = fa*fc - fb*fb
 
+// ---- eval_3D output SSBOs (bindings 19..21) --------------------------------
+layout(std430, set = 0, binding = 19) writeonly buffer BufGauss2Screen { float gauss2screen_out[]; };  // [N*16]
+layout(std430, set = 0, binding = 20) writeonly buffer BufCov3DInv     { float cov3D_inv_out[];     };  // [N*6]
+layout(std430, set = 0, binding = 21) writeonly buffer BufMeanOffset   { float mean_offset_out[];   };  // [N*3]
+
 // ---- Camera UBO (binding 12, std140, 224 bytes) -----------------------------
 layout(std140, set = 0, binding = 12) uniform CameraUBO {
     mat4 viewmatrix;           // 64B
@@ -96,6 +101,46 @@ const float SH_C3_6 = -0.5900435899266435;
 // -----------------------------------------------------------------------------
 float ndc2Pix(float v, float S) {
     return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+// -----------------------------------------------------------------------------
+// Precise mat4*vec4 helpers: force separate multiply-and-add (no FMA) so the
+// GPU produces bit-exact results matching CPU's -ffp-contract=off.
+//
+// CPU transformPoint4x3 evaluates as (left-to-right association):
+//   out[r] = ((m[r]*p[0] + m[r+4]*p[1]) + m[r+8]*p[2]) + m[r+12]
+// where m[] is column-major. With 'precise', the compiler cannot contract
+// multiply+add into FMA, ensuring identical rounding to the CPU.
+//
+// This is critical for depth (sort key) and pixel coordinates (tile assignment).
+// Without precise, FMA on NVIDIA GPUs produces ~1 ULP depth differences that
+// cascade into completely different sort orders for close-depth Gaussians,
+// degrading full-frame PSNR from 60+ dB to ~28 dB.
+// -----------------------------------------------------------------------------
+precise float preciseTransformRow(mat4 M, vec3 pos, int row) {
+    // Column-major: M[col][row]. Match CPU left-to-right: ((a+b)+c)+d
+    precise float a = M[0][row] * pos.x;
+    precise float b = M[1][row] * pos.y;
+    precise float c = M[2][row] * pos.z;
+    precise float d = M[3][row];
+    precise float ab = a + b;
+    precise float abc = ab + c;
+    precise float abcd = abc + d;
+    return abcd;
+}
+
+// Full 4-component transform (for projmatrix * position), row 'row'.
+// CPU transformPoint4x4: out[r] = m[r]*p[0] + m[r+4]*p[1] + m[r+8]*p[2] + m[r+12]
+// Same as above but the w-column also multiplies position.w (=1.0).
+precise float preciseTransformRow4(mat4 M, vec3 pos, int row) {
+    precise float a = M[0][row] * pos.x;
+    precise float b = M[1][row] * pos.y;
+    precise float c = M[2][row] * pos.z;
+    precise float d = M[3][row];  // * 1.0 for homogeneous
+    precise float ab = a + b;
+    precise float abc = ab + c;
+    precise float abcd = abc + d;
+    return abcd;
 }
 
 // -----------------------------------------------------------------------------
@@ -130,6 +175,504 @@ void quat2mat(vec4 rot, out float R[9]) {
 
 // R[row][col] access helper (row-major linearization)
 #define RMC(R_, r_, c_) R_[(r_) * 3 + (c_)]
+
+// =============================================================================
+// eval_3D helper functions (ported from math_utils.cpp)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// mat4Mul16: 4x4 column-major matrix multiply: result = A * B
+// Port of math_utils.cpp:166-174
+// -----------------------------------------------------------------------------
+void mat4Mul16(float A[16], float B[16], out float result[16]) {
+    for (int col = 0; col < 4; col++)
+        for (int row = 0; row < 4; row++) {
+            float sum = 0.0;
+            for (int k = 0; k < 4; k++)
+                sum += A[k*4 + row] * B[col*4 + k];
+            result[col*4 + row] = sum;
+        }
+}
+
+// -----------------------------------------------------------------------------
+// computeGauss2Screen: Build gauss-to-screen and gauss-to-view matrices.
+// Port of math_utils.cpp:474-582.
+// Returns dilation_factor.
+// g2s_rowmajor/g2v_rowmajor: row-major 4x4 output matrices.
+// -----------------------------------------------------------------------------
+float computeGauss2Screen(vec3 mean3D, vec3 scale, vec4 rot,
+                           float scale_mod, vec3 cam_pos,
+                           float focal, float kernel_size, float filter_3d_val,
+                           float W, float H,
+                           out float g2s_rowmajor[16],
+                           out float g2v_rowmajor[16])
+{
+    float R[9];
+    quat2mat(rot, R);
+
+    // Compute dilated scale with MIP filter
+    float scale_dilated[3] = float[3](scale.x, scale.y, scale.z);
+    float dilation_factor = 1.0;
+
+    if (kernel_size > 0.0) {
+        // viewray_world = normalize(mean3D - cam_pos)
+        vec3 vr = mean3D - cam_pos;
+        float vr_len = sqrt(vr.x*vr.x + vr.y*vr.y + vr.z*vr.z);
+        vr /= vr_len;
+
+        // viewray_gauss = R * viewray_world (R row-major: R[row][col])
+        float vrg[3];
+        for (int ii = 0; ii < 3; ii++)
+            vrg[ii] = RMC(R, ii, 0)*vr.x + RMC(R, ii, 1)*vr.y + RMC(R, ii, 2)*vr.z;
+        float r_sq[3] = float[3](vrg[0]*vrg[0], vrg[1]*vrg[1], vrg[2]*vrg[2]);
+
+        // mean3D in view space via preciseTransformRow (column-major viewmatrix)
+        float mean_view_z = preciseTransformRow(cam.viewmatrix, mean3D, 2);
+        float scale_mip = (mean_view_z / focal) * (mean_view_z / focal) * kernel_size;
+        scale_mip = max(filter_3d_val * filter_3d_val, scale_mip);
+
+        scale_dilated[0] = sqrt(scale.x*scale.x + scale_mip);
+        scale_dilated[1] = sqrt(scale.y*scale.y + scale_mip);
+        scale_dilated[2] = sqrt(scale.z*scale.z + scale_mip);
+
+        // Compute dilation factor from determinant ratio
+        float s[3] = float[3](scale.x*scale.x, scale.y*scale.y, scale.z*scale.z);
+        float s_dil[3] = float[3](scale_dilated[0]*scale_dilated[0],
+                                   scale_dilated[1]*scale_dilated[1],
+                                   scale_dilated[2]*scale_dilated[2]);
+
+        float det_mul = r_sq[0]*(s[1]*s[2]) + r_sq[1]*(s[2]*s[0]) + r_sq[2]*(s[0]*s[1]);
+        float det_mul_dil = r_sq[0]*(s_dil[1]*s_dil[2]) + r_sq[1]*(s_dil[2]*s_dil[0]) + r_sq[2]*(s_dil[0]*s_dil[1]);
+        dilation_factor = sqrt(det_mul / det_mul_dil);
+    }
+
+    // Build L = transpose(S*R), where S = diag(scale_dilated * sqrt(scale_mod))
+    float sm = sqrt(scale_mod);
+    float sd[3] = float[3](scale_dilated[0]*sm, scale_dilated[1]*sm, scale_dilated[2]*sm);
+
+    // L[row][col] = sd[col] * R[col][row]
+    float L[9];
+    for (int ii = 0; ii < 3; ii++)
+        for (int jj = 0; jj < 3; jj++)
+            L[ii*3 + jj] = sd[jj] * RMC(R, jj, ii);
+
+    // gauss2world (column-major 4x4):
+    // col0 = (L[0][0], L[1][0], L[2][0], 0)
+    // col1 = (L[0][1], L[1][1], L[2][1], 0)
+    // col2 = (L[0][2], L[1][2], L[2][2], 0)
+    // col3 = (mean3D.x, mean3D.y, mean3D.z, 1)
+    float g2w[16];
+    for (int col = 0; col < 3; col++) {
+        g2w[col*4+0] = L[0*3+col];
+        g2w[col*4+1] = L[1*3+col];
+        g2w[col*4+2] = L[2*3+col];
+        g2w[col*4+3] = 0.0;
+    }
+    g2w[12] = mean3D.x; g2w[13] = mean3D.y; g2w[14] = mean3D.z; g2w[15] = 1.0;
+
+    // Viewport matrix (column-major): maps NDC to pixel coords
+    float vp[16] = float[16](
+        W/2.0, 0.0, 0.0, 0.0,
+        0.0, H/2.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        W/2.0 - 0.5, H/2.0 - 0.5, 0.0, 1.0
+    );
+
+    // Extract viewproj and view as flat arrays from UBO mat4
+    // cam.projmatrix is viewproj (legacy naming), cam.viewmatrix is view
+    float viewproj[16];
+    float viewmat[16];
+    for (int col = 0; col < 4; col++)
+        for (int row = 0; row < 4; row++) {
+            viewproj[col*4+row] = cam.projmatrix[col][row];
+            viewmat[col*4+row] = cam.viewmatrix[col][row];
+        }
+
+    // world2screen = viewport * viewproj
+    float w2s[16];
+    mat4Mul16(vp, viewproj, w2s);
+
+    // gauss2screen_colmajor = world2screen * gauss2world
+    float g2s_cm[16];
+    mat4Mul16(w2s, g2w, g2s_cm);
+
+    // Transpose to row-major for output
+    for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+            g2s_rowmajor[row*4+col] = g2s_cm[col*4+row];
+
+    // gauss2view_colmajor = view_matrix * gauss2world
+    float g2v_cm[16];
+    mat4Mul16(viewmat, g2w, g2v_cm);
+
+    // Transpose to row-major
+    for (int row = 0; row < 4; row++)
+        for (int col = 0; col < 4; col++)
+            g2v_rowmajor[row*4+col] = g2v_cm[col*4+row];
+
+    return dilation_factor;
+}
+
+// -----------------------------------------------------------------------------
+// computeCov3DInv: inverse 3D covariance (upper triangle, 6 floats).
+// Port of math_utils.cpp:590-614.
+// cov3D_inv = R * diag(1/sd^2) * R^T
+// -----------------------------------------------------------------------------
+void computeCov3DInv_3D(vec3 scale_dilated_v, float scale_mod, vec4 rot,
+                         out float cov3D_inv[6]) {
+    float R[9];
+    quat2mat(rot, R);
+
+    float sm = sqrt(scale_mod);
+    float inv_sd2[3];
+    for (int j = 0; j < 3; j++) {
+        float s = scale_dilated_v[j] * sm;
+        inv_sd2[j] = 1.0 / (s * s);
+    }
+
+    // element (r,c) = sum_k R[k][r] * inv_sd2[k] * R[k][c]
+    int idx = 0;
+    for (int r = 0; r < 3; r++) {
+        for (int c = r; c < 3; c++) {
+            float val = 0.0;
+            for (int k = 0; k < 3; k++)
+                val += RMC(R, k, r) * inv_sd2[k] * RMC(R, k, c);
+            cov3D_inv[idx] = val;
+            idx++;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// maxContribRay: find maximum Gaussian contribution along ray defined by
+// intersection of two planes. Returns squared Mahalanobis distance.
+// Port of math_utils.cpp:186-207.
+// -----------------------------------------------------------------------------
+float maxContribRay(float plane_a[4], float plane_b[4], out float max_pos[4]) {
+    float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
+    float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
+    float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
+
+    float mx = plane_a[3]*plane_b[0] - plane_a[0]*plane_b[3];
+    float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
+    float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
+
+    float dd = dx*dx + dy*dy + dz*dz;
+    float m_div_dd[3] = float[3](mx/dd, my/dd, mz/dd);
+
+    max_pos[0] = dy*m_div_dd[2] - dz*m_div_dd[1];
+    max_pos[1] = dz*m_div_dd[0] - dx*m_div_dd[2];
+    max_pos[2] = dx*m_div_dd[1] - dy*m_div_dd[0];
+    max_pos[3] = 1.0;
+
+    return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
+}
+
+// -----------------------------------------------------------------------------
+// maxContribPlane: find max contribution on a single plane.
+// Port of math_utils.cpp:210-222.
+// g2s is row-major.
+// -----------------------------------------------------------------------------
+float maxContribPlane(float plane[4], float g2s[16], out float max_pos_screen[4]) {
+    float norm = plane[3] / (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]);
+    // CUDA: max_pos_gauss = -plane * norm; screen uses vec4(vec3(..), 1.0) — w=1.0.
+    float max_pos_gauss_screen[4] = float[4](-plane[0]*norm, -plane[1]*norm, -plane[2]*norm, 1.0);
+
+    // max_pos_screen = M * v  where g2s is row-major: g2s[i*4+j] = M_{i,j}.
+    for (int ii = 0; ii < 4; ii++) {
+        max_pos_screen[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++)
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss_screen[jj];
+    }
+    return plane[3] * norm;  // = -max_pos_gauss.w
+}
+
+// -----------------------------------------------------------------------------
+// inScreenRange: check if position is in range for a given dimension.
+// Port of math_utils.cpp:224-234.
+// Returns true if pos is between range_from and range_from+extent in dim.
+// Also outputs d for signed distance.
+// -----------------------------------------------------------------------------
+bool inScreenRange_d(float pos_screen[4], float range_from[3],
+                     float extent[3], int dim, out float d) {
+    d = pos_screen[dim] - range_from[dim] * pos_screen[3];
+    return d > 0.0 && d < extent[dim] * pos_screen[3];
+}
+
+bool inScreenRange(float pos_screen[4], float range_from[3],
+                   float extent[3], int dim) {
+    float d;
+    return inScreenRange_d(pos_screen, range_from, extent, dim, d);
+}
+
+// -----------------------------------------------------------------------------
+// maxContribRayScreen: maxContribRay with g2s transform to screen space.
+// Port of math_utils.cpp:237-248.
+// -----------------------------------------------------------------------------
+float maxContribRayScreen(float plane_a[4], float plane_b[4],
+                           float g2s[16], out float max_pos_screen[4]) {
+    float max_pos_gauss[4];
+    float contrib = maxContribRay(plane_a, plane_b, max_pos_gauss);
+    // max_pos_screen = M * v  where g2s is row-major: g2s[i*4+j] = M_{i,j}.
+    for (int ii = 0; ii < 4; ii++) {
+        max_pos_screen[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++)
+            max_pos_screen[ii] += g2s[ii*4+jj] * max_pos_gauss[jj];
+    }
+    return contrib;
+}
+
+// -----------------------------------------------------------------------------
+// maxContribGaussianFrustum3D: 3D frustum culling for Gaussian.
+// Port of math_utils.cpp:253-340.
+// g2s is row-major. Returns 0.5 * max_contrib.
+// -----------------------------------------------------------------------------
+float maxContribGaussianFrustum3D(
+    float screen_min_x, float screen_min_y,
+    float screen_max_x, float screen_max_y,
+    float g2s[16], out float max_pos_depth)
+{
+    float max_contrib = 1e30;
+    float max_pos_screen[4] = float[4](1.0, 1.0, 1.0, 1.0);
+
+    float RANGE_FROM[3] = float[3](screen_min_x, screen_min_y, -1.0);
+    float EXTENT[3] = float[3](screen_max_x - screen_min_x, screen_max_y - screen_min_y, 2.0);
+
+    // Mean in screen space: last column of row-major g2s = row 0-3, col 3
+    float mean_screen[4] = float[4](g2s[0*4+3], g2s[1*4+3], g2s[2*4+3], g2s[3*4+3]);
+
+    float d[3];
+    bool between_x = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 0, d[0]);
+    bool between_y = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 1, d[1]);
+    bool between_z = inScreenRange_d(mean_screen, RANGE_FROM, EXTENT, 2, d[2]);
+
+    if (between_x && between_y && between_z) {
+        for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = mean_screen[ii];
+        max_contrib = 0.0;
+    } else {
+        float dx_sign = (d[0] - (EXTENT[0]*0.5 * mean_screen[3])) >= 0.0 ? EXTENT[0]*0.5 : -EXTENT[0]*0.5;
+        float dy_sign = (d[1] - (EXTENT[1]*0.5 * mean_screen[3])) >= 0.0 ? EXTENT[1]*0.5 : -EXTENT[1]*0.5;
+
+        float cx = RANGE_FROM[0] + EXTENT[0]*0.5 + dx_sign;
+        float cy = RANGE_FROM[1] + EXTENT[1]*0.5 + dy_sign;
+
+        float closer_plane_x[4];
+        float closer_plane_y[4];
+        for (int ii = 0; ii < 4; ii++) {
+            closer_plane_x[ii] = g2s[0*4+ii] - g2s[3*4+ii] * cx;
+            closer_plane_y[ii] = g2s[1*4+ii] - g2s[3*4+ii] * cy;
+        }
+
+        float pos_screen[4];
+        float contrib;
+
+        // Test plane_x alone
+        contrib = maxContribPlane(closer_plane_x, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 1) &&
+            inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        // Test plane_y alone
+        contrib = maxContribPlane(closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 0) &&
+            inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        // Test ray: closer_plane_x AND closer_plane_y
+        contrib = maxContribRayScreen(closer_plane_x, closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        // Test ray: closer_plane_x AND other_plane_y
+        float other_plane_y[4];
+        float ocy = RANGE_FROM[1] + EXTENT[1]*0.5 - dy_sign;
+        for (int ii = 0; ii < 4; ii++)
+            other_plane_y[ii] = g2s[1*4+ii] - g2s[3*4+ii] * ocy;
+        contrib = maxContribRayScreen(closer_plane_x, other_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+
+        // Test ray: other_plane_x AND closer_plane_y
+        float other_plane_x[4];
+        float ocx = RANGE_FROM[0] + EXTENT[0]*0.5 - dx_sign;
+        for (int ii = 0; ii < 4; ii++)
+            other_plane_x[ii] = g2s[0*4+ii] - g2s[3*4+ii] * ocx;
+        contrib = maxContribRayScreen(other_plane_x, closer_plane_y, g2s, pos_screen);
+        if (contrib < max_contrib && inScreenRange(pos_screen, RANGE_FROM, EXTENT, 2)) {
+            max_contrib = contrib;
+            for (int ii = 0; ii < 4; ii++) max_pos_screen[ii] = pos_screen[ii];
+        }
+    }
+
+    max_pos_depth = max_pos_screen[2] / max_pos_screen[3];
+    return 0.5 * max_contrib;
+}
+
+// -----------------------------------------------------------------------------
+// computeAABBScreen: screen-space bounding box from gauss2screen.
+// Port of math_utils.cpp:342-389.
+// g2s is row-major. Returns false if not valid.
+// -----------------------------------------------------------------------------
+bool computeAABBScreen(float g2s[16], float cutoff,
+                       out float mean2D_out[2], out float extent2D_out[2]) {
+    float t[4] = float[4](cutoff, cutoff, cutoff, -1.0);
+
+    // rows of g2s (row-major)
+    // r0 = g2s[0..3], r1 = g2s[4..7], r2 = g2s[8..11], r3 = g2s[12..15]
+
+    // s = dot(t, r3 * r3)
+    float s = 0.0;
+    for (int k = 0; k < 4; k++) s += t[k] * g2s[12+k] * g2s[12+k];
+    if (s >= 0.0) return false;
+
+    float f[4];
+    for (int k = 0; k < 4; k++) f[k] = t[k] / s;
+
+    // p[dim] = dot(f, r_dim * r3)
+    float p[3] = float[3](0.0, 0.0, 0.0);
+    for (int k = 0; k < 4; k++) {
+        p[0] += f[k] * g2s[0*4+k] * g2s[3*4+k];
+        p[1] += f[k] * g2s[1*4+k] * g2s[3*4+k];
+        p[2] += f[k] * g2s[2*4+k] * g2s[3*4+k];
+    }
+
+    // h[dim] = p[dim]^2 - dot(f, r_dim * r_dim)
+    float h[3] = float[3](p[0]*p[0], p[1]*p[1], p[2]*p[2]);
+    for (int k = 0; k < 4; k++) {
+        h[0] -= f[k] * g2s[0*4+k] * g2s[0*4+k];
+        h[1] -= f[k] * g2s[1*4+k] * g2s[1*4+k];
+        h[2] -= f[k] * g2s[2*4+k] * g2s[2*4+k];
+    }
+
+    float extent_z = sqrt(max(0.0, h[2]));
+    float z_lo = p[2] - extent_z;
+    float z_hi = p[2] + extent_z;
+    if (z_lo < -1.0 || z_hi > 1.0) return false;
+
+    mean2D_out[0] = p[0];
+    mean2D_out[1] = p[1];
+    extent2D_out[0] = sqrt(max(0.0, h[0]));
+    extent2D_out[1] = sqrt(max(0.0, h[1]));
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// normalizeAngle: normalize angle to [-pi, pi].
+// Port of math_utils.cpp:391-396.
+// Uses floor-based modulo instead of fmod for consistent GLSL behavior.
+// -----------------------------------------------------------------------------
+const float PI_VAL = 3.14159265358979323846;
+
+float normalizeAngle(float theta) {
+    float TWO_PI = 2.0 * PI_VAL;
+    theta = theta - floor(theta / TWO_PI) * TWO_PI;
+    if (theta > PI_VAL) theta -= TWO_PI;
+    if (theta <= -PI_VAL) theta += TWO_PI;
+    return theta;
+}
+
+// -----------------------------------------------------------------------------
+// computeAABBView: view-space AABB fallback when screen-space AABB fails.
+// Port of math_utils.cpp:398-472.
+// gauss2view is row-major. Returns false if not valid.
+// -----------------------------------------------------------------------------
+bool computeAABBView(float gauss2view[16], vec3 mean3D_view,
+                     float focal_x, float focal_y, float W, float H, float cutoff,
+                     out float mean2D_out[2], out float extent2D_out[2])
+{
+    float t[4] = float[4](cutoff, cutoff, cutoff, -1.0);
+    float vlen = sqrt(mean3D_view.x*mean3D_view.x +
+                      mean3D_view.y*mean3D_view.y +
+                      mean3D_view.z*mean3D_view.z);
+    float viewdir[3] = float[3](mean3D_view.x/vlen, mean3D_view.y/vlen, mean3D_view.z/vlen);
+
+    // computeTheta for axis 0 (x) and axis 1 (y)
+    float bounds_lo[2];
+    float bounds_hi[2];
+
+    for (int axis = 0; axis < 2; axis++) {
+        float theta_mu = atan(axis == 0 ? viewdir[0] : viewdir[1], viewdir[2]);
+
+        // T[axis] row and T[2] row from gauss2view (row-major)
+        // Ta = gauss2view[axis*4 .. axis*4+3]
+        // T2 = gauss2view[2*4 .. 2*4+3]
+
+        float squared_axis = 0.0, squared_z = 0.0, mid_val = 0.0;
+        for (int ii = 0; ii < 4; ii++) {
+            float ta = gauss2view[axis*4+ii];
+            float t2 = gauss2view[2*4+ii];
+            squared_axis += t[ii] * ta * ta;
+            squared_z += t[ii] * t2 * t2;
+            mid_val += t[ii] * ta * t2;
+        }
+
+        float inside_sqrt = mid_val * mid_val - squared_z * squared_axis;
+
+        float result_lo = -(PI_VAL / 2.0 - 1e-5);
+        float result_hi = PI_VAL / 2.0 - 1e-5;
+
+        if (inside_sqrt > 0.0) {
+            float sqrt_val = sqrt(inside_sqrt);
+            float theta_axis_0 = atan(-(mid_val + sqrt_val), -squared_z);
+            float theta_axis_1 = atan(-(mid_val - sqrt_val), -squared_z);
+
+            // Rotate to get correct order around theta_mu
+            // Use bounded loops (max 8 iterations — more than enough for any angle)
+            for (int iter = 0; iter < 8; iter++) {
+                if (theta_axis_0 <= theta_mu) break;
+                theta_axis_0 -= PI_VAL;
+            }
+            for (int iter = 0; iter < 8; iter++) {
+                if (theta_axis_0 >= (theta_mu - PI_VAL)) break;
+                theta_axis_0 += PI_VAL;
+            }
+            for (int iter = 0; iter < 8; iter++) {
+                if (theta_axis_1 >= theta_mu) break;
+                theta_axis_1 += PI_VAL;
+            }
+            for (int iter = 0; iter < 8; iter++) {
+                if (theta_axis_1 <= (theta_mu + PI_VAL)) break;
+                theta_axis_1 -= PI_VAL;
+            }
+
+            float norm0 = normalizeAngle(theta_axis_0);
+            float norm1 = normalizeAngle(theta_axis_1);
+            if (theta_mu < 0.0 && abs(norm0) < abs(norm1)) {
+                theta_axis_0 += 2.0 * PI_VAL;
+                theta_axis_1 += 2.0 * PI_VAL;
+            } else if (theta_mu > 0.0 && abs(norm1) < abs(norm0)) {
+                theta_axis_0 -= 2.0 * PI_VAL;
+                theta_axis_1 -= 2.0 * PI_VAL;
+            }
+
+            result_lo = max(result_lo, theta_axis_0);
+            result_hi = min(result_hi, theta_axis_1);
+        }
+
+        float focal_dim = (axis == 0) ? focal_x : focal_y;
+        float dim_size = (axis == 0) ? W : H;
+        bounds_lo[axis] = dim_size / 2.0 + focal_dim * tan(result_lo);
+        bounds_hi[axis] = dim_size / 2.0 + focal_dim * tan(result_hi);
+    }
+
+    mean2D_out[0] = (bounds_hi[0] + bounds_lo[0]) / 2.0;
+    mean2D_out[1] = (bounds_hi[1] + bounds_lo[1]) / 2.0;
+    extent2D_out[0] = (bounds_hi[0] - bounds_lo[0]) / 2.0;
+    extent2D_out[1] = (bounds_hi[1] - bounds_lo[1]) / 2.0;
+    return true;
+}
+
+// =============================================================================
+// End eval_3D helper functions
+// =============================================================================
 
 // -----------------------------------------------------------------------------
 // computeCov3D: Sigma = M^T * M, where M[i][j] = s[i] * R[i][j]
@@ -189,9 +732,13 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
                   float tan_fovx, float tan_fovy,
                   out vec3 cov2D_out)
 {
-    // mean3d -> view space. viewmatrix is column-major mat4.
-    vec4 t4 = cam.viewmatrix * vec4(mean3d, 1.0);
-    vec3 t = t4.xyz;
+    // mean3d -> view space. Use precise helpers to match CPU (no FMA).
+    // The view-space position feeds into the Jacobian which determines cov2D,
+    // radius, and tile coverage — precision here prevents tile-assignment drift.
+    vec3 t = vec3(
+        preciseTransformRow(cam.viewmatrix, mean3d, 0),
+        preciseTransformRow(cam.viewmatrix, mean3d, 1),
+        preciseTransformRow(cam.viewmatrix, mean3d, 2));
 
     // Clamp to 1.3x frustum boundary (CPU lines 73-79).
     float limx = 1.3 * tan_fovx;
@@ -247,17 +794,17 @@ void computeCov2D(vec3 mean3d, float cov3D[6],
 // the "+tile-1" trick; Vulkan intentionally diverges from CPU here so the
 // SP-0 tiny-fixture golden match (T7) is bit-exact.
 // -----------------------------------------------------------------------------
-ivec2 rectMin(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int(floor((p.x - extent) / float(tile_w)));
-    int my = int(floor((p.y - extent) / float(tile_h)));
+ivec2 rectMin(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(floor((p.x - extent_x) / float(tile_w)));
+    int my = int(floor((p.y - extent_y) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
 }
 
-ivec2 rectMax(vec2 p, float extent, int grid_x, int grid_y, int tile_w, int tile_h) {
-    int mx = int(ceil((p.x + extent) / float(tile_w)));
-    int my = int(ceil((p.y + extent) / float(tile_h)));
+ivec2 rectMax(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, int tile_w, int tile_h) {
+    int mx = int(ceil((p.x + extent_x) / float(tile_w)));
+    int my = int(ceil((p.y + extent_y) / float(tile_h)));
     mx = min(grid_x, max(0, mx));
     my = min(grid_y, max(0, my));
     return ivec2(mx, my);
@@ -340,7 +887,8 @@ void main() {
     // Default outputs for culled paths.
     radii[i]         = 0;
     tiles_touched[i] = 0;
-    radius_f_arr[i]  = 0.0;
+    radius_f_arr[i*2u + 0u] = 0.0;
+    radius_f_arr[i*2u + 1u] = 0.0;
 
     // Zero-fill ForwardCache fields for culled paths.
     cov3D_cache[i*6u+0u]=0.0; cov3D_cache[i*6u+1u]=0.0; cov3D_cache[i*6u+2u]=0.0;
@@ -350,17 +898,207 @@ void main() {
     cov2D_cache[i*3u+0u]=0.0; cov2D_cache[i*3u+1u]=0.0; cov2D_cache[i*3u+2u]=0.0;
     cov2D_det_cache[i]=0.0;
 
+    // Zero-fill eval_3D outputs for culled paths.
+    if (spec_eval_3D == 1u) {
+        for (uint j = 0u; j < 16u; j++) gauss2screen_out[i*16u+j] = 0.0;
+        for (uint j = 0u; j < 6u; j++)  cov3D_inv_out[i*6u+j] = 0.0;
+        mean_offset_out[i*3u] = 0.0;
+        mean_offset_out[i*3u+1u] = 0.0;
+        mean_offset_out[i*3u+2u] = 0.0;
+    }
+
     vec3 position = vec3(positions[i*3u + 0u],
                          positions[i*3u + 1u],
                          positions[i*3u + 2u]);
 
     // 3. World -> view (near-plane cull).
-    vec4 p_view4 = cam.viewmatrix * vec4(position, 1.0);
-    vec3 p_view  = p_view4.xyz;
+    // Use precise helpers to match CPU's -ffp-contract=off (no FMA).
+    // The depth (p_view.z) is the sort key — FMA divergence cascades into
+    // completely different sort orders, destroying full-frame PSNR.
+    vec3 p_view = vec3(
+        preciseTransformRow(cam.viewmatrix, position, 0),
+        preciseTransformRow(cam.viewmatrix, position, 1),
+        preciseTransformRow(cam.viewmatrix, position, 2));
     if (p_view.z <= 0.2) return;   // CPU uses <= 0.2 in the 2D path.
 
+    // =========================================================================
+    // eval_3D branch: AAA-Gaussians 3D evaluation path
+    // Port of preprocessor_cpu.cpp:65-188 (eval_3D=true)
+    // =========================================================================
+    if (spec_eval_3D == 1u) {
+        float width_3d  = cam.fov_size.z;
+        float height_3d = cam.fov_size.w;
+        float tan_fovx_3d = cam.fov_size.x;
+        float tan_fovy_3d = cam.fov_size.y;
+        float focal_x_3d = width_3d  / (2.0 * tan_fovx_3d);
+        float focal_y_3d = height_3d / (2.0 * tan_fovy_3d);
+
+        float opacity_3d = opacities[i];
+        float focal_3d = max(focal_x_3d, focal_y_3d);
+        float filter_3d = filter_3D[i];
+
+        vec3 scale_3d = vec3(scales[i*3u + 0u], scales[i*3u + 1u], scales[i*3u + 2u]);
+        vec4 rot_3d   = vec4(rotations[i*4u + 0u], rotations[i*4u + 1u],
+                             rotations[i*4u + 2u], rotations[i*4u + 3u]);
+        vec3 cam_pos_3d = cam.campos_pad.xyz;
+
+        // Compute gauss2screen and gauss2view matrices
+        float gauss2screen[16];
+        float gauss2view[16];
+        float dilation_factor = computeGauss2Screen(
+            position, scale_3d, rot_3d,
+            pc.scale_modifier, cam_pos_3d,
+            focal_3d, 0.3, filter_3d,
+            width_3d, height_3d,
+            gauss2screen, gauss2view);
+
+        // NOTE: proper_ewa_scaling = false in the CUDA golden (default).
+        // Do NOT multiply opacity by dilation_factor — the golden keeps
+        // opacity untouched.  dilation_factor only affects the gauss2screen
+        // matrix (through scale_dilated), not the opacity.
+        // opacity_3d *= dilation_factor;  // DISABLED: proper_ewa_scaling=false
+        const float ALPHA_THRESHOLD = 1.0 / 255.0;
+        if (opacity_3d < ALPHA_THRESHOLD) return;
+
+        float opacity_power_threshold = log(opacity_3d / ALPHA_THRESHOLD);
+        float cutoff_3d = min(11.11, 2.0 * opacity_power_threshold);
+
+        // Camera-inside-ellipsoid test
+        // Recompute scale_dilated (same formula as inside computeGauss2Screen)
+        float R_3d[9];
+        quat2mat(rot_3d, R_3d);
+        float sm_3d = sqrt(pc.scale_modifier);
+
+        float scale_dilated[3] = float[3](scale_3d.x, scale_3d.y, scale_3d.z);
+        {
+            float mean_view_z = preciseTransformRow(cam.viewmatrix, position, 2);
+            float scale_mip = (mean_view_z / focal_3d) * (mean_view_z / focal_3d) * 0.3;
+            scale_mip = max(filter_3d * filter_3d, scale_mip);
+            for (int j = 0; j < 3; j++)
+                scale_dilated[j] = sqrt(scale_3d[j]*scale_3d[j] + scale_mip);
+        }
+
+        float sd_3d[3];
+        for (int j = 0; j < 3; j++)
+            sd_3d[j] = scale_dilated[j] * sm_3d;
+
+        // Compute inverse 3D covariance
+        float cov3D_inv_local[6];
+        computeCov3DInv_3D(vec3(scale_dilated[0], scale_dilated[1], scale_dilated[2]),
+                           pc.scale_modifier, rot_3d, cov3D_inv_local);
+
+        // Store mean_offset = position - cam_pos
+        mean_offset_out[i*3u]     = position.x - cam_pos_3d.x;
+        mean_offset_out[i*3u+1u]  = position.y - cam_pos_3d.y;
+        mean_offset_out[i*3u+2u]  = position.z - cam_pos_3d.z;
+
+        // campos_gauss = world2gauss * (cam_pos - mean3D)
+        // world2gauss row j = (1/sd[j]) * R[j]
+        vec3 diff_3d = cam_pos_3d - position;
+        float campos_gauss[3];
+        for (int j = 0; j < 3; j++) {
+            campos_gauss[j] = (RMC(R_3d, j, 0)*diff_3d.x +
+                               RMC(R_3d, j, 1)*diff_3d.y +
+                               RMC(R_3d, j, 2)*diff_3d.z) / sd_3d[j];
+        }
+
+        float dist_sq = campos_gauss[0]*campos_gauss[0] +
+                         campos_gauss[1]*campos_gauss[1] +
+                         campos_gauss[2]*campos_gauss[2];
+        if (dist_sq < cutoff_3d) return;  // Camera inside ellipsoid
+
+        // 3D frustum culling
+        float max_pos_depth;
+        float max_contrib = maxContribGaussianFrustum3D(
+            0.0, 0.0, width_3d - 1.0, height_3d - 1.0,
+            gauss2screen, max_pos_depth);
+        if (max_contrib > opacity_power_threshold) return;
+
+        // NDC projection for tile assignment (same as 2D path)
+        vec4 p_hom_3d = vec4(
+            preciseTransformRow4(cam.projmatrix, position, 0),
+            preciseTransformRow4(cam.projmatrix, position, 1),
+            preciseTransformRow4(cam.projmatrix, position, 2),
+            preciseTransformRow4(cam.projmatrix, position, 3));
+        precise float p_w_3d = 1.0 / (p_hom_3d.w + 1e-7);
+        precise float pixel_x_3d = ndc2Pix(p_hom_3d.x * p_w_3d, width_3d);
+        precise float pixel_y_3d = ndc2Pix(p_hom_3d.y * p_w_3d, height_3d);
+
+        // View-space AABB for extent estimation.
+        // CUDA default: new_aabb=true → always uses compute_aabb_view, never
+        // compute_aabb_screen.  We must match this to produce identical tile
+        // assignments and Gaussian-tile pair counts.
+        float mean2D_aabb[2];
+        float extent_aabb[2];
+        bool aabb_ok = computeAABBView(gauss2view, p_view, focal_x_3d, focal_y_3d,
+                                       width_3d, height_3d, cutoff_3d,
+                                       mean2D_aabb, extent_aabb);
+        if (!aabb_ok) return;
+
+        // Tile rect — separate x/y extents matching CUDA's getRect(p, float2).
+        // scatter.comp reads radius_f_arr[i*2+0/1] to reconstruct the identical rect.
+        float extent_x_3d = extent_aabb[0];
+        float extent_y_3d = extent_aabb[1];
+        const int TILE_W = 16;
+        const int TILE_H = 16;
+        int grid_x_3d = int(pc.num_tiles_x);
+        int grid_y_3d = int(pc.num_tiles_y);
+        vec2 center_3d = vec2(mean2D_aabb[0], mean2D_aabb[1]);
+        ivec2 rmn_3d = rectMin(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
+        ivec2 rmx_3d = rectMax(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
+        int n_tiles_3d = (rmx_3d.x - rmn_3d.x) * (rmx_3d.y - rmn_3d.y);
+        if (n_tiles_3d == 0) return;
+        int my_radius_3d = int(ceil(max(extent_x_3d, extent_y_3d)));
+        my_radius_3d = max(my_radius_3d, 1);
+
+        // SH color evaluation
+        vec3 color_3d = shToRGB(i, position, cam_pos_3d, pc.sh_degree, pc.sh_coeffs_per_g);
+
+        // ---- Write outputs ----
+        // Packed conic_opacity: slots 0-2 unused in eval_3D mode, slot 3 = opacity
+        conic_opacity_packed[i*4u + 0u] = 0.0;
+        conic_opacity_packed[i*4u + 1u] = 0.0;
+        conic_opacity_packed[i*4u + 2u] = 0.0;
+        conic_opacity_packed[i*4u + 3u] = opacity_3d;
+
+        // CUDA stores AABB center as means2D in eval_3D (not projected pixel).
+        means2D[i*2u + 0u] = mean2D_aabb[0];
+        means2D[i*2u + 1u] = mean2D_aabb[1];
+        depths[i]          = p_view.z;
+        rgb[i*3u + 0u]     = color_3d.x;
+        rgb[i*3u + 1u]     = color_3d.y;
+        rgb[i*3u + 2u]     = color_3d.z;
+
+        radii[i]         = my_radius_3d;
+        tiles_touched[i] = n_tiles_3d;
+        radius_f_arr[i*2u + 0u] = extent_x_3d;  // scatter.comp reads both to reconstruct rect
+        radius_f_arr[i*2u + 1u] = extent_y_3d;
+
+        // eval_3D specific outputs
+        for (uint j = 0u; j < 16u; j++) gauss2screen_out[i*16u+j] = gauss2screen[j];
+        for (uint j = 0u; j < 6u; j++)  cov3D_inv_out[i*6u+j] = cov3D_inv_local[j];
+
+        // Cache p_view for backward
+        p_view_cache[i*3u+0u] = p_view.x;
+        p_view_cache[i*3u+1u] = p_view.y;
+        p_view_cache[i*3u+2u] = p_view.z;
+        // Cache p_hom_w for backward
+        p_hom_w_cache[i] = p_hom_3d.w;
+
+        return;
+    }
+    // =========================================================================
+    // End eval_3D branch — fallthrough is the standard 2D path below
+    // =========================================================================
+
     // 4. View -> clip -> NDC -> pixel using ndc2Pix (matches CPU).
-    vec4 p_hom = cam.projmatrix * vec4(position, 1.0);
+    // Precise computation of p_hom to match CPU's transformPoint4x4.
+    // Pixel coordinates determine tile assignment — precision matters.
+    vec4 p_hom = vec4(
+        preciseTransformRow4(cam.projmatrix, position, 0),
+        preciseTransformRow4(cam.projmatrix, position, 1),
+        preciseTransformRow4(cam.projmatrix, position, 2),
+        preciseTransformRow4(cam.projmatrix, position, 3));
     float p_w  = 1.0 / (p_hom.w + 1e-7);
     vec3 p_ndc = vec3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
 
@@ -426,9 +1164,8 @@ void main() {
     float radius_f = 3.33 * sqrt(lambda);   // float radius (used for rect)
     int   my_radius = int(ceil(radius_f));  // int radius (written to radii[])
 
-    // Radius cull: if radius > max(W,H), drop (matches CPU).
-    int max_screen_dim = int(max(width, height));
-    if (my_radius > max_screen_dim) return;
+    // Note: no max_screen_dim cull — matches CUDA which renders
+    // large-radius Gaussians (near camera) without this check.
 
     // 13. Tile AABB — uses the FLOAT radius per CUDA's rect_dims convention.
     // tile_w/tile_h fixed to 16 per spec §4.4 SP-2. Grid comes from push consts.
@@ -437,8 +1174,8 @@ void main() {
     int grid_x = int(pc.num_tiles_x);
     int grid_y = int(pc.num_tiles_y);
     vec2 pix  = vec2(pixel_x, pixel_y);
-    ivec2 rmn = rectMin(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
-    ivec2 rmx = rectMax(pix, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmn = rectMin(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+    ivec2 rmx = rectMax(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
     int n_tiles = (rmx.x - rmn.x) * (rmx.y - rmn.y);
     if (n_tiles == 0) return;
 
@@ -468,7 +1205,8 @@ void main() {
 
     radii[i]         = my_radius;
     tiles_touched[i] = n_tiles;
-    radius_f_arr[i]  = radius_f;  // exact float radius for scatter.comp (binding 13)
+    radius_f_arr[i*2u + 0u] = radius_f;  // x/y symmetric in 2D path
+    radius_f_arr[i*2u + 1u] = radius_f;
 
     // Cache intermediates for backward pass (bindings 14..16).
     // cov3D: 6-element upper triangle computed by computeCov3D().

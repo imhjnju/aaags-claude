@@ -58,7 +58,12 @@ public:
                         VkBuffer means2D,
                         VkBuffer depths,
                         VkBuffer radii,
-                        VkBuffer radius_f);
+                        VkBuffer radius_f,
+                        VkBuffer cov3D_inv,
+                        VkBuffer mean_offset,
+                        VkBuffer gauss2screen,
+                        bool eval_3D,
+                        const Camera& cam);
 
     // Record prefix-scan + scatter into cmd. prepare_record() must have been
     // called. Inserts an internal barrier between scan and scatter (scatter
@@ -83,6 +88,9 @@ private:
     std::unique_ptr<VulkanBuffer> r_ws2_buf_;     // level-2 wg sums [ceil(ceil(N/256)/256)]
     std::unique_ptr<VulkanBuffer> r_keys_buf_;    // keys_unsorted [R_max] u64
     std::unique_ptr<VulkanBuffer> r_vals_buf_;    // values_unsorted [R_max] u32
+    std::unique_ptr<VulkanBuffer> r_scatter_ubo_; // ScatterUBO (eval_3D inverse_vp + cam_pos + img_size)
+    std::unique_ptr<VulkanBuffer> r_dummy4_;      // 4-byte dummy for unbound eval_3D SSBOs
+    bool r_eval_3D_ = false;                      // stashed for record()
 
     // --- Layer-1 persistent buffers (bin() reuses across calls) ---
     // Scan buffers sized to max N seen; scatter buffers sized to max ACTUAL R
@@ -99,7 +107,7 @@ private:
     std::unique_ptr<VulkanBuffer> bin_m2d_buf_;   // means2D [N*2] f32
     std::unique_ptr<VulkanBuffer> bin_dep_buf_;   // depths [N] f32
     std::unique_ptr<VulkanBuffer> bin_rad_buf_;   // radii [N] i32
-    std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N] f32
+    std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N*2] f32 (extent_x, extent_y)
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
 

@@ -10,7 +10,7 @@
 //      PreprocessOutput (types.h).
 //
 // SP-2 constraints enforced as hard errors (spec §4.4):
-//   - eval_3D=true not supported: spec_eval_3D=0 baked into the pipeline.
+//   - eval_3D=true: spec_eval_3D baked into the pipeline at construction.
 //   - tile 16x16 only: shader's getRect assumes 16x16 tiles.
 //   - antialiasing flag not supported: shader path is the fixed +0.3 dilation
 //     variant without h_conv_scaling.
@@ -31,19 +31,11 @@
 #include <stdexcept>
 #include <vector>
 
-PreprocessorVulkan::PreprocessorVulkan(VulkanContext& ctx)
-    : ctx_(ctx) {
-    // SP-2: spec_training=1 (match CPU training path, no upper SH-RGB clamp),
-    //       spec_eval_3D=0 (2D anti-aliasing path only).
-    // TODO(SP-2 T7+): RenderConfig::training is a per-process() flag on the
-    // CPU side but a pipeline-time specialization constant here. If mixed
-    // training/inference in the same session is ever required, we'll need
-    // either two pre-built PreprocessPass instances (one per mode) or a
-    // pipeline rebuild. For SP-2 bring-up tests we match the CPU training
-    // path; tests/callers must pass cfg.training=true for bitwise parity.
+PreprocessorVulkan::PreprocessorVulkan(VulkanContext& ctx, bool eval_3D)
+    : ctx_(ctx), eval_3D_(eval_3D) {
     pass_ = std::make_unique<PreprocessPass>(ctx_,
                                              /*spec_training=*/1u,
-                                             /*spec_eval_3D=*/0u);
+                                             /*spec_eval_3D=*/eval_3D ? 1u : 0u);
 }
 
 // Out-of-line destructor so std::unique_ptr<PreprocessPass> can see the
@@ -56,9 +48,6 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
                                              FrameAllocator& alloc,
                                              ForwardCache* cache) {
     // --- SP-2 hard errors (spec §4.4) ----------------------------------------
-    if (cfg.eval_3D)
-        throw std::runtime_error(
-            "PreprocessorVulkan: eval_3D=true not supported in SP-2");
     if (cfg.tile_w != 16 || cfg.tile_h != 16)
         throw std::runtime_error(
             "PreprocessorVulkan: only 16x16 tiles supported");
@@ -112,7 +101,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto rf_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        ctx_, static_cast<VkDeviceSize>(N) * 2u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto cam_buf = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO),
@@ -133,6 +122,17 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     cov2d_det_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // eval_3D output buffers (bindings 19..21).
+    // Always allocated so the descriptor set is fully bound.
+    gauss2screen_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 16 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    cov3d_inv_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 6 * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    mean_offset_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // --- 2. Upload inputs ----------------------------------------------------
@@ -203,6 +203,9 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     b.p_hom_w_cache         = p_hom_w_buf_  ->handle();
     b.cov2D_cache           = cov2d_buf_    ->handle();
     b.cov2D_det_cache       = cov2d_det_buf_->handle();
+    b.gauss2screen          = gauss2screen_buf_->handle();
+    b.cov3D_inv             = cov3d_inv_buf_  ->handle();
+    b.mean_offset           = mean_offset_buf_ ->handle();
     pass_->bind_buffers(b);
 
     PreprocessPushConstants pc{};
@@ -224,18 +227,30 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     out.rgb           = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
     out.radii         = alloc.allocate_array<int>  (static_cast<std::size_t>(N));
     out.tiles_touched = alloc.allocate_array<int>  (static_cast<std::size_t>(N));
-    out.gauss2screen  = nullptr;   // eval_3D=false
-    out.cov3D_inv     = nullptr;
-    out.mean_offset   = nullptr;
-    out.eval_3D       = false;
-    out.radius_f      = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    out.radius_f      = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 2);
+    out.eval_3D       = eval_3D_;
+    if (eval_3D_) {
+        out.gauss2screen = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 16);
+        out.cov3D_inv    = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 6);
+        out.mean_offset  = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    } else {
+        out.gauss2screen = nullptr;
+        out.cov3D_inv    = nullptr;
+        out.mean_offset  = nullptr;
+    }
 
     m2d_buf->download(out.means2D,       static_cast<std::size_t>(N) * 2 * sizeof(float));
     dep_buf->download(out.depths,        static_cast<std::size_t>(N) * sizeof(float));
     rgb_buf->download(out.rgb,           static_cast<std::size_t>(N) * 3 * sizeof(float));
     rad_buf->download(out.radii,         static_cast<std::size_t>(N) * sizeof(int32_t));
     tt_buf ->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
-    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * sizeof(float));
+    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * 2 * sizeof(float));
+
+    if (eval_3D_) {
+        gauss2screen_buf_->download(out.gauss2screen, static_cast<std::size_t>(N) * 16 * sizeof(float));
+        cov3d_inv_buf_   ->download(out.cov3D_inv,    static_cast<std::size_t>(N) * 6 * sizeof(float));
+        mean_offset_buf_ ->download(out.mean_offset,  static_cast<std::size_t>(N) * 3 * sizeof(float));
+    }
 
     // Deinterleave packed {conic.a, conic.b, conic.c, opacity} (stride-4 per
     // Gaussian) into the CPU-reference layout: conics[N*3] and opacities_2d[N].
@@ -309,6 +324,9 @@ enum RecBufIdx : size_t {
     kPHomWCache,     // binding 16: ForwardCache p_hom_w [N floats]
     kCov2DCache,     // binding 17: ForwardCache cov2D [N*3 floats] dilated (fa, fb, fc)
     kCov2DDetCache,  // binding 18: ForwardCache cov2D_det [N floats] det = fa*fc - fb*fb
+    kGauss2Screen,   // binding 19: eval_3D gauss2screen [N*16 floats]
+    kCov3DInv,       // binding 20: eval_3D cov3D_inv [N*6 floats]
+    kMeanOffset,     // binding 21: eval_3D mean_offset [N*3 floats]
     kRecBufCount,
 };
 }  // namespace
@@ -317,9 +335,6 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
                                         const Camera& cam,
                                         const RenderConfig& cfg) {
     // --- SP-2 hard errors (spec §4.4, same set as process()) -----------------
-    if (cfg.eval_3D)
-        throw std::runtime_error(
-            "PreprocessorVulkan::prepare_record: eval_3D=true not supported in SP-2");
     if (cfg.tile_w != 16 || cfg.tile_h != 16)
         throw std::runtime_error(
             "PreprocessorVulkan::prepare_record: only 16x16 tiles supported");
@@ -373,7 +388,7 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     record_bufs_[kCameraUBO]           = std::make_unique<VulkanBuffer>(
         ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     record_bufs_[kRadiusF]             =
-        mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 2u * sizeof(float));
     // ForwardCache output scratch buffers (bindings 14..18).
     // Always allocated so the descriptor set is fully bound. Layer-2 callers
     // that use record() don't download these — that is a Layer-1 concern.
@@ -387,6 +402,13 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
         mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
     record_bufs_[kCov2DDetCache]       =
         mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    // eval_3D output buffers (bindings 19..21).
+    record_bufs_[kGauss2Screen]        =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 16 * sizeof(float));
+    record_bufs_[kCov3DInv]            =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 6 * sizeof(float));
+    record_bufs_[kMeanOffset]          =
+        mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
 
     // --- 2. Upload inputs ----------------------------------------------------
     record_bufs_[kPositions]->upload(g.positions,
@@ -450,6 +472,9 @@ void PreprocessorVulkan::prepare_record(const GaussianData& g,
     b.p_hom_w_cache        = record_bufs_[kPHomWCache]          ->handle();
     b.cov2D_cache          = record_bufs_[kCov2DCache]          ->handle();
     b.cov2D_det_cache      = record_bufs_[kCov2DDetCache]       ->handle();
+    b.gauss2screen         = record_bufs_[kGauss2Screen]        ->handle();
+    b.cov3D_inv            = record_bufs_[kCov3DInv]            ->handle();
+    b.mean_offset          = record_bufs_[kMeanOffset]          ->handle();
     pass_->bind_buffers(b);
 }
 
@@ -500,4 +525,16 @@ VkBuffer PreprocessorVulkan::tiles_touched_buffer() const {
 VkBuffer PreprocessorVulkan::radius_f_buffer() const {
     if (record_bufs_.size() <= kRadiusF) return VK_NULL_HANDLE;
     return record_bufs_[kRadiusF] ? record_bufs_[kRadiusF]->handle() : VK_NULL_HANDLE;
+}
+VkBuffer PreprocessorVulkan::gauss2screen_buffer() const {
+    if (record_bufs_.size() <= kGauss2Screen) return VK_NULL_HANDLE;
+    return record_bufs_[kGauss2Screen] ? record_bufs_[kGauss2Screen]->handle() : VK_NULL_HANDLE;
+}
+VkBuffer PreprocessorVulkan::cov3D_inv_buffer() const {
+    if (record_bufs_.size() <= kCov3DInv) return VK_NULL_HANDLE;
+    return record_bufs_[kCov3DInv] ? record_bufs_[kCov3DInv]->handle() : VK_NULL_HANDLE;
+}
+VkBuffer PreprocessorVulkan::mean_offset_buffer() const {
+    if (record_bufs_.size() <= kMeanOffset) return VK_NULL_HANDLE;
+    return record_bufs_[kMeanOffset] ? record_bufs_[kMeanOffset]->handle() : VK_NULL_HANDLE;
 }

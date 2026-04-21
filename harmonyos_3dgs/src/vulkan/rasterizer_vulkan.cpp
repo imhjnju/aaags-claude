@@ -28,6 +28,8 @@
 
 #include "vulkan/rasterizer_vulkan.h"
 #include "vulkan/vk_buffer.h"
+#include "vulkan/preprocess_bindings.h"   // RasterEval3DUBO
+#include "math_utils.h"                   // invertMatrix4x4
 
 #include <cstddef>
 #include <cstdint>
@@ -36,9 +38,9 @@
 #include <stdexcept>
 #include <vector>
 
-RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx)
-    : ctx_(ctx) {
-    pass_ = std::make_unique<RasterizePass>(ctx_);
+RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx, bool eval_3D)
+    : ctx_(ctx), eval_3D_(eval_3D) {
+    pass_ = std::make_unique<RasterizePass>(ctx_, eval_3D ? 1u : 0u);
 }
 
 // Out-of-line so unique_ptr<RasterizePass> can see the complete type from
@@ -181,6 +183,62 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     ubo_buf->upload(&ubo, sizeof(ubo));
 
     // -------------------------------------------------------------------
+    // eval_3D rasterize buffers (gauss2screen, opacities_2d, cov3D_inv,
+    // mean_offset, RasterEval3DUBO).
+    // -------------------------------------------------------------------
+    std::unique_ptr<VulkanBuffer> g2s_buf, opa2d_buf, r_cov3d_buf, r_mo_buf;
+    std::unique_ptr<VulkanBuffer> eval3d_ubo_buf;
+    std::unique_ptr<VulkanBuffer> dummy4_buf;
+
+    if (eval_3D_ && preprocess.gauss2screen && preprocess.opacities_2d) {
+        g2s_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N_eff) * 16u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        g2s_buf->upload(preprocess.gauss2screen,
+            static_cast<std::size_t>(N_eff) * 16u * sizeof(float));
+        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N_eff) * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        opa2d_buf->upload(preprocess.opacities_2d,
+            static_cast<std::size_t>(N_eff) * sizeof(float));
+        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N_eff) * 6u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        r_cov3d_buf->upload(preprocess.cov3D_inv,
+            static_cast<std::size_t>(N_eff) * 6u * sizeof(float));
+        r_mo_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        r_mo_buf->upload(preprocess.mean_offset,
+            static_cast<std::size_t>(N_eff) * 3u * sizeof(float));
+    } else {
+        dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        g2s_buf   = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        r_mo_buf  = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    // Build RasterEval3DUBO.
+    RasterEval3DUBO eubo{};
+    {
+        float inv_vp[16];
+        if (invertMatrix4x4(camera.viewproj_matrix, inv_vp))
+            std::memcpy(eubo.inverse_vp, inv_vp, sizeof(inv_vp));
+        eubo.cam_pos[0] = camera.cam_pos[0];
+        eubo.cam_pos[1] = camera.cam_pos[1];
+        eubo.cam_pos[2] = camera.cam_pos[2];
+        eubo.cam_pos[3] = 0.0f;
+        eubo.img_size[0] = static_cast<float>(W);
+        eubo.img_size[1] = static_cast<float>(H);
+        eubo.img_size[2] = 0.0f;
+        eubo.img_size[3] = 0.0f;
+    }
+    eval3d_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
+        sizeof(RasterEval3DUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
+
+    // -------------------------------------------------------------------
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizePass::Buffers rb{};
@@ -193,6 +251,11 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     rb.transmittance        = t_buf  ->handle();
     rb.n_contrib            = nc_buf ->handle();
     rb.raster_ubo           = ubo_buf->handle();
+    rb.gauss2screen         = g2s_buf->handle();
+    rb.opacities_2d         = opa2d_buf->handle();
+    rb.cov3D_inv            = r_cov3d_buf->handle();
+    rb.mean_offset          = r_mo_buf->handle();
+    rb.raster_eval3d_ubo    = eval3d_ubo_buf->handle();
     pass_->bind_buffers(rb);
     pass_->dispatch_sync(N_eff,
                          static_cast<uint32_t>(W), static_cast<uint32_t>(H),
@@ -202,6 +265,22 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // Download outputs.
     // -------------------------------------------------------------------
     img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+
+    // Convert GPU CHW layout to CPU HWC layout.
+    // rasterize.comp writes: out_image[ch * HW + px]  (CHW)
+    // Rasterizer interface: output_image[px * 3 + ch]  (HWC)
+    {
+        std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
+        std::memcpy(chw.data(), output_image,
+                    static_cast<std::size_t>(HW) * 3u * sizeof(float));
+        for (int px = 0; px < HW; ++px) {
+            for (int ch = 0; ch < 3; ++ch) {
+                output_image[static_cast<std::size_t>(px) * 3 + ch] =
+                    chw[static_cast<std::size_t>(ch) * HW + px];
+            }
+        }
+    }
+
     if (cache) {
         if (cache->T_final) {
             t_buf->download(cache->T_final,
@@ -228,7 +307,12 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
                                       VkBuffer tile_ranges,
                                       VkBuffer means2D,
                                       VkBuffer conic_opacity_packed,
-                                      VkBuffer rgb) {
+                                      VkBuffer rgb,
+                                      VkBuffer gauss2screen,
+                                      VkBuffer opacities_2d,
+                                      VkBuffer cov3D_inv,
+                                      VkBuffer mean_offset,
+                                      const Camera& cam) {
     if (W == 0u || H == 0u)
         throw std::runtime_error(
             "RasterizerVulkan::prepare_record: W/H must be > 0");
@@ -238,6 +322,8 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
     r_tfinal_.reset();
     r_ncontrib_.reset();
     r_ubo_.reset();
+    r_eval3d_ubo_.reset();
+    r_dummy4_.reset();
 
     const uint32_t HW = H * W;
     const VkDeviceSize bytes_img      =
@@ -257,12 +343,44 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
         ctx_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    // Upload background colour into the UBO up front. Nothing else in the UBO.
     RasterizeUBO ubo{};
     ubo.bg_r = bg_color[0];
     ubo.bg_g = bg_color[1];
     ubo.bg_b = bg_color[2];
     r_ubo_->upload(&ubo, sizeof(ubo));
+
+    // Build RasterEval3DUBO.
+    RasterEval3DUBO eubo{};
+    {
+        float inv_vp[16];
+        if (invertMatrix4x4(cam.viewproj_matrix, inv_vp))
+            std::memcpy(eubo.inverse_vp, inv_vp, sizeof(inv_vp));
+        eubo.cam_pos[0] = cam.cam_pos[0];
+        eubo.cam_pos[1] = cam.cam_pos[1];
+        eubo.cam_pos[2] = cam.cam_pos[2];
+        eubo.cam_pos[3] = 0.0f;
+        eubo.img_size[0] = static_cast<float>(W);
+        eubo.img_size[1] = static_cast<float>(H);
+        eubo.img_size[2] = 0.0f;
+        eubo.img_size[3] = 0.0f;
+    }
+    r_eval3d_ubo_ = std::make_unique<VulkanBuffer>(
+        ctx_, sizeof(RasterEval3DUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    r_eval3d_ubo_->upload(&eubo, sizeof(eubo));
+
+    // Dummy buffer for unbound eval_3D SSBOs when eval_3D=false.
+    VkBuffer g2s_h  = gauss2screen;
+    VkBuffer opa_h  = opacities_2d;
+    VkBuffer cov_h  = cov3D_inv;
+    VkBuffer mo_h   = mean_offset;
+    if (!eval_3D_ || gauss2screen == VK_NULL_HANDLE) {
+        r_dummy4_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        g2s_h = r_dummy4_->handle();
+        opa_h = r_dummy4_->handle();
+        cov_h = r_dummy4_->handle();
+        mo_h  = r_dummy4_->handle();
+    }
 
     RasterizePass::Buffers rb{};
     rb.values_sorted        = values_sorted;
@@ -274,6 +392,11 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
     rb.transmittance        = r_tfinal_  ->handle();
     rb.n_contrib            = r_ncontrib_->handle();
     rb.raster_ubo           = r_ubo_     ->handle();
+    rb.gauss2screen         = g2s_h;
+    rb.opacities_2d         = opa_h;
+    rb.cov3D_inv            = cov_h;
+    rb.mean_offset          = mo_h;
+    rb.raster_eval3d_ubo    = r_eval3d_ubo_->handle();
     pass_->bind_buffers(rb);
 
     r_W_   = W;
@@ -295,9 +418,21 @@ void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) {
     if (!r_img_)
         throw std::runtime_error(
             "RasterizerVulkan::download_image called before prepare_record()");
+    const uint32_t HW = H * W;
     const std::size_t bytes =
-        static_cast<std::size_t>(W) * H * 3u * sizeof(float);
+        static_cast<std::size_t>(HW) * 3u * sizeof(float);
     r_img_->download(dst, bytes);
+
+    // Convert GPU CHW layout to CPU HWC layout to match rasterize() output
+    // convention and the CPU rasterizer's pixel-major format.
+    std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
+    std::memcpy(chw.data(), dst, bytes);
+    for (uint32_t px = 0; px < HW; ++px) {
+        for (int ch = 0; ch < 3; ++ch) {
+            dst[static_cast<std::size_t>(px) * 3 + ch] =
+                chw[static_cast<std::size_t>(ch) * HW + px];
+        }
+    }
 }
 
 void RasterizerVulkan::download_cache(float* T_final, int* n_contrib,

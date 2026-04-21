@@ -41,6 +41,7 @@ add_library(gs3d_core
     src/dssim.cpp
     src/densification.cpp
     src/train_utils.cpp
+    src/camera_utils.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
 
@@ -289,7 +290,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_densification.cpp
                 tests/test_e2e_basketball.cpp
                 tests/test_cpu_vk_compare.cpp
-                tests/test_vk_vs_py_reference.cpp)
+                tests/test_vk_vs_py_reference.cpp
+                tests/test_vk_vs_cpu_render.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
@@ -303,7 +305,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             target_compile_definitions(gs3d_vk_tests PRIVATE
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}"
-                TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
+                TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data"
+                REPO_ROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
             # E2E basketball test runs 2000 training steps — allow up to 2 hours.
             # The synchronous GPU dispatch model makes it slow on the dev machine;
             # a pipeline-recorded dispatch path would reduce this significantly.

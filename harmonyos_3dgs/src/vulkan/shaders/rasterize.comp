@@ -85,6 +85,20 @@ layout(std140, set = 0, binding = 8) uniform RasterUBO {
     vec4 bg_color;  // (R, G, B, unused)
 };
 
+// eval_3D bindings (9..13) — only accessed when spec_eval_3D == 1.
+layout(std430, set = 0, binding = 9)  readonly buffer Gauss2Screen { float gauss2screen[]; };  // [N*16] row-major
+layout(std430, set = 0, binding = 10) readonly buffer Opacities2D  { float opacities_2d[]; };  // [N] pre-dilated opacity
+layout(std430, set = 0, binding = 11) readonly buffer Cov3DInv     { float cov3D_inv[];    };  // [N*6] inverse 3D cov
+layout(std430, set = 0, binding = 12) readonly buffer MeanOffset   { float mean_offset[];  };  // [N*3] (pos - cam_pos)
+layout(std140, set = 0, binding = 13) uniform RasterEval3DUBO {
+    mat4 inverse_vp;        // 64B: inverse viewproj (column-major)
+    vec4 cam_pos_pad;       // 16B: xyz=cam_pos, w=0
+    vec4 img_size_pad;      // 16B: x=width, y=height, z=0, w=0
+} eval3d_ubo;
+
+// Specialization constant: 0=2D conic path, 1=eval_3D k-buffer path.
+layout(constant_id = 0) const uint spec_eval_3D = 0u;
+
 // RasterizePushConstants — 20 bytes (spec §4.8.7).
 layout(push_constant) uniform PC {
     uint num_gaussians;  // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
@@ -106,9 +120,41 @@ shared float s_rgb_g  [256];
 shared float s_rgb_b  [256];
 shared uint  s_gid    [256];
 
+// eval_3D shared memory: gauss2screen all 4 rows (16 floats per Gaussian),
+// opacity. s_rgb_r/g/b and s_gid are reused from 2D path.
+// Total eval_3D: 16*256*4 + 1*256*4 + reused = ~17 KB + 4 KB reused.
+shared float s_g2s  [256 * 16];  // all 4 rows of gauss2screen (need row 2 for depth)
+shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
+
 const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
 const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
 const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
+
+// --- eval_3D helper functions ------------------------------------------------
+
+// Port of CUDA consistent_common.cuh:max_contrib_ray.
+// Returns squared Mahalanobis distance (peak exponent) and sets max_pos to
+// the closest-approach point on the ray (in Gaussian homogeneous coordinates).
+// Caller uses max_pos with g2s rows 2,3 to compute NDC depth.
+float maxContribRayPixel(float plane_a[4], float plane_b[4], out float max_pos[4]) {
+    float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
+    float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
+    float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
+    float mx = plane_a[3]*plane_b[0] - plane_a[0]*plane_b[3];
+    float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
+    float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
+    float dd = dx*dx + dy*dy + dz*dz;
+    if (dd < 1e-8) {
+        max_pos = float[4](0.0, 0.0, 0.0, 1.0);
+        return 0.0;
+    }
+    float m_div_dd[3] = float[3](mx/dd, my/dd, mz/dd);
+    max_pos[0] = dy*m_div_dd[2] - dz*m_div_dd[1];
+    max_pos[1] = dz*m_div_dd[0] - dx*m_div_dd[2];
+    max_pos[2] = dx*m_div_dd[1] - dy*m_div_dd[0];
+    max_pos[3] = 1.0;
+    return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
+}
 
 void main() {
     // --- Tile → range lookup ---
@@ -132,10 +178,90 @@ void main() {
     // but contribute nothing; treat them as already-done for the blending loop.
     bool pixel_done = !valid_pixel;
 
-    // --- Batched march through this tile's sorted Gaussian list ---
-    // TODO(SP-3-perf): add subgroup-wide early-exit when all pixels in tile are done
-    // (CUDA equivalent: __syncthreads_count(done) at forward.cu:386-388; Vulkan uses
-    // subgroupAllEqual() or a shared counter + barrier + uniform read).
+    if (spec_eval_3D == 1u) {
+    // =================================================================
+    // eval_3D path: vanilla front-to-back blending with 3D Gaussian
+    // evaluation via gauss2screen plane equations.
+    // Reference: CUDA forward.cu:renderCUDA (EVAL_3D=true, SortMode::GLOBAL).
+    // Gaussians arrive pre-sorted by maxContribGaussianFrustum3D per-tile
+    // depth key (scatter.comp). We blend in that order — no per-pixel
+    // depth re-sorting (matches CUDA GLOBAL sort mode).
+    // =================================================================
+
+    for (uint batch_start = range_start;
+         batch_start < range_end;
+         batch_start += BATCH_SIZE)
+    {
+        // 1. Cooperative load into shared memory.
+        uint load_idx = batch_start + local_idx;
+        if (load_idx < range_end) {
+            uint gid = values_sorted[load_idx];
+            s_gid[local_idx] = gid;
+            // Load gauss2screen rows 0, 1, 3 (row 2 + row 3 for depth clip).
+            for (int j = 0; j < 4; j++) {
+                s_g2s[local_idx * 16u + uint(j)]         = gauss2screen[gid * 16u + 0u * 4u + uint(j)]; // row 0
+                s_g2s[local_idx * 16u + 4u + uint(j)]    = gauss2screen[gid * 16u + 1u * 4u + uint(j)]; // row 1
+                s_g2s[local_idx * 16u + 8u + uint(j)]    = gauss2screen[gid * 16u + 2u * 4u + uint(j)]; // row 2
+                s_g2s[local_idx * 16u + 12u + uint(j)]   = gauss2screen[gid * 16u + 3u * 4u + uint(j)]; // row 3
+            }
+            // Read opacity from conic_opacity (slot 3) — preprocess.comp writes
+            // the dilated opacity there for both 2D and eval_3D paths.
+            s_opa[local_idx]     = conic_opacity[gid * 4u + 3u];
+            s_rgb_r[local_idx]   = rgb[gid * 3u + 0u];
+            s_rgb_g[local_idx]   = rgb[gid * 3u + 1u];
+            s_rgb_b[local_idx]   = rgb[gid * 3u + 2u];
+        }
+        barrier();
+
+        // 2. Per-pixel eval_3D evaluation + front-to-back blending.
+        uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+        if (!pixel_done) {
+            float fpx = float(pixel_x);
+            float fpy = float(pixel_y);
+
+            for (uint k = 0u; k < batch_size; ++k) {
+                // Plane equations from gauss2screen rows 0,1,3 (16-float stride).
+                float plane_x[4], plane_y[4];
+                for (int j = 0; j < 4; j++) {
+                    plane_x[j] = s_g2s[k * 16u + uint(j)]        - s_g2s[k * 16u + 12u + uint(j)] * fpx;
+                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)]   - s_g2s[k * 16u + 12u + uint(j)] * fpy;
+                }
+
+                float max_pos[4];
+                float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
+                if (power > 0.0) continue;
+
+                float alpha = min(0.99, s_opa[k] * exp(power));
+                if (alpha < ALPHA_THRESHOLD) continue;
+
+                // Depth clip: NDC z/w must be in [-1, 1] (CUDA forward.cu:451-454).
+                // w = dot(g2s_row3, max_pos), depth = dot(g2s_row2, max_pos).
+                // Reject if depth < -w || depth > w.
+                float w_ndc = 0.0, z_ndc = 0.0;
+                for (int j = 0; j < 4; j++) {
+                    w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
+                    z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                }
+                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+                // Front-to-back alpha blending (matches CUDA vanilla path).
+                float test_T = T * (1.0 - alpha);
+                if (test_T < T_MIN) { pixel_done = true; continue; }
+                C.r += s_rgb_r[k] * alpha * T;
+                C.g += s_rgb_g[k] * alpha * T;
+                C.b += s_rgb_b[k] * alpha * T;
+                T = test_T;
+                n += 1u;
+            }
+        }
+        barrier();
+    }
+
+    } else {
+    // =================================================================
+    // 2D conic path (unchanged from SP-2 — standard front-to-back blend).
+    // =================================================================
+
     for (uint batch_start = range_start;
          batch_start < range_end;
          batch_start += BATCH_SIZE)
@@ -163,25 +289,18 @@ void main() {
             for (uint k = 0u; k < batch_size; ++k) {
                 float dx = float(pixel_x) - s_mean_x[k];
                 float dy = float(pixel_y) - s_mean_y[k];
-                // Power of unnormalised 2D Gaussian in inverse-covariance form.
-                // con_o.y (b) is the raw off-diagonal, not pre-halved — matches
-                // CUDA forward.cu exactly.
                 float power = -0.5 * (s_conic_a[k] * dx * dx
                                     + s_conic_c[k] * dy * dy)
                               - s_conic_b[k] * dx * dy;
                 if (power > 0.0) {
-                    continue;  // pixel behind peak of this (degenerate-eval'd) Gaussian
+                    continue;
                 }
                 float alpha = min(0.99, s_opacity[k] * exp(power));
                 if (alpha < ALPHA_THRESHOLD) {
-                    continue;  // negligible contribution
+                    continue;
                 }
                 float test_T = T * (1.0 - alpha);
                 if (test_T < T_MIN) {
-                    // Transmittance exhausted: stop blending further Gaussians
-                    // for this pixel. The triggering Gaussian is NOT counted
-                    // (matches forward.cu: `done = true; continue;` before the
-                    //  accumulation block).
                     pixel_done = true;
                     break;
                 }
@@ -192,8 +311,10 @@ void main() {
                 n += 1u;
             }
         }
-        barrier();  // ensure every thread finishes before next load overwrites shared
+        barrier();
     }
+
+    } // end spec_eval_3D branch
 
     // --- Write final outputs ---
     if (valid_pixel) {

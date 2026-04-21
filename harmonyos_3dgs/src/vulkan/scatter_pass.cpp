@@ -26,9 +26,10 @@ ScatterPass::ScatterPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(scatter_spv),
         static_cast<std::size_t>(scatter_spv_len));
 
-    // 8 SSBOs, all storage buffers. No specialization constants.
-    std::vector<VkDescriptorType> binding_types(8,
+    // 12 bindings: 11 SSBOs + 1 UBO (binding 10 = ScatterUBO).
+    std::vector<VkDescriptorType> binding_types(12,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    binding_types[scatter_bind::SCATTER_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
     pipeline_ = std::make_unique<VulkanComputePipeline>(
         ctx_,
@@ -49,11 +50,17 @@ void ScatterPass::bind_buffers(const Buffers& b) {
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::KEYS_UNSORTED,   b.keys_unsorted);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::VALUES_UNSORTED, b.values_unsorted);
     pipeline_->update_ssbo(descriptor_set_, scatter_bind::RADIUS_F,        b.radius_f);
+    pipeline_->update_ssbo(descriptor_set_, scatter_bind::COV3D_INV,      b.cov3D_inv);
+    pipeline_->update_ssbo(descriptor_set_, scatter_bind::MEAN_OFFSET,    b.mean_offset);
+    pipeline_->update_ssbo(descriptor_set_, scatter_bind::GAUSS2SCREEN,  b.gauss2screen);
+    pipeline_->update_ubo(descriptor_set_,  scatter_bind::SCATTER_UBO,
+                          b.scatter_ubo, sizeof(ScatterUBO));
 }
 
 void ScatterPass::dispatch_sync(uint32_t num_gaussians,
                                 uint32_t num_tiles_x,
-                                uint32_t num_tiles_y) {
+                                uint32_t num_tiles_y,
+                                bool eval_3D) {
     if (descriptor_set_ == VK_NULL_HANDLE)
         throw std::runtime_error(
             "ScatterPass::dispatch_sync called before bind_buffers()");
@@ -65,7 +72,7 @@ void ScatterPass::dispatch_sync(uint32_t num_gaussians,
     pc.num_tiles_y   = num_tiles_y;
     pc.tile_w        = 16u;  // SP-2 tile size is hard-coded per spec §4.4.
     pc.tile_h        = 16u;
-    pc._pad          = 0u;
+    pc.eval_3D       = eval_3D ? 1u : 0u;
 
     const uint32_t groups =
         (num_gaussians + kScatterLocalSize - 1u) / kScatterLocalSize;
@@ -77,7 +84,8 @@ void ScatterPass::dispatch_sync(uint32_t num_gaussians,
 void ScatterPass::record(VkCommandBuffer cmd,
                          uint32_t num_gaussians,
                          uint32_t num_tiles_x,
-                         uint32_t num_tiles_y) {
+                         uint32_t num_tiles_y,
+                         bool eval_3D) {
     if (descriptor_set_ == VK_NULL_HANDLE)
         throw std::runtime_error(
             "ScatterPass::record called before bind_buffers()");
@@ -89,7 +97,7 @@ void ScatterPass::record(VkCommandBuffer cmd,
     pc.num_tiles_y   = num_tiles_y;
     pc.tile_w        = 16u;
     pc.tile_h        = 16u;
-    pc._pad          = 0u;
+    pc.eval_3D       = eval_3D ? 1u : 0u;
 
     const uint32_t groups =
         (num_gaussians + kScatterLocalSize - 1u) / kScatterLocalSize;

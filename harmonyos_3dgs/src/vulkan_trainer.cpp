@@ -300,34 +300,6 @@ float VulkanTrainer::step(const Camera& cam,
     rasterizer_.rasterize(pre, bin, cam, active_cfg, image_.data(),
                           /*depth=*/nullptr, &cache, &alloc_);
 
-    // 4b. Convert rasterizer output from CHW (channel-first GPU layout) to HWC
-    //     (pixel-major CPU layout expected by compute_combined_loss_gradient and
-    //     the rasterize_backward.comp shader).
-    //
-    //     rasterize.comp writes: out_image[ch * HW + px]   (CHW)
-    //     backward shader reads: dL_dpixels[px * 3 + ch]   (HWC)
-    //
-    //     Without this conversion, the loss gradient fed to the backward shader
-    //     is scrambled: each pixel sees the R/G/B signs of the WRONG pixel in
-    //     the other channel plane, causing ~50% underestimation of all gradient
-    //     norms relative to the Python autograd reference.
-    //
-    //     Evidence: Python autograd gradient norm rel_diff drops from ~45–60%
-    //     (before fix) to < 5% (after fix) for scale/rotation/SH/opacity groups.
-    {
-        const int HW = H * W;
-        const std::vector<float> chw_tmp(image_);  // copy CHW buffer
-        for (int px = 0; px < HW; ++px) {
-            for (int ch = 0; ch < 3; ++ch) {
-                image_[static_cast<size_t>(px) * 3 + ch] =
-                    chw_tmp[static_cast<size_t>(ch) * HW + px];
-            }
-        }
-        // TODO(perf): eliminate this copy by fixing rasterize.comp to write HWC
-        // directly (out_image[px*3+ch] instead of out_image[ch*HW+px]). At
-        // 720×960 this is ~8 MB copied every training step.
-    }
-
     // 5. Combined L1 + DSSIM loss + gradient.
     //    lambda_dssim=0 disables the O(W*H*WINDOW^2) SSIM computation (use for large images).
     last_loss_ = compute_combined_loss_gradient(

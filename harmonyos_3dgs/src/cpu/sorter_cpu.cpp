@@ -15,7 +15,7 @@ void SorterCPU::sort(BinningOutput& bin, FrameAllocator& alloc) {
     std::iota(indices, indices + bin.total_pairs, 0u);
 
     // Sort indices by key
-    std::sort(indices, indices + bin.total_pairs, [&](uint32_t a, uint32_t b) {
+    std::stable_sort(indices, indices + bin.total_pairs, [&](uint32_t a, uint32_t b) {
         return bin.keys_unsorted[a] < bin.keys_unsorted[b];
     });
 

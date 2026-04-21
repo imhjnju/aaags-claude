@@ -104,7 +104,11 @@ public:
         VkBuffer tiles_touched;   // RO int[N]
         VkBuffer keys_unsorted;   // WO uint64[R]
         VkBuffer values_unsorted; // WO uint[R]
-        VkBuffer radius_f;        // RO float[N]  — float eigenvalue radius from preprocess
+        VkBuffer radius_f;        // RO float[N*2] — (extent_x, extent_y) per Gaussian from preprocess
+        VkBuffer cov3D_inv;       // RO float[N*6]   (binding 8, eval_3D only)
+        VkBuffer mean_offset;     // RO float[N*3]   (binding 9, eval_3D only)
+        VkBuffer scatter_ubo;     // UB ScatterUBO   (binding 10, eval_3D only)
+        VkBuffer gauss2screen;    // RO float[N*16]  (binding 11, eval_3D sort key)
     };
 
     explicit ScatterPass(VulkanContext& ctx);
@@ -117,15 +121,18 @@ public:
 
     /// Layer 1: sync dispatch of scatter.comp over `num_gaussians` threads.
     /// Tile grid parameters are required because scatter recomputes rect.
+    /// eval_3D enables per-tile depthAlongRay keys via cov3D_inv/mean_offset.
     void dispatch_sync(uint32_t num_gaussians,
                        uint32_t num_tiles_x,
-                       uint32_t num_tiles_y);
+                       uint32_t num_tiles_y,
+                       bool eval_3D = false);
 
     /// Layer 2: record into an external cmd buffer.
     void record(VkCommandBuffer cmd,
                 uint32_t num_gaussians,
                 uint32_t num_tiles_x,
-                uint32_t num_tiles_y);
+                uint32_t num_tiles_y,
+                bool eval_3D = false);
 
 private:
     VulkanContext& ctx_;

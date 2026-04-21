@@ -279,7 +279,7 @@ RenderConfig makeBasicCfg() {
 }
 }  // namespace
 
-TEST(PreprocessPass, RejectsEval3D) {
+TEST(PreprocessPass, Eval3D_SingleGaussian) {
     VulkanContext ctx;
     ASSERT_TRUE(ctx.init());
 
@@ -289,22 +289,18 @@ TEST(PreprocessPass, RejectsEval3D) {
     g.positions = s.pos; g.scales = s.scl; g.rotations = s.rot;
     g.opacities = s.opa; g.sh_coeffs = s.sh; g.filter_3D = s.f3d;
 
-    Camera cam{};
-    const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    std::memcpy(cam.view_matrix,     id, sizeof(id));
-    std::memcpy(cam.viewproj_matrix, id, sizeof(id));
-    cam.tan_fovx = 1.0f; cam.tan_fovy = 1.0f;
-    cam.width = 64; cam.height = 64;
-
-    RenderConfig cfg{};
-    cfg.sh_degree = 0;
-    cfg.eval_3D   = true;    // must be rejected
-    cfg.tile_w    = 16;
-    cfg.tile_h    = 16;
+    Camera cam = makePerspCamera();
+    RenderConfig cfg = makeBasicCfg();
+    cfg.eval_3D = true;
 
     FrameAllocator alloc(1u * 1024u * 1024u);
-    PreprocessorVulkan pp(ctx);
-    EXPECT_THROW(pp.process(g, cam, cfg, alloc), std::runtime_error);
+    PreprocessorVulkan pp(ctx, /*eval_3D=*/true);
+    PreprocessOutput out = pp.process(g, cam, cfg, alloc);
+    // eval_3D path should produce valid output without throwing.
+    EXPECT_TRUE(out.eval_3D);
+    EXPECT_NE(out.gauss2screen, nullptr);
+    EXPECT_NE(out.cov3D_inv, nullptr);
+    EXPECT_NE(out.mean_offset, nullptr);
 }
 
 TEST(PreprocessPass, RejectsNon16Tile) {
@@ -371,18 +367,21 @@ TEST(PreprocessPass, CullPaths_NearPlane) {
     EXPECT_EQ(out.radii[0], 0)         << "G0 (near-plane) radii != 0";
     EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (near-plane) tiles_touched != 0";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (near-plane) radius_f != 0.0";
+    EXPECT_EQ(out.radius_f[0*2], 0.0f)   << "G0 (near-plane) radius_f_x != 0.0";
+    EXPECT_EQ(out.radius_f[0*2+1], 0.0f) << "G0 (near-plane) radius_f_y != 0.0";
 
     // G1: visible — control check.
     EXPECT_GT(out.radii[1], 0)         << "G1 (visible) radii should be > 0";
     EXPECT_GT(out.tiles_touched[1], 0) << "G1 (visible) tiles_touched should be > 0";
-    EXPECT_GT(out.radius_f[1], 0.0f)   << "G1 (visible) radius_f should be > 0";
+    EXPECT_GT(out.radius_f[1*2], 0.0f)   << "G1 (visible) radius_f_x should be > 0";
 }
 
 // Radius cull (my_radius > max(W, H)).
 // G0 at center screen (z=5) with scale=(1000,1000,1000).
-// Projected radius ≫ max(W=64, H=64) → radius_cull triggers.
-TEST(PreprocessPass, CullPaths_RadiusCull) {
+// Projected radius ≫ max(W=64, H=64).  CUDA does NOT cull large-radius
+// Gaussians, so neither do we.  The Gaussian should be visible and cover
+// many tiles.
+TEST(PreprocessPass, LargeRadius_NotCulled) {
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan device";
 
@@ -402,10 +401,11 @@ TEST(PreprocessPass, CullPaths_RadiusCull) {
     PreprocessorVulkan pp(ctx);
     auto out = pp.process(g, makePerspCamera(), makeBasicCfg(), alloc);
 
-    EXPECT_EQ(out.radii[0], 0)         << "G0 (radius-culled) radii != 0";
-    EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (radius-culled) tiles_touched != 0";
+    // Should NOT be culled — CUDA renders large-radius Gaussians.
+    EXPECT_GT(out.radii[0], 0)         << "Large Gaussian should be visible";
+    EXPECT_GT(out.tiles_touched[0], 0) << "Large Gaussian should touch tiles";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (radius-culled) radius_f != 0.0";
+    EXPECT_GT(out.radius_f[0*2], 0.0f)   << "Large Gaussian should have nonzero radius_f";
 }
 
 // Zero-tiles cull (n_tiles == 0).
@@ -436,5 +436,5 @@ TEST(PreprocessPass, CullPaths_ZeroTiles) {
     EXPECT_EQ(out.radii[0], 0)         << "G0 (zero-tiles) radii != 0";
     EXPECT_EQ(out.tiles_touched[0], 0) << "G0 (zero-tiles) tiles_touched != 0";
     ASSERT_NE(out.radius_f, nullptr);
-    EXPECT_EQ(out.radius_f[0], 0.0f)   << "G0 (zero-tiles) radius_f != 0.0";
+    EXPECT_EQ(out.radius_f[0*2], 0.0f)   << "G0 (zero-tiles) radius_f != 0.0";
 }
