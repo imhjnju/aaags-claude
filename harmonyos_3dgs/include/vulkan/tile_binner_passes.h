@@ -109,6 +109,7 @@ public:
         VkBuffer mean_offset;     // RO float[N*3]   (binding 9, eval_3D only)
         VkBuffer scatter_ubo;     // UB ScatterUBO   (binding 10, eval_3D only)
         VkBuffer gauss2screen;    // RO float[N*16]  (binding 11, eval_3D sort key)
+        VkBuffer conic_opacity_packed; // RO float[N*4]  (binding 12, eval_3D tile culling: opacity at [i*4+3])
     };
 
     explicit ScatterPass(VulkanContext& ctx);

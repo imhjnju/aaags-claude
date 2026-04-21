@@ -41,6 +41,8 @@ namespace {
 // G1 baseline locked at 36.3 dB (floor(36.864*10)/10 - 0.5).
 // Task 12 (per-pixel k-buffer HEAD_WINDOW=4): P2=40.266 dB (+3.402 dB) on 2026-04-21.
 // G2 baseline locked at 39.7 dB (floor(40.266*10)/10 - 0.5).
+// Task 11 (tile_based_culling INVALID sentinel for eval_3D): P3=40.256 dB (+3.392 dB vs P1) on 2026-04-21.
+// G3 baseline locked at 39.7 dB (floor(40.256*10)/10 - 0.5 = 39.75 → 39.7; kept same as G2).
 // DO NOT lower this without documenting why.
 constexpr float kBaselinePSNR = 39.7f;
 

@@ -62,6 +62,7 @@ public:
                         VkBuffer cov3D_inv,
                         VkBuffer mean_offset,
                         VkBuffer gauss2screen,
+                        VkBuffer conic_opacity_packed,
                         bool eval_3D,
                         const Camera& cam);
 

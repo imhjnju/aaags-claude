@@ -215,6 +215,7 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     std::unique_ptr<VulkanBuffer> bin_mean_offset_buf;
     std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
     std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
+    std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf;
     if (cfg.eval_3D && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
         bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
             static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
@@ -231,12 +232,30 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         bin_gauss2screen_buf->upload(pre.gauss2screen,
             static_cast<std::size_t>(N) * 16u * sizeof(float));
+        // Pack {conic.a, conic.b, conic.c, opacity} per Gaussian for scatter
+        // tile-based culling predicate. Matches preprocess_bind::CONIC_OPACITY_PACKED layout.
+        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_,
+            static_cast<VkDeviceSize>(N) * 4u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (pre.conics && pre.opacities_2d) {
+            std::vector<float> packed(static_cast<std::size_t>(N) * 4u);
+            for (int k = 0; k < N; ++k) {
+                packed[static_cast<std::size_t>(k) * 4u + 0u] = pre.conics[static_cast<std::size_t>(k) * 3u + 0u];
+                packed[static_cast<std::size_t>(k) * 4u + 1u] = pre.conics[static_cast<std::size_t>(k) * 3u + 1u];
+                packed[static_cast<std::size_t>(k) * 4u + 2u] = pre.conics[static_cast<std::size_t>(k) * 3u + 2u];
+                packed[static_cast<std::size_t>(k) * 4u + 3u] = pre.opacities_2d[k];
+            }
+            bin_conic_opacity_packed_buf->upload(packed.data(),
+                static_cast<std::size_t>(N) * 4u * sizeof(float));
+        }
     } else {
         bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
     // Build ScatterUBO with inverse_vp, cam_pos, img_size.
@@ -271,8 +290,9 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     sb.radius_f        = bin_rf_buf_ ->handle();
     sb.cov3D_inv       = bin_cov3d_inv_buf->handle();
     sb.mean_offset     = bin_mean_offset_buf->handle();
-    sb.scatter_ubo     = bin_scatter_ubo_buf->handle();
-    sb.gauss2screen    = bin_gauss2screen_buf->handle();
+    sb.scatter_ubo          = bin_scatter_ubo_buf->handle();
+    sb.gauss2screen         = bin_gauss2screen_buf->handle();
+    sb.conic_opacity_packed = bin_conic_opacity_packed_buf->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
@@ -310,6 +330,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
                                       VkBuffer cov3D_inv,
                                       VkBuffer mean_offset,
                                       VkBuffer gauss2screen,
+                                      VkBuffer conic_opacity_packed,
                                       bool eval_3D,
                                       const Camera& cam) {
     if (N == 0u)
@@ -373,17 +394,20 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     r_scatter_ubo_->upload(&subo, sizeof(ScatterUBO));
 
-    // For the 2D path, cov3D_inv/mean_offset/gauss2screen may be VK_NULL_HANDLE.
-    // Allocate a 4-byte dummy so the descriptor set stays valid.
+    // For the 2D path, cov3D_inv/mean_offset/gauss2screen/opacities_2d may be VK_NULL_HANDLE.
+    // For the 2D path, cov3D_inv/mean_offset/gauss2screen/conic_opacity_packed
+    // may be VK_NULL_HANDLE. Allocate a 4-byte dummy so the descriptor set stays valid.
     VkBuffer cov3d_handle   = cov3D_inv;
     VkBuffer mo_handle      = mean_offset;
     VkBuffer g2s_handle     = gauss2screen;
+    VkBuffer cop_handle     = conic_opacity_packed;
     if (!eval_3D || cov3D_inv == VK_NULL_HANDLE) {
         r_dummy4_ = std::make_unique<VulkanBuffer>(
             ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         cov3d_handle = r_dummy4_->handle();
         mo_handle    = r_dummy4_->handle();
         g2s_handle   = r_dummy4_->handle();
+        cop_handle   = r_dummy4_->handle();
     }
 
     // Bind scan (input=tiles_touched, output=point_offsets, wg_sums, wg_sums2).
@@ -394,18 +418,19 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
 
     // Bind scatter (inputs + outputs).
     ScatterPass::Buffers sb{};
-    sb.means2D         = means2D;
-    sb.depths          = depths;
-    sb.radii           = radii;
-    sb.point_offsets   = r_po_buf_->handle();
-    sb.tiles_touched   = tiles_touched;
-    sb.keys_unsorted   = r_keys_buf_->handle();
-    sb.values_unsorted = r_vals_buf_->handle();
-    sb.radius_f        = radius_f;
-    sb.cov3D_inv       = cov3d_handle;
-    sb.mean_offset     = mo_handle;
-    sb.scatter_ubo     = r_scatter_ubo_->handle();
-    sb.gauss2screen    = g2s_handle;
+    sb.means2D              = means2D;
+    sb.depths               = depths;
+    sb.radii                = radii;
+    sb.point_offsets        = r_po_buf_->handle();
+    sb.tiles_touched        = tiles_touched;
+    sb.keys_unsorted        = r_keys_buf_->handle();
+    sb.values_unsorted      = r_vals_buf_->handle();
+    sb.radius_f             = radius_f;
+    sb.cov3D_inv            = cov3d_handle;
+    sb.mean_offset          = mo_handle;
+    sb.scatter_ubo          = r_scatter_ubo_->handle();
+    sb.gauss2screen         = g2s_handle;
+    sb.conic_opacity_packed = cop_handle;
     scatter_pass_->bind_buffers(sb);
 
     (void)num_tiles_x;

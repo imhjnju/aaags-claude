@@ -62,20 +62,23 @@ static void sort_cpu_fallback(BinningOutput& bin, FrameAllocator& alloc)
     }
 
     // Compute tile ranges from sorted keys (upper 32 bits = tile index).
+    // Guard: INVALID sentinel keys have tile_id=0xFFFFFFFF (>= num_tiles);
+    // skip them to avoid OOB writes. Matches tile_range.comp line 45.
+    // INVALID keys sort to END (highest key), so valid entries are at [0, first_invalid).
+    const uint32_t num_tiles_u = static_cast<uint32_t>(num_tiles);
     for (int i = 0; i < R; ++i) {
         const uint32_t cur_tile = static_cast<uint32_t>(bin.keys_sorted[i] >> 32);
-        if (i == 0) {
-            bin.tile_ranges[cur_tile * 2u] = 0u;
-        } else {
-            const uint32_t prev_tile = static_cast<uint32_t>(bin.keys_sorted[i - 1] >> 32);
-            if (cur_tile != prev_tile) {
-                bin.tile_ranges[prev_tile * 2u + 1u] = static_cast<uint32_t>(i);
-                bin.tile_ranges[cur_tile  * 2u]      = static_cast<uint32_t>(i);
-            }
-        }
-        if (i == R - 1) {
-            bin.tile_ranges[cur_tile * 2u + 1u] = static_cast<uint32_t>(R);
-        }
+        if (cur_tile >= num_tiles_u) break; // rest are INVALID sentinels, all >= num_tiles
+
+        // Detect left boundary (start of new tile run).
+        const bool is_start = (i == 0) ||
+            (static_cast<uint32_t>(bin.keys_sorted[i - 1] >> 32) != cur_tile);
+        // Detect right boundary (end of tile run).
+        const bool is_end = (i == R - 1) ||
+            (static_cast<uint32_t>(bin.keys_sorted[i + 1] >> 32) != cur_tile);
+
+        if (is_start) bin.tile_ranges[cur_tile * 2u]      = static_cast<uint32_t>(i);
+        if (is_end)   bin.tile_ranges[cur_tile * 2u + 1u] = static_cast<uint32_t>(i + 1);
     }
 }
 

@@ -228,6 +228,7 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
             prep.cov3D_inv_buffer(),
             prep.mean_offset_buffer(),
             prep.gauss2screen_buffer(),
+            prep.conic_opacity_packed_buffer(),
             cfg.eval_3D,
             cam);
         sorter.prepare_record(R_ours, num_tiles,
@@ -456,6 +457,7 @@ TEST(ForwardPipeline, FullChain_TinyFixture_Eval3D) {
             prep.cov3D_inv_buffer(),
             prep.mean_offset_buffer(),
             prep.gauss2screen_buffer(),
+            prep.conic_opacity_packed_buffer(),
             cfg.eval_3D,
             cam);
         sorter.prepare_record(R_ours, num_tiles,

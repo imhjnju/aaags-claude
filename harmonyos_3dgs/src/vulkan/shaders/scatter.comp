@@ -62,6 +62,7 @@ layout(std430, set = 0, binding = 7) readonly  buffer RadiusFIn     { float    r
 layout(std430, set = 0, binding = 8) readonly  buffer Cov3DInvIn   { float    cov3D_inv[];       };  // [N*6] inverse 3D covariance upper tri
 layout(std430, set = 0, binding = 9) readonly  buffer MeanOffsetIn { float    mean_offset[];     };  // [N*3] world-space (pos - cam_pos)
 layout(std430, set = 0, binding = 11) readonly buffer Gauss2ScreenIn { float  gauss2screen_arr[];};  // [N*16] gauss2screen row-major
+layout(std430, set = 0, binding = 12) readonly buffer ConicOpacityIn { float  conic_opacity_packed_arr[]; }; // [N*4] {a,b,c,opacity} for tile culling
 
 layout(std140, set = 0, binding = 10) uniform ScatterUBO {
     mat4 inverse_vp;       // 64B: inverse viewproj (column-major)
@@ -281,9 +282,17 @@ void main() {
 
     // Load gauss2screen 4x4 matrix once per Gaussian for eval_3D sort key.
     float g2s[16];
+    float opacity_factor_threshold = 0.0;
     if (pc.eval_3D != 0u) {
         for (int k = 0; k < 16; k++)
             g2s[k] = gauss2screen_arr[i * 16u + uint(k)];
+        // tile_based_culling: threshold = log(opacity / ALPHA_THRESHOLD)
+        // where ALPHA_THRESHOLD = 1/255.  A tile is written only if
+        // maxContribGaussianFrustum3D() <= threshold (Gaussian contributes
+        // at least ALPHA_THRESHOLD somewhere in the tile).
+        // Matches CUDA: opacity_factor_threshold = logf(co.w / ALPHA_THRESHOLD).
+        float opacity = conic_opacity_packed_arr[i * 4u + 3u];
+        opacity_factor_threshold = log(opacity * 255.0);  // = log(opacity / (1/255))
     }
 
     // Iterate [rmn, rmx) row-major. Hard-cap writes at cap=tiles_touched[i]
@@ -293,21 +302,32 @@ void main() {
             uint tile_id = uint(ty) * pc.num_tiles_x + uint(tx);
             // Per-tile depth key: frustum closest-approach when eval_3D, else view-space z.
             uint depth_bits_tile = depth_bits;
+            uint64_t key;
             if (pc.eval_3D != 0u) {
                 float screen_min_x = float(tx) * float(pc.tile_w);
                 float screen_min_y = float(ty) * float(pc.tile_h);
                 float screen_max_x = float(tx + 1) * float(pc.tile_w) - 1.0;
                 float screen_max_y = float(ty + 1) * float(pc.tile_h) - 1.0;
                 float max_pos_depth;
-                maxContribGaussianFrustum3D(
+                float max_contrib_val = maxContribGaussianFrustum3D(
                     screen_min_x, screen_min_y,
                     screen_max_x, screen_max_y,
                     g2s, max_pos_depth);
-                // +8.0 bias matches CUDA (AAA-Gaussians forward.cu).
-                // Makes negative depths sort correctly as positive IEEE floats.
-                depth_bits_tile = floatBitsToUint(max_pos_depth + 8.0);
+                // tile_based_culling: if max_contrib_val > threshold, the Gaussian
+                // contributes < ALPHA_THRESHOLD anywhere in this tile — write INVALID.
+                // Matches CUDA: write_tile = (max_opac_factor <= opacity_factor_threshold).
+                if (max_contrib_val > opacity_factor_threshold) {
+                    // INVALID sentinel — radix sort pushes to end, tile_range ignores.
+                    key = uint64_t(0xFFFFFFFFu) << 32 | uint64_t(0xFFFFFFFFu);
+                } else {
+                    // +8.0 bias matches CUDA (AAA-Gaussians forward.cu).
+                    // Makes negative depths sort correctly as positive IEEE floats.
+                    depth_bits_tile = floatBitsToUint(max_pos_depth + 8.0);
+                    key = (uint64_t(tile_id) << 32) | uint64_t(depth_bits_tile);
+                }
+            } else {
+                key = (uint64_t(tile_id) << 32) | uint64_t(depth_bits_tile);
             }
-            uint64_t key = (uint64_t(tile_id) << 32) | uint64_t(depth_bits_tile);
             keys_unsorted[offset + slot]   = key;
             values_unsorted[offset + slot] = i;
             slot++;
@@ -315,6 +335,11 @@ void main() {
     }
 
     // Invariant: slot == cap at loop exit.
+    //
+    // tile_based_culling: INVALID slots (key=0xFFFFFFFFFFFFFFFF) are written
+    // to fill the slot space allocated by the prefix scan. Radix sort pushes
+    // them to the end of the sorted buffer. tile_range.comp ignores them because
+    // tile_id=0xFFFFFFFF >= num_tiles. This matches CUDA's INVALID_TILE_ID fill.
     //
     // Preprocess and scatter MUST compute identical tile rects:
     //   preprocess: rectMin/Max(center_3d, r_3d, ...)  [preprocess.comp]
