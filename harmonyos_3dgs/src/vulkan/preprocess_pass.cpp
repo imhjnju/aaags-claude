@@ -55,7 +55,7 @@ PreprocessPass::PreprocessPass(VulkanContext& ctx,
 
     // --- 3. Descriptor layout: 13 SSBOs + 1 UBO (binding 12) + 1 SSBO (binding 13)
     //        + 5 cache SSBOs (bindings 14..18) = 19 total entries.
-    std::vector<VkDescriptorType> binding_types(19,
+    std::vector<VkDescriptorType> binding_types(22,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[preprocess_bind::CAMERA_UBO] =
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -105,6 +105,10 @@ void PreprocessPass::bind_buffers(const Buffers& b) {
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::P_HOM_W_CACHE,   b.p_hom_w_cache);
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::COV2D_CACHE,     b.cov2D_cache);
     pipeline_->update_ssbo(descriptor_set_, preprocess_bind::COV2D_DET_CACHE, b.cov2D_det_cache);
+    // eval_3D output SSBOs (bindings 19..21).
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::GAUSS2SCREEN, b.gauss2screen);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::COV3D_INV,    b.cov3D_inv);
+    pipeline_->update_ssbo(descriptor_set_, preprocess_bind::MEAN_OFFSET,  b.mean_offset);
 }
 
 void PreprocessPass::dispatch_sync(const PreprocessPushConstants& pc) {

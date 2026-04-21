@@ -279,7 +279,7 @@ RenderConfig makeBasicCfg() {
 }
 }  // namespace
 
-TEST(PreprocessPass, RejectsEval3D) {
+TEST(PreprocessPass, Eval3D_SingleGaussian) {
     VulkanContext ctx;
     ASSERT_TRUE(ctx.init());
 
@@ -289,22 +289,18 @@ TEST(PreprocessPass, RejectsEval3D) {
     g.positions = s.pos; g.scales = s.scl; g.rotations = s.rot;
     g.opacities = s.opa; g.sh_coeffs = s.sh; g.filter_3D = s.f3d;
 
-    Camera cam{};
-    const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-    std::memcpy(cam.view_matrix,     id, sizeof(id));
-    std::memcpy(cam.viewproj_matrix, id, sizeof(id));
-    cam.tan_fovx = 1.0f; cam.tan_fovy = 1.0f;
-    cam.width = 64; cam.height = 64;
-
-    RenderConfig cfg{};
-    cfg.sh_degree = 0;
-    cfg.eval_3D   = true;    // must be rejected
-    cfg.tile_w    = 16;
-    cfg.tile_h    = 16;
+    Camera cam = makePerspCamera();
+    RenderConfig cfg = makeBasicCfg();
+    cfg.eval_3D = true;
 
     FrameAllocator alloc(1u * 1024u * 1024u);
-    PreprocessorVulkan pp(ctx);
-    EXPECT_THROW(pp.process(g, cam, cfg, alloc), std::runtime_error);
+    PreprocessorVulkan pp(ctx, /*eval_3D=*/true);
+    PreprocessOutput out = pp.process(g, cam, cfg, alloc);
+    // eval_3D path should produce valid output without throwing.
+    EXPECT_TRUE(out.eval_3D);
+    EXPECT_NE(out.gauss2screen, nullptr);
+    EXPECT_NE(out.cov3D_inv, nullptr);
+    EXPECT_NE(out.mean_offset, nullptr);
 }
 
 TEST(PreprocessPass, RejectsNon16Tile) {

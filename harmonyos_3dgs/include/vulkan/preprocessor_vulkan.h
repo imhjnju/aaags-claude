@@ -34,7 +34,7 @@ class VulkanBuffer;
 
 class PreprocessorVulkan : public Preprocessor {
 public:
-    explicit PreprocessorVulkan(VulkanContext& ctx);
+    explicit PreprocessorVulkan(VulkanContext& ctx, bool eval_3D = false);
     // Defined out-of-line in preprocessor_vulkan.cpp because
     // std::unique_ptr<PreprocessPass> requires PreprocessPass to be complete
     // at the destruction point.
@@ -71,6 +71,9 @@ public:
     VkBuffer radii_buffer() const;
     VkBuffer tiles_touched_buffer() const;
     VkBuffer radius_f_buffer() const;
+    VkBuffer gauss2screen_buffer() const;
+    VkBuffer cov3D_inv_buffer() const;
+    VkBuffer mean_offset_buffer() const;
 
     // Download the 5 ForwardCache fields populated during process().
     // Must be called after process(); throws if process() hasn't run yet.
@@ -79,6 +82,7 @@ public:
 
 private:
     VulkanContext& ctx_;
+    bool eval_3D_ = false;
     std::unique_ptr<PreprocessPass> pass_;
 
     // Layer-1 per-call ForwardCache output buffers.
@@ -89,6 +93,10 @@ private:
     std::unique_ptr<VulkanBuffer> p_hom_w_buf_;
     std::unique_ptr<VulkanBuffer> cov2d_buf_;
     std::unique_ptr<VulkanBuffer> cov2d_det_buf_;
+    // Layer-1 eval_3D output buffers.
+    std::unique_ptr<VulkanBuffer> gauss2screen_buf_;
+    std::unique_ptr<VulkanBuffer> cov3d_inv_buf_;
+    std::unique_ptr<VulkanBuffer> mean_offset_buf_;
 
     // Layer-2 persistent buffers. Filled by prepare_record(); released and
     // re-allocated on the next prepare_record(). Index into this vector:
