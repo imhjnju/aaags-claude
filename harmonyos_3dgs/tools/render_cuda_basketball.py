@@ -110,6 +110,26 @@ def activate(pply: dict) -> dict:
 
 
 def load_camera(cam_path: str, cam_id: int) -> dict:
+    """Build camera matrices in the exact convention used by AAA-Gaussians cameras.py.
+
+    cameras.json convention (saved from training):
+      'rotation'  — C2W rotation matrix R_c2w  (NOT W2C)
+      'position'  — camera position in world space (C2W origin)
+
+    AAA-Gaussians cameras.py convention:
+      world_view_transform = getWorld2View2(R_c2w, T_w2c).T   # = W2C.T stored row-major
+      projection_matrix    = getProjectionMatrix(...).T
+      full_proj_transform  = world_view_transform @ projection_matrix
+      campos               = world_view_transform.inverse()[3, :3]
+
+    getWorld2View2(R, T):  # R=C2W, T=W2C translation
+      Rt[:3,:3] = R.T  (= W2C rotation)
+      Rt[:3, 3] = T
+      returns Rt  (= W2C, 4x4)
+
+    getProjectionMatrix(znear, zfar, fovX, fovY):
+      returns P[3,2]=z_sign, P[2,2]=zfar/(zfar-znear), etc.  (row-major, NOT transposed yet)
+    """
     with open(cam_path) as f:
         cams = json.load(f)
     cam = next(c for c in cams if c['id'] == cam_id)
@@ -117,22 +137,52 @@ def load_camera(cam_path: str, cam_id: int) -> dict:
     fx, fy = float(cam['fx']), float(cam['fy'])
     tan_fovx = W / (2.0 * fx)
     tan_fovy = H / (2.0 * fy)
-    R = np.array(cam['rotation'], dtype=np.float32)            # [3,3]
-    T = -R @ np.array(cam['position'], dtype=np.float32)       # [3]
-    W2C = np.eye(4, dtype=np.float32)
-    W2C[:3, :3] = R
-    W2C[:3, 3] = T
+    fov_x = 2.0 * math.atan(tan_fovx)
+    fov_y = 2.0 * math.atan(tan_fovy)
+
+    # cam['rotation'] is C2W; W2C rotation = R_c2w.T
+    R_c2w = np.array(cam['rotation'], dtype=np.float64)
+    R_w2c = R_c2w.T
+    cam_pos = np.array(cam['position'], dtype=np.float64)
+    T_w2c = -R_w2c @ cam_pos                                   # W2C translation
+
+    # W2C matrix (= getWorld2View2 result before .T)
+    W2C = np.zeros((4, 4), dtype=np.float64)
+    W2C[:3, :3] = R_w2c
+    W2C[:3, 3] = T_w2c
+    W2C[3, 3] = 1.0
+
+    # world_view_transform = W2C.T  (matches cameras.py: getWorld2View2(R,T).T)
     viewmatrix = W2C.T.astype(np.float32)
+
+    # Projection matrix: getProjectionMatrix returns P (4x4, row-major), stored as P.T
     znear, zfar = 0.01, 100.0
-    proj = np.zeros((4, 4), dtype=np.float32)
-    proj[0, 0] = 1.0 / tan_fovx
-    proj[1, 1] = 1.0 / tan_fovy
-    proj[2, 2] = zfar / (zfar - znear)
-    proj[2, 3] = -(zfar * znear) / (zfar - znear)
-    proj[3, 2] = 1.0
-    projmatrix = (viewmatrix @ proj).astype(np.float32)
-    inv_viewprojmatrix = np.linalg.inv(projmatrix).astype(np.float32)
-    campos = np.array(cam['position'], dtype=np.float32)
+    tan_half_fov_x = math.tan(fov_x / 2.0)
+    tan_half_fov_y = math.tan(fov_y / 2.0)
+    top = tan_half_fov_y * znear
+    bottom = -top
+    right = tan_half_fov_x * znear
+    left = -right
+    P = np.zeros((4, 4), dtype=np.float64)
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = 1.0                                              # z_sign
+    P[2, 2] = zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    projection_matrix = P.T.astype(np.float32)                 # matches getProjectionMatrix().T
+
+    # full_proj_transform = world_view_transform @ projection_matrix  (cameras.py line 56)
+    vm_t = torch.tensor(viewmatrix, dtype=torch.float32)
+    pm_t = torch.tensor(projection_matrix, dtype=torch.float32)
+    fpt = (vm_t.unsqueeze(0).bmm(pm_t.unsqueeze(0))).squeeze(0)
+    projmatrix = fpt.numpy().astype(np.float32)
+    inv_viewprojmatrix = np.linalg.inv(projmatrix.astype(np.float64)).astype(np.float32)
+
+    # campos = world_view_transform.inverse()[3, :3]  (cameras.py line 58)
+    campos = np.linalg.inv(viewmatrix.astype(np.float64))[3, :3].astype(np.float32)
+
     return dict(W=W, H=H, tan_fovx=tan_fovx, tan_fovy=tan_fovy,
                 viewmatrix=viewmatrix, projmatrix=projmatrix,
                 inv_viewprojmatrix=inv_viewprojmatrix, campos=campos)
