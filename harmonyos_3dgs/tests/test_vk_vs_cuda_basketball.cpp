@@ -43,8 +43,10 @@ namespace {
 // G2 baseline locked at 39.7 dB (floor(40.266*10)/10 - 0.5).
 // Task 11 (tile_based_culling INVALID sentinel for eval_3D): P3=40.256 dB (+3.392 dB vs P1) on 2026-04-21.
 // G3 baseline locked at 39.7 dB (floor(40.256*10)/10 - 0.5 = 39.75 → 39.7; kept same as G2).
+// Task 12b (hierarchical sub-tile TAIL re-sort, simplified): P4=42.623 dB (+2.367 dB) on 2026-04-21.
+// G4 baseline locked at 42.1 dB (floor(42.623*10)/10 - 0.5).
 // DO NOT lower this without documenting why.
-constexpr float kBaselinePSNR = 39.7f;
+constexpr float kBaselinePSNR = 42.1f;
 
 constexpr int kW = 720;
 constexpr int kH = 960;
