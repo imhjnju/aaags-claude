@@ -782,3 +782,439 @@ Phase 2 instruments both pipelines to dump post-preprocess / post-sort / post-ti
 - [ ] **Step 3: If not approved, engage the emergency exit per spec §7**
 
 Document root cause in `investigations/vk_cuda_residual_<date>.md` and finalize with the best-achieved PSNR.
+
+---
+
+## Task 9: Fix `proper_ewa_scaling` in `preprocess.comp`
+
+**Why:** aaa.json sets `proper_ewa_scaling=true` but preprocess.comp line 959 explicitly disables it with an incorrect comment claiming the CUDA golden uses `false`. The CUDA golden uses `aaa.json` which has `"proper_ewa_scaling": true`. This causes every Gaussian's opacity to be wrong by the dilation factor. PSNR impact: HIGH.
+
+**Files:**
+- Modify: `harmonyos_3dgs/src/vulkan/shaders/preprocess.comp`
+
+- [ ] **Step 1: Read the research gate**
+
+```bash
+cat .claude/gates/research.md
+```
+
+- [ ] **Step 2: Read preprocess.comp lines 940–970 (eval_3D opacity section)**
+
+```bash
+sed -n '940,970p' harmonyos_3dgs/src/vulkan/shaders/preprocess.comp
+```
+
+- [ ] **Step 3: Re-enable opacity dilation in eval_3D path**
+
+Find the disabled line:
+```glsl
+// opacity_3d *= dilation_factor;  // DISABLED: proper_ewa_scaling=false
+```
+Replace with:
+```glsl
+opacity_3d *= dilation_factor;  // proper_ewa_scaling=true (matches aaa.json)
+```
+
+- [ ] **Step 4: Fix 2D path — apply convolution_scaling_factor to opacity**
+
+Find the 2D path opacity store (search for `conic_opacity_packed` or `opacity_activated`).
+
+In CUDA (forward_common.h lines 118–142), the 2D path computes:
+```cpp
+float det_dilated = (cov[0][0]+0.3f)*(cov[1][1]+0.3f) - cov[0][1]*cov[0][1];
+float det_orig = cov[0][0]*cov[1][1] - cov[0][1]*cov[0][1];
+float convolution_scaling_factor = sqrt(max(0.000025f, det_orig / det_dilated));
+conic_opacity.w = opacity * convolution_scaling_factor;
+```
+
+In VK's 2D path, locate where `cov2D.x += 0.3; cov2D.z += 0.3;` (the dilation), then find where `opacity_activated` is stored to `conic_opacity_packed`. Add the scaling:
+```glsl
+// proper_ewa_scaling: scale opacity by sqrt(det_orig / det_dilated)
+float det_orig = cov2D_pre_dilate.x * cov2D_pre_dilate.z - cov2D_pre_dilate.y * cov2D_pre_dilate.y;
+float det_dilated = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+float convolution_scaling_factor = sqrt(max(0.000025, det_orig / det_dilated));
+opacity_activated *= convolution_scaling_factor;
+```
+You will need to capture `cov2D` before the dilation (e.g., `vec3 cov2D_pre_dilate = cov2D;`) immediately before the `+= 0.3` lines.
+
+- [ ] **Step 5: Build**
+
+```bash
+cmake --build harmonyos_3dgs/build -j$(nproc) --target gs3d_vk_tests
+```
+
+- [ ] **Step 6: Run PSNR harness — record new PSNR**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build -R VkVsCudaBasketball --output-on-failure 2>&1 | grep "PSNR="
+```
+
+Expected: PSNR increases (was 25.308 dB). If PSNR drops, revert and investigate.
+
+- [ ] **Step 7: Run full suite**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build --output-on-failure 2>&1 | tail -10
+```
+
+- [ ] **Step 8: Update kBaselinePSNR if PSNR improved**
+
+If new PSNR P1 > P0 (25.308), set `kBaselinePSNR = floor(P1*10)/10 - 0.5` in the test file.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add harmonyos_3dgs/src/vulkan/shaders/preprocess.comp harmonyos_3dgs/tests/test_vk_vs_cuda_basketball.cpp
+git commit -m "fix(preprocess): enable proper_ewa_scaling — opacity*dilation_factor in eval_3D and 2D paths (PSNR delta: +X.X dB)"
+```
+Fill in the measured PSNR delta.
+
+---
+
+## Task 10: Fix `rect_bounding` + `tight_opacity_bounding` in `preprocess.comp` 2D path
+
+**Why:** aaa.json sets `rect_bounding=true` and `tight_opacity_bounding=true`. VK uses an isotropic radius for tile AABB in the 2D path and hardcodes extent=3.33. This causes VK to over-cover tiles for elongated Gaussians, producing different tile-pair sets than CUDA. PSNR impact: MEDIUM (compound tile coverage error).
+
+Note: the eval_3D path already stores asymmetric extents correctly (lines 1074–1075).
+
+**Files:**
+- Modify: `harmonyos_3dgs/src/vulkan/shaders/preprocess.comp`
+
+- [ ] **Step 1: Read the research gate**
+
+```bash
+cat .claude/gates/research.md
+```
+
+- [ ] **Step 2: Read preprocess.comp lines 1140–1215 (2D path AABB/radius section)**
+
+```bash
+sed -n '1140,1215p' harmonyos_3dgs/src/vulkan/shaders/preprocess.comp
+```
+
+- [ ] **Step 3: Implement tight_opacity_bounding extent**
+
+Find:
+```glsl
+float radius_f = 3.33 * sqrt(lambda);
+```
+Replace with (compute adaptive extent based on opacity):
+```glsl
+// tight_opacity_bounding=true: extent = min(3.33, sqrt(2 * log(opacity / ALPHA_THRESHOLD)))
+// ALPHA_THRESHOLD = 1.0/255.0
+const float ALPHA_THRESHOLD = 1.0 / 255.0;
+float opacity_power_threshold = -log(ALPHA_THRESHOLD / opacity_activated);
+float extent_tight = min(3.33, sqrt(max(0.0, 2.0 * opacity_power_threshold)));
+float radius_f = extent_tight * sqrt(lambda);
+```
+
+- [ ] **Step 4: Implement rect_bounding asymmetric extents**
+
+Find the isotropic rectMin/rectMax calls:
+```glsl
+ivec2 rmn = rectMin(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+ivec2 rmx = rectMax(pix, radius_f, radius_f, grid_x, grid_y, TILE_W, TILE_H);
+```
+
+Replace with:
+```glsl
+// rect_bounding=true: use per-axis extents fitted to covariance ellipse
+float extent_x = min(extent_tight * sqrt(max(0.0, cov2D.x)), radius_f);
+float extent_y = min(extent_tight * sqrt(max(0.0, cov2D.z)), radius_f);
+ivec2 rmn = rectMin(pix, extent_x, extent_y, grid_x, grid_y, TILE_W, TILE_H);
+ivec2 rmx = rectMax(pix, extent_x, extent_y, grid_x, grid_y, TILE_W, TILE_H);
+```
+Also update the radius_f_arr storage:
+```glsl
+radius_f_arr[i*2u + 0u] = extent_x;  // was radius_f
+radius_f_arr[i*2u + 1u] = extent_y;  // was radius_f
+```
+
+Verify that `rectMin/rectMax` accept separate x/y extents. If they only accept one radius, add a variant or inline the computation:
+```glsl
+ivec2 rmn = ivec2(
+    min(grid_x, max(0, int(floor((pix.x - extent_x) / float(TILE_W))))),
+    min(grid_y, max(0, int(floor((pix.y - extent_y) / float(TILE_H)))))
+);
+ivec2 rmx = ivec2(
+    min(grid_x, max(0, int(ceil((pix.x + extent_x) / float(TILE_W))))),
+    min(grid_y, max(0, int(ceil((pix.y + extent_y) / float(TILE_H)))))
+);
+```
+
+- [ ] **Step 5: Build**
+
+```bash
+cmake --build harmonyos_3dgs/build -j$(nproc) --target gs3d_vk_tests
+```
+
+- [ ] **Step 6: Run PSNR harness — record new PSNR**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build -R VkVsCudaBasketball --output-on-failure 2>&1 | grep "PSNR="
+```
+
+Expected: PSNR increases from Task 9 baseline.
+
+- [ ] **Step 7: Run full suite, confirm no regressions**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build --output-on-failure 2>&1 | tail -10
+```
+
+- [ ] **Step 8: Update kBaselinePSNR if PSNR improved**
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add harmonyos_3dgs/src/vulkan/shaders/preprocess.comp harmonyos_3dgs/tests/test_vk_vs_cuda_basketball.cpp
+git commit -m "fix(preprocess): rect_bounding + tight_opacity_bounding — asymmetric AABB, adaptive extent (PSNR delta: +X.X dB)"
+```
+
+---
+
+## Task 11: Implement `tile_based_culling` in scatter + preprocess
+
+**Why:** aaa.json sets `tile_based_culling=true` and `load_balancing=true`. CUDA's `duplicateWithKeys_extended` runs a per-tile opacity test and only writes tiles where the Gaussian contributes meaningfully. VK writes all rect tiles unconditionally. This inflates the sort buffer and feeds the rasterizer with extra tiles that CUDA would skip. PSNR impact: HIGH (different tile-pair counts change blend ordering for every tile boundary region).
+
+**Files:**
+- Modify: `harmonyos_3dgs/src/vulkan/shaders/preprocess.comp`
+- Modify: `harmonyos_3dgs/src/vulkan/shaders/scatter.comp`
+
+**CUDA reference:** `forward.cu::duplicateWithKeys_extended` (stopthepop_common.cuh, search for `write_tile`), `auxiliary.h::max_contrib_power_rect_gaussian_float`.
+
+- [ ] **Step 1: Read the research gate**
+
+```bash
+cat .claude/gates/research.md
+```
+
+- [ ] **Step 2: Read CUDA reference — per-tile opacity test**
+
+```bash
+grep -n "write_tile\|max_contrib_power\|opacity_power_threshold\|TILE_BASED_CULLING\|computeTilebasedCulling" \
+  /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/stopthepop_common.cuh | head -40
+```
+
+```bash
+grep -n "write_tile\|max_contrib_power\|opacity_power_threshold\|TILE_BASED_CULLING" \
+  /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/forward.cu | head -30
+```
+
+- [ ] **Step 3: Read scatter.comp current tile-write loop**
+
+```bash
+sed -n '270,330p' harmonyos_3dgs/src/vulkan/shaders/scatter.comp
+```
+
+- [ ] **Step 4: Implement per-tile opacity predicate in scatter.comp**
+
+For each tile in the rect bounding box, compute `max_contrib_power_rect_gaussian` — the maximum 2D Gaussian contribution at any point within the tile's pixel bounding box:
+
+For the 2D path: The maximum contribution within a tile rect [tile_min, tile_max] for a 2D Gaussian with conic (a, b, c) and mean (mx, my) is found by clamping the mean to the tile rect and evaluating. The CUDA function `max_contrib_power_rect_gaussian_float` in stopthepop_common.cuh computes this.
+
+Port the CUDA per-tile test to GLSL in scatter.comp:
+```glsl
+// tile_based_culling: skip tile if max Gaussian contribution is below threshold
+float tile_min_x = float(tx * TILE_W);
+float tile_max_x = float((tx + 1) * TILE_W - 1);
+float tile_min_y = float(ty * TILE_H);
+float tile_max_y = float((ty + 1) * TILE_H - 1);
+float clamped_x = clamp(mean2D.x, tile_min_x, tile_max_x);
+float clamped_y = clamp(mean2D.y, tile_min_y, tile_max_y);
+float dx = clamped_x - mean2D.x;
+float dy = clamped_y - mean2D.y;
+float power = -0.5 * (conic.x * dx*dx + conic.z * dy*dy) - conic.y * dx*dy;
+float max_opac_factor = exp(power);
+const float ALPHA_THRESHOLD = 1.0 / 255.0;
+bool write_tile = (opacity * max_opac_factor >= ALPHA_THRESHOLD);
+if (!write_tile) {
+    // Write INVALID sentinel key so radix sort pushes this to the end
+    keys_out[out_slot] = (uint64_t(0xFFFFFFFFu) << 32) | uint64_t(0xFFFFFFFFu);
+    vals_out[out_slot] = 0xFFFFFFFFu;
+} else {
+    keys_out[out_slot] = (uint64_t(tile_id) << 32) | uint64_t(depth_bits);
+    vals_out[out_slot] = i;
+}
+```
+
+- [ ] **Step 5: Update preprocess.comp tiles_touched count**
+
+The `tiles_touched[i]` count must match the number of tiles that will actually be written (for correct prefix sum). Add the same per-tile test in preprocess.comp's 2D path tile-counting loop.
+
+- [ ] **Step 6: Build**
+
+```bash
+cmake --build harmonyos_3dgs/build -j$(nproc) --target gs3d_vk_tests
+```
+
+- [ ] **Step 7: Run PSNR harness — record new PSNR**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build -R VkVsCudaBasketball --output-on-failure 2>&1 | grep "PSNR="
+```
+
+- [ ] **Step 8: Update kBaselinePSNR + commit**
+
+```bash
+git add harmonyos_3dgs/src/vulkan/shaders/preprocess.comp harmonyos_3dgs/src/vulkan/shaders/scatter.comp harmonyos_3dgs/tests/test_vk_vs_cuda_basketball.cpp
+git commit -m "fix(scatter): tile_based_culling — per-tile opacity predicate, INVALID sentinel for culled tiles (PSNR delta: +X.X dB)"
+```
+
+---
+
+## Task 12: Implement hierarchical eval_3D rasterizer
+
+**Why:** aaa.json sets `sort_mode=3` (HIERARCHICAL). CUDA uses `sortGaussiansRayHierarchicalCUDA_forward` (hierarchical_render.cuh, 1378 lines) with per-pixel HEAD_WINDOW=4 sorted k-buffer, 2×2 MID_WINDOW=8 intermediate queue, and 4×4 TAIL buffer (64 entries). VK uses a simple global front-to-back blend (sort_mode=0 equivalent). This is the primary driver of the PSNR gap. PSNR impact: CATASTROPHIC (expected +20–30 dB).
+
+**Key parameters from aaa.json:**
+- `per_pixel = 4` (HEAD_WINDOW)
+- `tile_2x2 = 8` (MID_WINDOW)
+- `tile_4x4 = 64` (TAIL buffer size)
+- `hierarchical_4x4_culling = true` (CULL_ALPHA)
+
+**CUDA reference:** `hierarchical_render.cuh` (1378 lines, particularly lines 207–1059 for the kernel implementation)
+
+**Files:**
+- Modify: `harmonyos_3dgs/src/vulkan/shaders/rasterize.comp`
+- Possibly create: new sub-shaders or GLSL include if needed
+
+- [ ] **Step 1: Read the research gate**
+
+```bash
+cat .claude/gates/research.md
+```
+
+- [ ] **Step 2: Read CUDA hierarchical render kernel**
+
+```bash
+sed -n '1,100p' /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+sed -n '200,500p' /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+sed -n '500,900p' /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+sed -n '900,1200p' /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+sed -n '1200,1378p' /home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+```
+
+- [ ] **Step 3: Read current rasterize.comp eval_3D path**
+
+```bash
+sed -n '180,260p' harmonyos_3dgs/src/vulkan/shaders/rasterize.comp
+```
+
+- [ ] **Step 4: Understand CUDA thread layout**
+
+CUDA hierarchical kernel uses `{16, 4, 4}` thread blocks — 16 pixels × 4×4 sub-tile hierarchy.
+- `dim3 block(BLOCK_X, 4, 4)` = `{16, 4, 4}` = 256 threads per block
+- `threadIdx.x` = pixel within the 16-pixel row; `threadIdx.y` = 2×2 sub-tile x; `threadIdx.z` = 2×2 sub-tile y
+- Each 16×16 tile contains 4×4 sub-tiles (each 4×4 pixels), each holding a MID queue
+
+VK: Currently `local_size_x=TILE_W*TILE_H` (256 threads for 16×16 tile). The thread ID maps to `(thread_id % TILE_W, thread_id / TILE_W)`.
+
+The CUDA hierarchy: each 4×4 tile block shares a TAIL queue (64 entries, sorted by tile-center depth). Within each 4×4, the 2×2 groups share MID queues. Within each 2×2, individual pixels have HEAD queues (4 entries, sorted by per-pixel depth).
+
+- [ ] **Step 5: Design VK shared memory layout**
+
+For a 16×16 tile (256 threads), the hierarchical layout requires:
+- 1 TAIL buffer: 64 entries per 4×4 tile (1 per 16×16 tile since TAIL covers the whole tile)
+- 16 MID buffers: 8 entries each, one per 2×2 sub-tile (16 sub-tiles per 16×16 tile)  
+- 256 HEAD buffers: 4 entries each, one per pixel
+
+Shared memory:
+```glsl
+// 256 pixels × 4-entry head = 1024 depth/contrib entries
+shared float head_depth[256][4];
+shared uint head_gauss_idx[256][4];
+shared int head_size[256];
+// 16 2x2-subtiles × 8-entry mid
+shared float mid_depth[16][8];
+shared uint mid_gauss_idx[16][8];
+shared int mid_size[16];
+// 1 tail per 16×16 tile × 64 entries
+shared float tail_depth[64];
+shared uint tail_gauss_idx[64];
+shared int tail_size_s;
+```
+
+- [ ] **Step 6: Port the hierarchical insertion logic**
+
+The CUDA kernel (hierarchical_render.cuh lines 400–900) processes Gaussians in batches from the sorted list:
+1. Load batch into shared memory
+2. For each Gaussian in batch, each 4×4 group evaluates `hierarchical_4x4_culling`:
+   - Compute alpha at the nearest point of the 4×4 tile rect
+   - If alpha < ALPHA_THRESHOLD for whole 4×4 tile: skip this Gaussian for this tile
+3. Surviving Gaussians are inserted into TAIL (sorted by 4×4-center depth)
+4. When TAIL is full, flush: each 2×2 sub-tile pulls its subset from TAIL into MID (sorted by 2×2-center depth)
+5. When MID is full, flush: each pixel pulls from MID into HEAD (sorted by per-pixel depth via max_contrib_ray)
+6. When HEAD is full, blend the shallowest entry and pop it
+
+**Implementation note:** This is approximately 400–600 lines of GLSL. Port the CUDA logic faithfully, adapting:
+- CUDA `cooperative_groups::tiled_partition<N>` → GLSL `subgroupBallot` / barrier-based voting
+- CUDA `__ballot_sync` → `subgroupBallot`
+- CUDA `__syncthreads()` → `barrier()` + `memoryBarrierShared()`
+- CUDA `atomicOr` / `atomicAdd` on shared → GLSL `atomicAdd` on shared uint arrays
+
+- [ ] **Step 7: Handle flush and final blend**
+
+After all Gaussians processed: flush remaining TAIL→MID→HEAD entries for each pixel, then blend the HEAD entries in depth order into the final color accumulator.
+
+This matches CUDA hierarchical_render.cuh lines 800–1000 (the final-flush phase).
+
+- [ ] **Step 8: Build**
+
+```bash
+cmake --build harmonyos_3dgs/build -j$(nproc) --target gs3d_vk_tests
+```
+
+Fix any compilation errors before proceeding.
+
+- [ ] **Step 9: Run PSNR harness — record new PSNR**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build -R VkVsCudaBasketball --output-on-failure 2>&1 | grep "PSNR="
+```
+
+Expected: substantial PSNR gain (+20–30 dB). If gain is < 5 dB, stop and file an investigation note before proceeding.
+
+- [ ] **Step 10: Run FullChain_TinyFixture_Eval3D — no regression**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build -R FullChain_TinyFixture_Eval3D --output-on-failure
+```
+
+Must still pass (≥83 dB on tiny fixture).
+
+- [ ] **Step 11: Update kBaselinePSNR + commit**
+
+```bash
+git add harmonyos_3dgs/src/vulkan/shaders/rasterize.comp harmonyos_3dgs/tests/test_vk_vs_cuda_basketball.cpp
+git commit -m "feat(rasterize): hierarchical eval_3D sort_mode=3 — HEAD_WINDOW=4 per-pixel k-buffer, 4x4 culling (PSNR delta: +X.X dB)"
+```
+
+---
+
+## Task 13: Verify ≥60 dB and lock final baseline
+
+- [ ] **Step 1: Run harness 3× to confirm PSNR ≥ 60 dB**
+
+```bash
+for i in 1 2 3; do
+  ctest --test-dir harmonyos_3dgs/build -R VkVsCudaBasketball --output-on-failure 2>&1 | grep "PSNR="
+done
+```
+
+If PSNR < 60 dB, consult the emergency exit clause in the design spec and investigate residual divergence.
+
+- [ ] **Step 2: Run full test suite**
+
+```bash
+ctest --test-dir harmonyos_3dgs/build --output-on-failure 2>&1 | tail -20
+```
+
+- [ ] **Step 3: Set kBaselinePSNR = floor(PSNR*10)/10 - 0.5**
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add harmonyos_3dgs/tests/test_vk_vs_cuda_basketball.cpp
+git commit -m "test(harness): lock G3 baseline PSNR (>=60 dB target achieved)"
+```
