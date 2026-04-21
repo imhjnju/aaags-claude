@@ -234,7 +234,9 @@ void main() {
                 s_g2s[local_idx * 12u + 4u + uint(j)]   = gauss2screen[gid * 16u + 1u * 4u + uint(j)]; // row 1
                 s_g2s[local_idx * 12u + 8u + uint(j)]   = gauss2screen[gid * 16u + 3u * 4u + uint(j)]; // row 3
             }
-            s_opa[local_idx]     = opacities_2d[gid];
+            // Read opacity from conic_opacity (slot 3) — preprocess.comp writes
+            // the dilated opacity there for both 2D and eval_3D paths.
+            s_opa[local_idx]     = conic_opacity[gid * 4u + 3u];
             s_rgb_r[local_idx]   = rgb[gid * 3u + 0u];
             s_rgb_g[local_idx]   = rgb[gid * 3u + 1u];
             s_rgb_b[local_idx]   = rgb[gid * 3u + 2u];
