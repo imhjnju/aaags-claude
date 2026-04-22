@@ -184,6 +184,15 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
               static_cast<std::streamsize>(golden_hwc.size() * sizeof(float)))
         << "Golden file size mismatch";
 
+    // Dump VK raw output for external comparison
+    {
+        std::string vk_raw = std::string(CMAKE_BINARY_DIR) + "/vk_image.raw";
+        std::ofstream vo(vk_raw, std::ios::binary);
+        vo.write(reinterpret_cast<const char*>(vk_hwc.data()),
+                 static_cast<std::streamsize>(vk_hwc.size() * sizeof(float)));
+        std::printf("[VkVsCudaBasketball] VK raw -> %s\n", vk_raw.c_str());
+    }
+
     Metrics m = compute_metrics_hwc(vk_hwc, golden_hwc);
 
     std::string diff_ppm =
@@ -196,6 +205,62 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
                 "p99_abs=%.5f bad_pixels(>1e-3)=%d\n",
                 m.max_abs, m.mean_abs, m.p99_abs, m.num_bad);
     std::printf("[VkVsCudaBasketball] diff heatmap -> %s\n", diff_ppm.c_str());
+
+    // --- Spatial region analysis ---
+    // Split into foreground (cuda pixel > 0.01) vs background, and report
+    // per-region PSNR + top-20 worst pixels.
+    {
+        double sse_fg = 0.0, sse_bg = 0.0;
+        int n_fg = 0, n_bg = 0;
+        int vk_brighter = 0, cuda_brighter = 0;
+        struct WorstPixel { int x, y; float vk_r, vk_g, vk_b; float cu_r, cu_g, cu_b; float err; };
+        std::vector<WorstPixel> worst;
+        worst.reserve(static_cast<size_t>(kW) * kH);
+
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                size_t base = (static_cast<size_t>(y) * kW + x) * 3;
+                float vr = vk_hwc[base], vg = vk_hwc[base+1], vb = vk_hwc[base+2];
+                float cr = golden_hwc[base], cg = golden_hwc[base+1], cb = golden_hwc[base+2];
+                float dr = vr - cr, dg = vg - cg, db = vb - cb;
+                float err = std::sqrt(dr*dr + dg*dg + db*db) / std::sqrt(3.0f);
+                float cuda_lum = 0.2126f*cr + 0.7152f*cg + 0.0722f*cb;
+                float vk_lum   = 0.2126f*vr + 0.7152f*vg + 0.0722f*vb;
+                float d2 = dr*dr + dg*dg + db*db;
+                if (cuda_lum > 0.01f) { sse_fg += d2; n_fg++; } else { sse_bg += d2; n_bg++; }
+                if (vk_lum > cuda_lum + 0.001f) vk_brighter++;
+                else if (cuda_lum > vk_lum + 0.001f) cuda_brighter++;
+                worst.push_back({x, y, vr, vg, vb, cr, cg, cb, err});
+            }
+        }
+        std::sort(worst.begin(), worst.end(),
+                  [](const WorstPixel& a, const WorstPixel& b) { return a.err > b.err; });
+
+        float psnr_fg = n_fg > 0 ? psnr_from_mse(static_cast<float>(sse_fg / (n_fg * 3))) : 100.0f;
+        float psnr_bg = n_bg > 0 ? psnr_from_mse(static_cast<float>(sse_bg / (n_bg * 3))) : 100.0f;
+        std::printf("[VkVsCudaBasketball] FG pixels=%d PSNR=%.2f dB | BG pixels=%d PSNR=%.2f dB\n",
+                    n_fg, psnr_fg, n_bg, psnr_bg);
+        std::printf("[VkVsCudaBasketball] VK_brighter=%d CUDA_brighter=%d equal=%d\n",
+                    vk_brighter, cuda_brighter, kW*kH - vk_brighter - cuda_brighter);
+
+        std::printf("[VkVsCudaBasketball] Top-20 worst pixels (VK vs CUDA [R,G,B] RMSE):\n");
+        for (int i = 0; i < 20 && i < (int)worst.size(); ++i) {
+            const auto& p = worst[i];
+            std::printf("  #%2d (%4d,%4d) err=%.4f  VK=[%.3f,%.3f,%.3f] CU=[%.3f,%.3f,%.3f]\n",
+                        i+1, p.x, p.y, p.err, p.vk_r, p.vk_g, p.vk_b, p.cu_r, p.cu_g, p.cu_b);
+        }
+
+        // Histogram: how many pixels at each error level
+        int bins[10] = {};
+        for (const auto& p : worst) {
+            int b = std::min(9, static_cast<int>(p.err * 20.0f));
+            bins[b]++;
+        }
+        std::printf("[VkVsCudaBasketball] Error histogram (bin width=0.05):\n");
+        for (int i = 0; i < 10; ++i) {
+            std::printf("  [%.2f,%.2f): %d pixels\n", i*0.05f, (i+1)*0.05f, bins[i]);
+        }
+    }
 
     EXPECT_GE(m.psnr, kBaselinePSNR)
         << "VK vs CUDA PSNR regressed below baseline " << kBaselinePSNR
