@@ -192,8 +192,9 @@ void RasterizerCPU::rasterize(const PreprocessOutput& pre, const BinningOutput& 
                         cache->n_contrib[pix] = contrib_count;
                     }
 
+                    const int HW = cam.width * cam.height;
                     for (int ch = 0; ch < 3; ch++)
-                        out_img[pix*3+ch] = C[ch] + T * cfg.bg_color[ch];
+                        out_img[ch*HW + pix] = C[ch] + T * cfg.bg_color[ch];
                     if (out_depth)
                         out_depth[pix] = inv_depth;
                 }

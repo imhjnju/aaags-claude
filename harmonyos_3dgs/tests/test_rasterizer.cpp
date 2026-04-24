@@ -20,15 +20,16 @@ TEST(RasterizerCPU, BackgroundOnly) {
     bin.tile_ranges = alloc.allocate_array<uint32_t>(8);
     memset(bin.tile_ranges, 0, 8 * sizeof(uint32_t));
 
-    std::vector<float> img(32 * 32 * 3, 0.0f);
+    const int HW = 32 * 32;
+    std::vector<float> img(HW * 3, 0.0f);
     RasterizerCPU rast;
     rast.rasterize(pre, bin, cam, cfg, img.data());
 
-    // All pixels should be red background
-    for (int i = 0; i < 32*32; i++) {
-        EXPECT_FLOAT_EQ(img[i*3+0], 1.0f) << "pixel " << i;
-        EXPECT_FLOAT_EQ(img[i*3+1], 0.0f) << "pixel " << i;
-        EXPECT_FLOAT_EQ(img[i*3+2], 0.0f) << "pixel " << i;
+    // All pixels should be red background (CHW: R plane, G plane, B plane)
+    for (int i = 0; i < HW; i++) {
+        EXPECT_FLOAT_EQ(img[0 * HW + i], 1.0f) << "pixel " << i;
+        EXPECT_FLOAT_EQ(img[1 * HW + i], 0.0f) << "pixel " << i;
+        EXPECT_FLOAT_EQ(img[2 * HW + i], 0.0f) << "pixel " << i;
     }
 }
 
@@ -75,10 +76,12 @@ TEST(RasterizerCPU, SingleGaussian_CenterContribution) {
     rast.rasterize(pre, bin, cam, cfg, img.data());
 
     // Center pixel (16,16) should have color contribution
+    const int HW = 32 * 32;
     int cx = 16, cy = 16;
-    float r = img[(cy*32+cx)*3+0];
-    float g = img[(cy*32+cx)*3+1];
-    float b = img[(cy*32+cx)*3+2];
+    int pix = cy * 32 + cx;
+    float r = img[0 * HW + pix];
+    float g = img[1 * HW + pix];
+    float b = img[2 * HW + pix];
     EXPECT_GT(r, 0.0f);
     EXPECT_GT(g, 0.0f);
     EXPECT_GT(b, 0.0f);
@@ -86,8 +89,8 @@ TEST(RasterizerCPU, SingleGaussian_CenterContribution) {
     EXPECT_NEAR(r, 0.8f * 0.95f, 0.1f);
 }
 
-TEST(RasterizerCPU, OutputFormat_HWC) {
-    // Verify output is HWC interleaved, not CHW planar
+TEST(RasterizerCPU, OutputFormat_CHW) {
+    // Verify output is CHW planar, not HWC interleaved
     FrameAllocator alloc(1024 * 1024);
     Camera cam{};
     cam.width = 4; cam.height = 4;
@@ -101,18 +104,19 @@ TEST(RasterizerCPU, OutputFormat_HWC) {
     bin.tile_ranges = alloc.allocate_array<uint32_t>(2);
     memset(bin.tile_ranges, 0, 2 * sizeof(uint32_t));
 
-    std::vector<float> img(4 * 4 * 3, 0.0f);
+    const int HW = 4 * 4;
+    std::vector<float> img(HW * 3, 0.0f);
     RasterizerCPU rast;
     rast.rasterize(pre, bin, cam, cfg, img.data());
 
-    // First pixel: img[0]=R, img[1]=G, img[2]=B (HWC)
-    EXPECT_FLOAT_EQ(img[0], 0.1f);  // R
-    EXPECT_FLOAT_EQ(img[1], 0.2f);  // G
-    EXPECT_FLOAT_EQ(img[2], 0.3f);  // B
-    // Second pixel: img[3]=R, img[4]=G, img[5]=B
-    EXPECT_FLOAT_EQ(img[3], 0.1f);
-    EXPECT_FLOAT_EQ(img[4], 0.2f);
-    EXPECT_FLOAT_EQ(img[5], 0.3f);
+    // First pixel: img[0*HW+0]=R, img[1*HW+0]=G, img[2*HW+0]=B (CHW)
+    EXPECT_FLOAT_EQ(img[0 * HW + 0], 0.1f);  // R
+    EXPECT_FLOAT_EQ(img[1 * HW + 0], 0.2f);  // G
+    EXPECT_FLOAT_EQ(img[2 * HW + 0], 0.3f);  // B
+    // Second pixel: img[0*HW+1]=R, img[1*HW+1]=G, img[2*HW+1]=B
+    EXPECT_FLOAT_EQ(img[0 * HW + 1], 0.1f);
+    EXPECT_FLOAT_EQ(img[1 * HW + 1], 0.2f);
+    EXPECT_FLOAT_EQ(img[2 * HW + 1], 0.3f);
 }
 
 TEST(RasterizerCPU, DepthOutput) {

@@ -38,7 +38,7 @@ static std::vector<float> make_gaussian_kernel_2d() {
 }
 
 // Compute SSIM for the 11x11 window centered at (cx, cy), channel ch.
-// rendered, target: [H*W*3] pixel-major layout (pixel p*W+q at (p*W+q)*3, channel ch at +ch).
+// rendered, target: [3*H*W] CHW channel-first layout (channel ch at ch*H*W + pixel).
 // Uses clamp-to-edge padding at image boundaries.
 static float ssim_window(const float* rendered, const float* target,
                          int W, int H, int cx, int cy, int ch,
@@ -53,8 +53,8 @@ static float ssim_window(const float* rendered, const float* target,
             int c = std::clamp(cx + dc, 0, W - 1);
             int ki = (dr + half) * WINDOW + (dc + half);
             float w = kernel[ki];
-            float x = rendered[(r * W + c) * 3 + ch];
-            float y = target  [(r * W + c) * 3 + ch];
+            float x = rendered[ch * H * W + r * W + c];
+            float y = target  [ch * H * W + r * W + c];
             mu1 += w * x;
             mu2 += w * y;
         }
@@ -68,8 +68,8 @@ static float ssim_window(const float* rendered, const float* target,
             int c = std::clamp(cx + dc, 0, W - 1);
             int ki = (dr + half) * WINDOW + (dc + half);
             float w = kernel[ki];
-            float x = rendered[(r * W + c) * 3 + ch];
-            float y = target  [(r * W + c) * 3 + ch];
+            float x = rendered[ch * H * W + r * W + c];
+            float y = target  [ch * H * W + r * W + c];
             s1sq += w * (x - mu1) * (x - mu1);
             s2sq += w * (y - mu2) * (y - mu2);
             s12  += w * (x - mu1) * (y - mu2);
@@ -145,8 +145,8 @@ float compute_combined_loss_gradient(
                         int r = std::clamp(cy + dr, 0, H - 1);
                         int c = std::clamp(cx + dc, 0, W - 1);
                         float w = kernel[(dr + half) * WINDOW + (dc + half)];
-                        mu1 += w * rendered[(r * W + c) * 3 + ch];
-                        mu2 += w * target  [(r * W + c) * 3 + ch];
+                        mu1 += w * rendered[ch * H * W + r * W + c];
+                        mu2 += w * target  [ch * H * W + r * W + c];
                     }
                 }
                 float s1sq = 0.f, s2sq = 0.f, s12 = 0.f;
@@ -155,8 +155,8 @@ float compute_combined_loss_gradient(
                         int r = std::clamp(cy + dr, 0, H - 1);
                         int c = std::clamp(cx + dc, 0, W - 1);
                         float w = kernel[(dr + half) * WINDOW + (dc + half)];
-                        float x = rendered[(r * W + c) * 3 + ch];
-                        float y = target  [(r * W + c) * 3 + ch];
+                        float x = rendered[ch * H * W + r * W + c];
+                        float y = target  [ch * H * W + r * W + c];
                         s1sq += w * (x - mu1) * (x - mu1);
                         s2sq += w * (y - mu2) * (y - mu2);
                         s12  += w * (x - mu1) * (y - mu2);
@@ -174,15 +174,15 @@ float compute_combined_loss_gradient(
                         int r = std::clamp(cy + dr, 0, H - 1);
                         int c = std::clamp(cx + dc, 0, W - 1);
                         float w_k = kernel[(dr + half) * WINDOW + (dc + half)];
-                        float x_k = rendered[(r * W + c) * 3 + ch];
-                        float y_k = target  [(r * W + c) * 3 + ch];
+                        float x_k = rendered[ch * H * W + r * W + c];
+                        float y_k = target  [ch * H * W + r * W + c];
 
                         float d_ssim_dxk = w_k * (
                             (2.f * mu2 * B + 2.f * A * (y_k - mu2)) / (D * E)
                             - ssim_val * (2.f * mu1 / D + 2.f * (x_k - mu1) / E)
                         );
                         // d(DSSIM_mean)/d(x_k) = -d(SSIM_mean)/d(x_k) = -norm_ssim * d(SSIM(cx,cy))/d(x_k)
-                        dL_dpixels[(r * W + c) * 3 + ch] += -w_ssim * norm_ssim * d_ssim_dxk;
+                        dL_dpixels[ch * H * W + r * W + c] += -w_ssim * norm_ssim * d_ssim_dxk;
                     }
                 }
             }

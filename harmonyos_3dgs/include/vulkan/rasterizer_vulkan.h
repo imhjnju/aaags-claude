@@ -91,7 +91,7 @@ private:
     std::unique_ptr<RasterizePass> pass_;
 
     // Layer-2 persistent buffers.
-    std::unique_ptr<VulkanBuffer> r_img_;           // [3*H*W]   f32 CHW
+    std::unique_ptr<VulkanBuffer> r_img_;           // [3*H*W]   f32 CHW (channel-first)
     std::unique_ptr<VulkanBuffer> r_tfinal_;        // [H*W]     f32
     std::unique_ptr<VulkanBuffer> r_ncontrib_;      // [H*W]     u32
     std::unique_ptr<VulkanBuffer> r_ubo_;           // RasterizeUBO (16 bytes std140)

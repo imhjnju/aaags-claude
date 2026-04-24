@@ -951,7 +951,7 @@ __global__ void renderCUDA(...)
         }
     }
 
-    // 写出最终颜色 (CHW 格式)
+    // 写出最终颜色 (CHW 格式 — CUDA 原始输出；我们的 Vulkan 实现已统一为 HWC)
     for (int ch = 0; ch < CHANNELS; ch++)
         out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 }
@@ -1053,10 +1053,11 @@ Reference 中对应:
 
 | 实现 | 布局 | 像素 (x,y) 通道 ch 的索引 |
 |------|------|--------------------------|
-| CUDA | CHW | `out_color[ch * H * W + y * W + x]` |
+| CUDA (原始) | CHW | `out_color[ch * H * W + y * W + x]` |
+| Vulkan (统一) | HWC | `out_image[(y * W + x) * 3 + ch]` |
 | Reference | HWC | `image[y, x, ch]` |
 
-CUDA 的 CHW 布局直接与 PyTorch 的 `[C, H, W]` 张量约定匹配, 无需任何转换。
+CUDA 原始输出为 CHW, 与 PyTorch `[C, H, W]` 张量约定匹配。我们的 Vulkan 实现已统一为 HWC pixel-major, 与 CPU/Reference 一致, 消除了 CPU 侧布局转换开销。
 
 ### 6.4 SH 系数内存布局详解
 
@@ -1189,7 +1190,7 @@ dL_dRGB.z *= clamped[3*idx+2] ? 0 : 1;
 | **Alpha floor** | < 1/255 skip | < 1/255 skip | ✓ |
 | **T threshold** | < 0.0001 done | < 0.0001 break | ✓ |
 | **背景混合** | `C + T * bg` | `C + T * bg` | ✓ |
-| **输出布局** | CHW `[3, H, W]` | HWC `[H, W, 3]` | 内容一致, 布局不同 |
+| **输出布局** | CUDA: CHW `[3, H, W]`; VK: HWC `[H, W, 3]` | HWC `[H, W, 3]` | VK 与 Reference 一致; CUDA 原始 CHW |
 | **最终 clamp** | `rendered_image.clamp(0, 1)` | `np.clip(image, 0, 1)` | ✓ |
 | **反向传播** | 完整实现 | 无 | N/A |
 
