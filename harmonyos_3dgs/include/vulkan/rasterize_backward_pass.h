@@ -37,7 +37,7 @@ public:
         VkBuffer colors;          // RO float[N*3]
         VkBuffer T_final;         // RO float[H*W]
         VkBuffer n_contrib;       // RO uint[H*W]
-        VkBuffer dL_dpixels;      // RO float[H*W*3]  pixel-major
+        VkBuffer dL_dpixels;      // RO float[3*H*W]  CHW channel-first
         VkBuffer dL_dmeans2D;     // RW float[N*2]    zero-filled by caller
         VkBuffer dL_dconics;      // RW float[N*3]    zero-filled by caller
         VkBuffer dL_dopacity;     // RW float[N]      zero-filled by caller

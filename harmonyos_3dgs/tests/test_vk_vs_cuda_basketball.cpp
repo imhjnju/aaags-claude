@@ -1,4 +1,4 @@
-// test_vk_vs_cuda_basketball.cpp — Full-scene VK eval_3D vs CUDA golden.
+// test_vk_vs_cuda_basketball.cpp — Full-scene VK eval_3D vs CUDA golden (CHW layout).
 //
 // Loads basket-aaa.ply (400000 Gaussians, SH degree 3) @ cam 0 (720x960),
 // renders via the Vulkan Renderer path (same as vk_render_main), loads the
@@ -70,10 +70,11 @@ float psnr_from_mse(float mse) {
     return -10.0f * std::log10(mse);
 }
 
-Metrics compute_metrics_hwc(const std::vector<float>& vk,
+Metrics compute_metrics_chw(const std::vector<float>& vk,
                             const std::vector<float>& cuda) {
     EXPECT_EQ(vk.size(), cuda.size());
     const size_t N = vk.size();
+    const size_t per_ch = N / 3;
     double sse = 0.0, sse_r = 0.0, sse_g = 0.0, sse_b = 0.0;
     double sum_abs = 0.0;
     float max_abs = 0.0f;
@@ -89,14 +90,14 @@ Metrics compute_metrics_hwc(const std::vector<float>& vk,
         if (ad > max_abs) max_abs = ad;
         if (ad > 1e-3f) ++num_bad;
         abs_errs.push_back(ad);
-        int ch = static_cast<int>(i % 3);
+        // CHW: pixels 0..per_ch-1 are R, per_ch..2*per_ch-1 are G, 2*per_ch..3*per_ch-1 are B.
+        int ch = static_cast<int>(i / per_ch);
         if (ch == 0) sse_r += d2;
         else if (ch == 1) sse_g += d2;
         else sse_b += d2;
     }
     std::sort(abs_errs.begin(), abs_errs.end());
     float p99 = abs_errs[static_cast<size_t>(abs_errs.size() * 0.99)];
-    const size_t per_ch = N / 3;
     Metrics m{};
     m.psnr     = psnr_from_mse(static_cast<float>(sse / N));
     m.psnr_r   = psnr_from_mse(static_cast<float>(sse_r / per_ch));
@@ -113,15 +114,18 @@ void write_diff_heatmap(const std::vector<float>& vk,
                         const std::vector<float>& cuda,
                         const std::string& out_ppm) {
     const float scale = 1.0f / 0.05f;
+    const size_t HW = static_cast<size_t>(kH) * kW;
+    // writePPM expects HWC layout, so build heat in HWC for output.
     std::vector<float> heat(static_cast<size_t>(kW) * kH * 3);
     for (int y = 0; y < kH; ++y) {
         for (int x = 0; x < kW; ++x) {
-            size_t base = (static_cast<size_t>(y) * kW + x) * 3;
+            size_t pix = static_cast<size_t>(y) * kW + x;
             float dmax = 0.0f;
             for (int c = 0; c < 3; ++c) {
-                dmax = std::max(dmax, std::fabs(vk[base + c] - cuda[base + c]));
+                dmax = std::max(dmax, std::fabs(vk[c * HW + pix] - cuda[c * HW + pix]));
             }
             float v = std::clamp(dmax * scale, 0.0f, 1.0f);
+            size_t base = pix * 3;
             heat[base + 0] = v;
             heat[base + 1] = v;
             heat[base + 2] = v;
@@ -171,33 +175,45 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
         std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/true),
         alloc);
 
-    std::vector<float> vk_hwc(static_cast<size_t>(kW) * kH * 3, 0.0f);
-    renderer.render(model.data, cam, cfg, vk_hwc.data());
+    std::vector<float> vk_chw(static_cast<size_t>(kW) * kH * 3, 0.0f);
+    renderer.render(model.data, cam, cfg, vk_chw.data());
     model.free();
 
-    std::vector<float> golden_hwc(vk_hwc.size());
+    std::vector<float> golden_chw(vk_chw.size());
     std::ifstream in(kGoldenPath, std::ios::binary);
     ASSERT_TRUE(in.good()) << "Cannot open golden: " << kGoldenPath;
-    in.read(reinterpret_cast<char*>(golden_hwc.data()),
-            static_cast<std::streamsize>(golden_hwc.size() * sizeof(float)));
+    in.read(reinterpret_cast<char*>(golden_chw.data()),
+            static_cast<std::streamsize>(golden_chw.size() * sizeof(float)));
     ASSERT_EQ(in.gcount(),
-              static_cast<std::streamsize>(golden_hwc.size() * sizeof(float)))
+              static_cast<std::streamsize>(golden_chw.size() * sizeof(float)))
         << "Golden file size mismatch";
+
+    // Golden raw was saved as HWC by render_single.py --raw-out. Convert to CHW.
+    {
+        const int HW = kH * kW;
+        std::vector<float> tmp(HW * 3);
+        std::memcpy(tmp.data(), golden_chw.data(), HW * 3 * sizeof(float));
+        for (int px = 0; px < HW; ++px) {
+            for (int ch = 0; ch < 3; ++ch) {
+                golden_chw[static_cast<size_t>(ch) * HW + px] = tmp[static_cast<size_t>(px) * 3 + ch];
+            }
+        }
+    }
 
     // Dump VK raw output for external comparison
     {
         std::string vk_raw = std::string(CMAKE_BINARY_DIR) + "/vk_image.raw";
         std::ofstream vo(vk_raw, std::ios::binary);
-        vo.write(reinterpret_cast<const char*>(vk_hwc.data()),
-                 static_cast<std::streamsize>(vk_hwc.size() * sizeof(float)));
+        vo.write(reinterpret_cast<const char*>(vk_chw.data()),
+                 static_cast<std::streamsize>(vk_chw.size() * sizeof(float)));
         std::printf("[VkVsCudaBasketball] VK raw -> %s\n", vk_raw.c_str());
     }
 
-    Metrics m = compute_metrics_hwc(vk_hwc, golden_hwc);
+    Metrics m = compute_metrics_chw(vk_chw, golden_chw);
 
     std::string diff_ppm =
         std::string(CMAKE_BINARY_DIR) + "/vk_cuda_diff_cam0.ppm";
-    write_diff_heatmap(vk_hwc, golden_hwc, diff_ppm);
+    write_diff_heatmap(vk_chw, golden_chw, diff_ppm);
 
     std::printf("[VkVsCudaBasketball] PSNR=%.3f dB (R=%.2f G=%.2f B=%.2f)\n",
                 m.psnr, m.psnr_r, m.psnr_g, m.psnr_b);
@@ -210,6 +226,7 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
     // Split into foreground (cuda pixel > 0.01) vs background, and report
     // per-region PSNR + top-20 worst pixels.
     {
+        const size_t HW = static_cast<size_t>(kH) * kW;
         double sse_fg = 0.0, sse_bg = 0.0;
         int n_fg = 0, n_bg = 0;
         int vk_brighter = 0, cuda_brighter = 0;
@@ -219,9 +236,9 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
 
         for (int y = 0; y < kH; ++y) {
             for (int x = 0; x < kW; ++x) {
-                size_t base = (static_cast<size_t>(y) * kW + x) * 3;
-                float vr = vk_hwc[base], vg = vk_hwc[base+1], vb = vk_hwc[base+2];
-                float cr = golden_hwc[base], cg = golden_hwc[base+1], cb = golden_hwc[base+2];
+                size_t pix = static_cast<size_t>(y) * kW + x;
+                float vr = vk_chw[0 * HW + pix], vg = vk_chw[1 * HW + pix], vb = vk_chw[2 * HW + pix];
+                float cr = golden_chw[0 * HW + pix], cg = golden_chw[1 * HW + pix], cb = golden_chw[2 * HW + pix];
                 float dr = vr - cr, dg = vg - cg, db = vb - cb;
                 float err = std::sqrt(dr*dr + dg*dg + db*db) / std::sqrt(3.0f);
                 float cuda_lum = 0.2126f*cr + 0.7152f*cg + 0.0722f*cb;

@@ -16,7 +16,7 @@
 //   - means2D             : N_eff * 2 * sizeof(float)
 //   - conic_opacity_packed: N_eff * 4 * sizeof(float)
 //   - rgb                 : N_eff * 3 * sizeof(float)
-//   - out_image           : 3 * H * W * sizeof(float)         CHW
+//   - out_image           : 3 * H * W * sizeof(float)         CHW (channel-first, matches CUDA/PyTorch)
 //   - transmittance       : H * W * sizeof(float)
 //   - n_contrib           : H * W * sizeof(uint32)            (ForwardCache::n_contrib is int*, same width)
 //   - raster_ubo          : sizeof(RasterizeUBO) = 16         UNIFORM_BUFFER
@@ -76,8 +76,8 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     if (R <= 0 || binning.values_sorted == nullptr) {
         for (int ch = 0; ch < 3; ++ch) {
             const float bg = config.bg_color[ch];
-            float* row = output_image + static_cast<std::size_t>(ch) * HW;
-            for (int px = 0; px < HW; ++px) row[px] = bg;
+            float* plane = output_image + static_cast<std::size_t>(ch) * HW;
+            for (int px = 0; px < HW; ++px) plane[px] = bg;
         }
         // T_final = 1 and n_contrib = 0 for every pixel — mirror that into
         // the cache if the caller asked for it.
@@ -266,21 +266,6 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // -------------------------------------------------------------------
     img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
 
-    // Convert GPU CHW layout to CPU HWC layout.
-    // rasterize.comp writes: out_image[ch * HW + px]  (CHW)
-    // Rasterizer interface: output_image[px * 3 + ch]  (HWC)
-    {
-        std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
-        std::memcpy(chw.data(), output_image,
-                    static_cast<std::size_t>(HW) * 3u * sizeof(float));
-        for (int px = 0; px < HW; ++px) {
-            for (int ch = 0; ch < 3; ++ch) {
-                output_image[static_cast<std::size_t>(px) * 3 + ch] =
-                    chw[static_cast<std::size_t>(ch) * HW + px];
-            }
-        }
-    }
-
     if (cache) {
         if (cache->T_final) {
             t_buf->download(cache->T_final,
@@ -422,17 +407,6 @@ void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) {
     const std::size_t bytes =
         static_cast<std::size_t>(HW) * 3u * sizeof(float);
     r_img_->download(dst, bytes);
-
-    // Convert GPU CHW layout to CPU HWC layout to match rasterize() output
-    // convention and the CPU rasterizer's pixel-major format.
-    std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
-    std::memcpy(chw.data(), dst, bytes);
-    for (uint32_t px = 0; px < HW; ++px) {
-        for (int ch = 0; ch < 3; ++ch) {
-            dst[static_cast<std::size_t>(px) * 3 + ch] =
-                chw[static_cast<std::size_t>(ch) * HW + px];
-        }
-    }
 }
 
 void RasterizerVulkan::download_cache(float* T_final, int* n_contrib,
