@@ -911,15 +911,19 @@ void main() {
                          positions[i*3u + 1u],
                          positions[i*3u + 2u]);
 
-    // 3. World -> view (near-plane cull).
+    // 3. World -> view (used for both 2D and eval_3D paths).
     // Use precise helpers to match CPU's -ffp-contract=off (no FMA).
-    // The depth (p_view.z) is the sort key — FMA divergence cascades into
-    // completely different sort orders, destroying full-frame PSNR.
+    // The depth (p_view.z) is the sort key in the 2D path.
     vec3 p_view = vec3(
         preciseTransformRow(cam.viewmatrix, position, 0),
         preciseTransformRow(cam.viewmatrix, position, 1),
         preciseTransformRow(cam.viewmatrix, position, 2));
-    if (p_view.z <= 0.2) return;   // CPU uses <= 0.2 in the 2D path.
+    // Near-plane cull only in the 2D path. CUDA's eval_3D path gates this on
+    // splatting_settings.near_clipping (forward.cu:136), which is false by default
+    // and absent from configs/aaa.json, so eval_3D renders near-camera Gaussians
+    // (near_clipping=false). The eval_3D branch below relies on the
+    // camera-inside-ellipsoid test + frustum/AABB culling to reject invalid splats.
+    if (spec_eval_3D == 0u && p_view.z <= 0.2) return;
 
     // =========================================================================
     // eval_3D branch: AAA-Gaussians 3D evaluation path

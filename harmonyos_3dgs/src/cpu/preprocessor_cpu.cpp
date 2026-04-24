@@ -64,8 +64,11 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
 
         if (cfg.eval_3D) {
             // === AAA-Gaussians 3D evaluation path ===
-            if (p_view[2] < 0.2f)
-                continue;
+            // No hard near-plane cull here. CUDA reference (forward.cu:136) gates
+            // this on splatting_settings.near_clipping, which is false by default
+            // and not set in configs/aaa.json, so near-camera Gaussians are kept.
+            // The camera-inside-ellipsoid + frustum/AABB checks below reject
+            // degenerate splats.
 
             float opacity = g.opacities[i];
             float focal = std::max(focal_x, focal_y);
@@ -148,15 +151,15 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
             float pixel_x = ndc2Pix(p_hom[0]*p_w_inv, cam.width);
             float pixel_y = ndc2Pix(p_hom[1]*p_w_inv, cam.height);
 
-            // Screen-space AABB for extent estimation
+            // View-space AABB. Matches CUDA's new_aabb=true path (forward.cu:187)
+            // which uses compute_aabb_view exclusively when aaa.json sets new_aabb=true.
+            // Screen-space AABB fails on near-plane Gaussians, which are now kept
+            // (we no longer near-clip for eval_3D) — view-space AABB handles them.
             float mean2D_aabb[2], extent_aabb[2];
-            if (!computeAABBScreen(gauss2screen, cutoff, mean2D_aabb, extent_aabb)) {
-                // Fallback: view-space AABB (handles near-plane overflow)
-                if (!computeAABBView(gauss2view, p_view, focal_x, focal_y,
-                                     (float)cam.width, (float)cam.height, cutoff,
-                                     mean2D_aabb, extent_aabb))
-                    continue;
-            }
+            if (!computeAABBView(gauss2view, p_view, focal_x, focal_y,
+                                 (float)cam.width, (float)cam.height, cutoff,
+                                 mean2D_aabb, extent_aabb))
+                continue;
 
             int my_radius = (int)std::ceil(std::max(extent_aabb[0], extent_aabb[1]));
             my_radius = std::max(my_radius, 1);
