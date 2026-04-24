@@ -1,0 +1,31 @@
+diff --git a/cuda_rasterizer/stopthepop/hierarchical_render.cuh b/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+index 12e4b65..88258bf 100644
+--- a/cuda_rasterizer/stopthepop/hierarchical_render.cuh
++++ b/cuda_rasterizer/stopthepop/hierarchical_render.cuh
+@@ -1077,7 +1077,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
+ 	DebugVisualization debugType,
+ 	float* __restrict__ out_color)
+ {
+-	// int num_blends = 0;
++	int num_blends = 0;  // DIAG: enabled for VK-vs-CUDA parity investigation
+ 	struct BlendDataRaw
+ 	{
+ 		float T;
+@@ -1125,7 +1125,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
+ 			for (int ch = 0; ch < CHANNELS; ch++)
+ 				blend_data.C[ch] += features[id * CHANNELS + ch] * alpha * blend_data.T;
+ 
+-			// ++num_blends;
++			++num_blends;
+ 			if constexpr (ENABLE_DEBUG_VIZ)
+ 			{
+ 				accumSortingErrorDepth(debugType, blend_data.currentDepth, depth, alpha, blend_data.T, blend_data.accumDepth, blend_data.errorCounter);
+@@ -1140,7 +1140,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
+ 			uint32_t pix_id = W * pixpos.y + pixpos.x;
+ 			final_T[pix_id] = blend_data.T;
+ 
+-			// n_contrib[pix_id] = num_blends;
++			n_contrib[pix_id] = num_blends;
+ 
+ 			if constexpr (!ENABLE_DEBUG_VIZ)
+ 			{
