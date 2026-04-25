@@ -46,3 +46,10 @@ void VulkanBuffer::download(void* dst, std::size_t bytes,
     std::memcpy(dst, mapped, bytes);
     vkUnmapMemory(ctx_.device(), memory_);
 }
+
+void VulkanBuffer::zero_fill(std::size_t bytes, VkDeviceSize offset) {
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(ctx_.device(), memory_, offset, bytes, 0, &mapped));
+    std::memset(mapped, 0, bytes);
+    vkUnmapMemory(ctx_.device(), memory_);
+}

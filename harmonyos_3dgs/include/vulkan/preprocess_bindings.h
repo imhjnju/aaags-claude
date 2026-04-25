@@ -171,5 +171,59 @@ struct alignas(16) RasterEval3DUBO {
 static_assert(sizeof(RasterEval3DUBO) == 96, "RasterEval3DUBO must be 96 bytes (std140)");
 
 namespace rasterize_spec {
-constexpr uint32_t EVAL_3D = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
+constexpr uint32_t EVAL_3D       = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
+constexpr uint32_t TRACE_ENABLED = 1;  // 1 = emit cascade trace (Phase 4 VK port)
 }  // namespace rasterize_spec
+
+// --- rasterize.comp CASCADE TRACE bindings (Phase 4 / Milestone A) -----------
+// 17 additional bindings (14..30) declared in rasterize.comp behind the
+// spec_trace_enabled specialization constant. See
+// dev_notes/phase4_vk_cascade_port_plan.md §5.2 for layout rationale and
+// per-buffer element counts. The shader body never writes these in Milestone
+// A — only the declarations exist so the descriptor-set layout is stable for
+// Milestones B..F.
+namespace rasterize_trace_bind {
+constexpr uint32_t TRACE_META         = 14;  // UBO TraceMetaUBO { K, num_tiles, ... }
+constexpr uint32_t SLOT_LOOKUP        = 15;  // SSBO int[num_tiles]
+constexpr uint32_t TAIL_DEPTHS        = 16;  // SSBO float[K*512*16*64]
+constexpr uint32_t TAIL_IDS           = 17;  // SSBO int  [K*512*16*64]
+constexpr uint32_t TAIL_WCUR          = 18;  // SSBO uint [K]
+constexpr uint32_t MID_DEPTHS         = 19;  // SSBO float[K*1024*16*4*8]
+constexpr uint32_t MID_IDS            = 20;  // SSBO int  [K*1024*16*4*8]
+constexpr uint32_t MID_WCUR           = 21;  // SSBO uint [K]
+constexpr uint32_t HEAD_INS_DEPTH     = 22;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_INS_ALPHA     = 23;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_INS_GID       = 24;  // SSBO int  [K*256*4096]
+constexpr uint32_t HEAD_INS_CURSOR    = 25;  // SSBO uint [K*256]
+constexpr uint32_t HEAD_BLEND_DEPTH   = 26;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_ALPHA   = 27;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_T       = 28;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_GID     = 29;  // SSBO int  [K*256*4096]
+constexpr uint32_t HEAD_BLEND_CURSOR  = 30;  // SSBO uint [K*256]
+constexpr uint32_t BINDING_COUNT      = 31;  // total bindings (0..30)
+}  // namespace rasterize_trace_bind
+
+// TraceMetaUBO (std140) — 32 bytes, matches the shader's TraceMetaUBO block.
+struct alignas(16) TraceMetaUBO {
+    uint32_t K = 0;
+    uint32_t num_tiles = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _reserved[4] = {0, 0, 0, 0};
+};
+static_assert(sizeof(TraceMetaUBO) == 32, "TraceMetaUBO must be 32 bytes (std140)");
+
+// Oversized trace buffer element counts (must match CascadeTraceConsts on the
+// CUDA side — see AAA-Gaussians/submodules/diff-gaussian-rasterization/
+// cuda_rasterizer/stopthepop/cascade_trace.h).
+namespace rasterize_trace_consts {
+constexpr uint32_t MAX_TAIL_SNAPSHOTS = 512;
+constexpr uint32_t MAX_MID_SNAPSHOTS  = 1024;
+constexpr uint32_t MAX_HEAD_INS       = 4096;
+constexpr uint32_t MAX_HEAD_BLEND     = 4096;
+constexpr uint32_t SUBTILES_PER_TILE  = 16;
+constexpr uint32_t QUADRANTS_PER_SUB  = 4;
+constexpr uint32_t TAIL_SLOTS         = 64;
+constexpr uint32_t MID_SLOTS          = 8;
+constexpr uint32_t PIXELS_PER_TILE    = 256;
+}  // namespace rasterize_trace_consts

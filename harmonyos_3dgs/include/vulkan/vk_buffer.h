@@ -29,6 +29,12 @@ public:
     /// Copy `bytes` bytes from the buffer at `offset` to `dst`.
     void download(void* dst, std::size_t bytes, VkDeviceSize offset = 0) const;
 
+    /// Fill `bytes` bytes of the buffer at `offset` with zero via a host
+    /// memory map. Cheaper than uploading a zero-filled staging vector; used
+    /// by the Phase 4 traced rasterize path to initialize cursor/wcur SSBOs
+    /// before the shader ran.
+    void zero_fill(std::size_t bytes, VkDeviceSize offset = 0);
+
 private:
     VulkanContext& ctx_;
     VkBuffer       buffer_ = VK_NULL_HANDLE;

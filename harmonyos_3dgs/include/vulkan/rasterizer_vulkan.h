@@ -23,8 +23,11 @@
 #include "vulkan/vk_context.h"
 #include "vulkan/rasterize_pass.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 class VulkanBuffer;
 
@@ -85,10 +88,55 @@ public:
     VkBuffer transmittance_buf() const;
     VkBuffer n_contrib_buf()     const;
 
+    // -- Phase 4 / Milestone A: traced rasterize --------------------------
+    //
+    // Runs the eval_3D rasterize pipeline with spec_trace_enabled=1. Allocates
+    // the 17 trace SSBOs sized per cascade_trace.h constants (K=
+    // selected_tiles.size()), zero-fills them, populates `SlotLookup` with
+    // -1 for unselected tiles and 0..K-1 for the selected tile IDs,
+    // dispatches, then downloads every buffer into TraceDump. Caller writes
+    // NPYs from that struct (the library layer does not depend on the NPY
+    // writer in tests/golden/).
+    //
+    // The current rasterize.comp body does NOT emit trace writes yet, so all
+    // downloaded TraceDump buffers are zero-filled; only shape/dtype match is
+    // guaranteed. Milestones B..E will populate them level by level.
+    struct TraceDump {
+        uint32_t K = 0;
+        uint32_t num_tiles = 0;
+        std::vector<int32_t>  slot_lookup;        // [num_tiles]
+        std::vector<float>    tail_depths;        // [K,512,16,64]
+        std::vector<int32_t>  tail_ids;           // [K,512,16,64]
+        std::vector<uint32_t> tail_wcur;          // [K]
+        std::vector<float>    mid_depths;         // [K,1024,16,4,8]
+        std::vector<int32_t>  mid_ids;            // [K,1024,16,4,8]
+        std::vector<uint32_t> mid_wcur;           // [K]
+        std::vector<float>    head_ins_depth;     // [K,256,4096]
+        std::vector<float>    head_ins_alpha;     // [K,256,4096]
+        std::vector<int32_t>  head_ins_gid;       // [K,256,4096]
+        std::vector<uint32_t> head_ins_cursor;    // [K,256]
+        std::vector<float>    head_blend_depth;   // [K,256,4096]
+        std::vector<float>    head_blend_alpha;   // [K,256,4096]
+        std::vector<float>    head_blend_T;       // [K,256,4096]
+        std::vector<int32_t>  head_blend_gid;     // [K,256,4096]
+        std::vector<uint32_t> head_blend_cursor;  // [K,256]
+    };
+
+    TraceDump rasterize_traced(const PreprocessOutput& preprocess,
+                               const BinningOutput& binning,
+                               const Camera& camera,
+                               const RenderConfig& config,
+                               const std::vector<uint32_t>& selected_tiles,
+                               float* output_image,
+                               ForwardCache* cache = nullptr);
+
 private:
     VulkanContext& ctx_;
     bool eval_3D_ = false;
     std::unique_ptr<RasterizePass> pass_;
+    // Lazily-constructed trace-enabled pass (spec_trace_enabled=1, eval_3D=1).
+    // Only built when rasterize_traced() is first called.
+    std::unique_ptr<RasterizePass> traced_pass_;
 
     // Layer-2 persistent buffers.
     std::unique_ptr<VulkanBuffer> r_img_;           // [3*H*W]   f32 CHW

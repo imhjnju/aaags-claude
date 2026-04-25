@@ -459,3 +459,365 @@ VkBuffer RasterizerVulkan::transmittance_buf() const {
 VkBuffer RasterizerVulkan::n_contrib_buf() const {
     return r_ncontrib_ ? r_ncontrib_->handle() : VK_NULL_HANDLE;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 / Milestone A: rasterize_traced.
+// Mirrors rasterize() but allocates 17 additional trace SSBOs, dispatches
+// the spec_trace_enabled=1 pipeline variant, and downloads every trace
+// buffer into a TraceDump. The current rasterize.comp body does NOT yet
+// emit trace writes (Milestones B..E will), so downloaded data is all
+// zeros and only shape/dtype alignment with the CUDA side is guaranteed.
+// ---------------------------------------------------------------------------
+RasterizerVulkan::TraceDump RasterizerVulkan::rasterize_traced(
+    const PreprocessOutput& preprocess,
+    const BinningOutput& binning,
+    const Camera& camera,
+    const RenderConfig& config,
+    const std::vector<uint32_t>& selected_tiles,
+    float* output_image,
+    ForwardCache* cache) {
+
+    TraceDump dump{};
+    if (!eval_3D_) {
+        throw std::runtime_error(
+            "rasterize_traced requires the rasterizer be constructed with "
+            "eval_3D=true (matches CUDA hierarchical_render semantics).");
+    }
+
+    const int W = camera.width;
+    const int H = camera.height;
+    if (W <= 0 || H <= 0) return dump;
+
+    const uint32_t num_tiles_x =
+        static_cast<uint32_t>((W + config.tile_w - 1) / config.tile_w);
+    const uint32_t num_tiles_y =
+        static_cast<uint32_t>((H + config.tile_h - 1) / config.tile_h);
+    const uint32_t num_tiles = num_tiles_x * num_tiles_y;
+    const uint32_t K = static_cast<uint32_t>(selected_tiles.size());
+    if (K == 0u) {
+        throw std::runtime_error(
+            "rasterize_traced: selected_tiles must be non-empty");
+    }
+
+    const int R = binning.total_pairs;
+    const int HW = H * W;
+
+    // Lazy-build the trace-enabled pass (kept alive across calls).
+    if (!traced_pass_) {
+        traced_pass_ = std::make_unique<RasterizePass>(
+            ctx_, /*spec_eval_3D=*/1u, /*spec_trace_enabled=*/1u);
+    }
+
+    // Empty-scene: short-circuit to background color (mirrors rasterize()).
+    if (R <= 0 || binning.values_sorted == nullptr) {
+        for (int ch = 0; ch < 3; ++ch) {
+            const float bg = config.bg_color[ch];
+            float* row = output_image + static_cast<std::size_t>(ch) * HW;
+            for (int px = 0; px < HW; ++px) row[px] = bg;
+        }
+        if (cache) {
+            if (cache->T_final)    for (int px = 0; px < HW; ++px) cache->T_final[px]    = 1.0f;
+            if (cache->n_contrib)  for (int px = 0; px < HW; ++px) cache->n_contrib[px]  = 0;
+        }
+        // Produce zero-shape-matched trace buffers.
+        dump.K         = K;
+        dump.num_tiles = num_tiles;
+        dump.slot_lookup.assign(num_tiles, -1);
+        for (uint32_t k = 0; k < K; ++k) {
+            if (selected_tiles[k] < num_tiles) dump.slot_lookup[selected_tiles[k]] = int32_t(k);
+        }
+        const size_t n_tail = size_t(K) * 512 * 16 * 64;
+        const size_t n_mid  = size_t(K) * 1024 * 16 * 4 * 8;
+        const size_t n_head = size_t(K) * 256 * 4096;
+        const size_t n_cur  = size_t(K) * 256;
+        dump.tail_depths.assign(n_tail, 0.f);
+        dump.tail_ids   .assign(n_tail, 0);
+        dump.tail_wcur  .assign(K, 0u);
+        dump.mid_depths .assign(n_mid, 0.f);
+        dump.mid_ids    .assign(n_mid, 0);
+        dump.mid_wcur   .assign(K, 0u);
+        dump.head_ins_depth   .assign(n_head, 0.f);
+        dump.head_ins_alpha   .assign(n_head, 0.f);
+        dump.head_ins_gid     .assign(n_head, 0);
+        dump.head_ins_cursor  .assign(n_cur, 0u);
+        dump.head_blend_depth .assign(n_head, 0.f);
+        dump.head_blend_alpha .assign(n_head, 0.f);
+        dump.head_blend_T     .assign(n_head, 0.f);
+        dump.head_blend_gid   .assign(n_head, 0);
+        dump.head_blend_cursor.assign(n_cur, 0u);
+        return dump;
+    }
+
+    // ---- N_eff + conic_opacity packing (same as rasterize()) -------------
+    uint32_t max_gid = 0u;
+    for (int i = 0; i < R; ++i) {
+        const uint32_t g = binning.values_sorted[i];
+        if (g > max_gid) max_gid = g;
+    }
+    const uint32_t N_eff = max_gid + 1u;
+
+    std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N_eff) * 4u);
+    for (uint32_t i = 0; i < N_eff; ++i) {
+        const std::size_t dst = static_cast<std::size_t>(i) * 4u;
+        const std::size_t src = static_cast<std::size_t>(i) * 3u;
+        conic_opacity_packed[dst + 0] = preprocess.conics[src + 0];
+        conic_opacity_packed[dst + 1] = preprocess.conics[src + 1];
+        conic_opacity_packed[dst + 2] = preprocess.conics[src + 2];
+        conic_opacity_packed[dst + 3] = preprocess.opacities_2d[i];
+    }
+
+    // ---- Core per-Gaussian + output buffers ------------------------------
+    const VkDeviceSize bytes_vs       = VkDeviceSize(R) * sizeof(uint32_t);
+    const VkDeviceSize bytes_tr       = VkDeviceSize(binning.num_tiles) * 2u * sizeof(uint32_t);
+    const VkDeviceSize bytes_m2d      = VkDeviceSize(N_eff) * 2u * sizeof(float);
+    const VkDeviceSize bytes_co       = VkDeviceSize(N_eff) * 4u * sizeof(float);
+    const VkDeviceSize bytes_rgb      = VkDeviceSize(N_eff) * 3u * sizeof(float);
+    const VkDeviceSize bytes_img      = VkDeviceSize(HW) * 3u * sizeof(float);
+    const VkDeviceSize bytes_tfinal   = VkDeviceSize(HW) * sizeof(float);
+    const VkDeviceSize bytes_ncontrib = VkDeviceSize(HW) * sizeof(uint32_t);
+    const VkDeviceSize bytes_g2s      = VkDeviceSize(N_eff) * 16u * sizeof(float);
+    const VkDeviceSize bytes_opa2d    = VkDeviceSize(N_eff) * sizeof(float);
+    const VkDeviceSize bytes_cov3i    = VkDeviceSize(N_eff) * 6u * sizeof(float);
+    const VkDeviceSize bytes_mo       = VkDeviceSize(N_eff) * 3u * sizeof(float);
+
+    auto vs_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_vs,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto tr_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_tr,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto m2d_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_m2d,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto co_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_co,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto rgb_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_rgb,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto img_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_img,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto t_buf        = std::make_unique<VulkanBuffer>(ctx_, bytes_tfinal,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto nc_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_ncontrib, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto ubo_buf      = std::make_unique<VulkanBuffer>(ctx_, sizeof(RasterizeUBO),     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    auto g2s_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_g2s,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto opa2d_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_opa2d,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto cov3i_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_cov3i,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto mo_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_mo,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto e3d_ubo_buf  = std::make_unique<VulkanBuffer>(ctx_, sizeof(RasterEval3DUBO),  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    vs_buf ->upload(binning.values_sorted, static_cast<std::size_t>(bytes_vs));
+    tr_buf ->upload(binning.tile_ranges,   static_cast<std::size_t>(bytes_tr));
+    m2d_buf->upload(preprocess.means2D,    static_cast<std::size_t>(bytes_m2d));
+    co_buf ->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+    rgb_buf->upload(preprocess.rgb,        static_cast<std::size_t>(bytes_rgb));
+    g2s_buf   ->upload(preprocess.gauss2screen, static_cast<std::size_t>(bytes_g2s));
+    opa2d_buf ->upload(preprocess.opacities_2d, static_cast<std::size_t>(bytes_opa2d));
+    cov3i_buf ->upload(preprocess.cov3D_inv,    static_cast<std::size_t>(bytes_cov3i));
+    mo_buf    ->upload(preprocess.mean_offset,  static_cast<std::size_t>(bytes_mo));
+
+    RasterizeUBO ubo{};
+    ubo.bg_r = config.bg_color[0];
+    ubo.bg_g = config.bg_color[1];
+    ubo.bg_b = config.bg_color[2];
+    ubo_buf->upload(&ubo, sizeof(ubo));
+
+    RasterEval3DUBO eubo{};
+    {
+        float inv_vp[16];
+        if (invertMatrix4x4(camera.viewproj_matrix, inv_vp))
+            std::memcpy(eubo.inverse_vp, inv_vp, sizeof(inv_vp));
+        eubo.cam_pos[0] = camera.cam_pos[0];
+        eubo.cam_pos[1] = camera.cam_pos[1];
+        eubo.cam_pos[2] = camera.cam_pos[2];
+        eubo.cam_pos[3] = 0.0f;
+        eubo.img_size[0] = static_cast<float>(W);
+        eubo.img_size[1] = static_cast<float>(H);
+        eubo.img_size[2] = 0.0f;
+        eubo.img_size[3] = 0.0f;
+    }
+    e3d_ubo_buf->upload(&eubo, sizeof(eubo));
+
+    // ---- Cascade trace SSBOs (bindings 14..30) ---------------------------
+    // Sizes follow cascade_trace.h consts; K=selected_tiles.size().
+    const size_t n_tail_elems = size_t(K) * 512 * 16 * 64;
+    const size_t n_mid_elems  = size_t(K) * 1024 * 16 * 4 * 8;
+    const size_t n_head_elems = size_t(K) * 256 * 4096;
+    const size_t n_cur_elems  = size_t(K) * 256;
+
+    const VkDeviceSize bytes_meta        = sizeof(TraceMetaUBO);
+    const VkDeviceSize bytes_slot_lookup = VkDeviceSize(num_tiles) * sizeof(int32_t);
+    const VkDeviceSize bytes_tail_f      = VkDeviceSize(n_tail_elems) * sizeof(float);
+    const VkDeviceSize bytes_tail_i      = VkDeviceSize(n_tail_elems) * sizeof(int32_t);
+    const VkDeviceSize bytes_tail_wcur   = VkDeviceSize(K) * sizeof(uint32_t);
+    const VkDeviceSize bytes_mid_f       = VkDeviceSize(n_mid_elems) * sizeof(float);
+    const VkDeviceSize bytes_mid_i       = VkDeviceSize(n_mid_elems) * sizeof(int32_t);
+    const VkDeviceSize bytes_mid_wcur    = VkDeviceSize(K) * sizeof(uint32_t);
+    const VkDeviceSize bytes_head_f      = VkDeviceSize(n_head_elems) * sizeof(float);
+    const VkDeviceSize bytes_head_i      = VkDeviceSize(n_head_elems) * sizeof(int32_t);
+    const VkDeviceSize bytes_head_cur    = VkDeviceSize(n_cur_elems) * sizeof(uint32_t);
+
+    auto meta_buf           = std::make_unique<VulkanBuffer>(ctx_, bytes_meta,        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    auto slot_lookup_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_slot_lookup, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto tail_depths_buf    = std::make_unique<VulkanBuffer>(ctx_, bytes_tail_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto tail_ids_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_tail_i,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto tail_wcur_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_tail_wcur,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto mid_depths_buf     = std::make_unique<VulkanBuffer>(ctx_, bytes_mid_f,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto mid_ids_buf        = std::make_unique<VulkanBuffer>(ctx_, bytes_mid_i,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto mid_wcur_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_mid_wcur,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hi_depth_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_head_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hi_alpha_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_head_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hi_gid_buf         = std::make_unique<VulkanBuffer>(ctx_, bytes_head_i,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hi_cursor_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_head_cur,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hb_depth_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_head_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hb_alpha_buf       = std::make_unique<VulkanBuffer>(ctx_, bytes_head_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hb_T_buf           = std::make_unique<VulkanBuffer>(ctx_, bytes_head_f,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hb_gid_buf         = std::make_unique<VulkanBuffer>(ctx_, bytes_head_i,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto hb_cursor_buf      = std::make_unique<VulkanBuffer>(ctx_, bytes_head_cur,    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // Upload TraceMetaUBO.
+    {
+        TraceMetaUBO tm{};
+        tm.K = K;
+        tm.num_tiles = num_tiles;
+        meta_buf->upload(&tm, sizeof(tm));
+    }
+
+    // Zero-fill wcur/cursor/depth/alpha/T SSBOs. Init id SSBOs to -1 (CUDA
+    // semantics: tail_ids/mid_ids/head_*_gid use -1 as "invalid slot"
+    // sentinel; CUDA pre-fills tail/mid with -1 via torch::full(-1) so the
+    // VK trace must do the same for unwritten slots to compare cleanly).
+    slot_lookup_buf->zero_fill(static_cast<std::size_t>(bytes_slot_lookup));
+    tail_depths_buf->zero_fill(static_cast<std::size_t>(bytes_tail_f));
+    tail_wcur_buf  ->zero_fill(static_cast<std::size_t>(bytes_tail_wcur));
+    mid_depths_buf ->zero_fill(static_cast<std::size_t>(bytes_mid_f));
+    mid_wcur_buf   ->zero_fill(static_cast<std::size_t>(bytes_mid_wcur));
+    hi_depth_buf   ->zero_fill(static_cast<std::size_t>(bytes_head_f));
+    hi_alpha_buf   ->zero_fill(static_cast<std::size_t>(bytes_head_f));
+    hi_cursor_buf  ->zero_fill(static_cast<std::size_t>(bytes_head_cur));
+    hb_depth_buf   ->zero_fill(static_cast<std::size_t>(bytes_head_f));
+    hb_alpha_buf   ->zero_fill(static_cast<std::size_t>(bytes_head_f));
+    hb_T_buf       ->zero_fill(static_cast<std::size_t>(bytes_head_f));
+    hb_cursor_buf  ->zero_fill(static_cast<std::size_t>(bytes_head_cur));
+    // Fill *_gid buffers with -1 (int32). CUDA pre-fills with torch::full(-1);
+    // uninitialized slots must report -1 so the comparator doesn't see them
+    // as phantom gid=0 entries.
+    {
+        std::vector<int32_t> neg1_tail(n_tail_elems, -1);
+        std::vector<int32_t> neg1_mid (n_mid_elems,  -1);
+        std::vector<int32_t> neg1_head(n_head_elems, -1);
+        tail_ids_buf->upload(neg1_tail.data(), neg1_tail.size() * sizeof(int32_t));
+        mid_ids_buf ->upload(neg1_mid .data(), neg1_mid .size() * sizeof(int32_t));
+        hi_gid_buf  ->upload(neg1_head.data(), neg1_head.size() * sizeof(int32_t));
+        hb_gid_buf  ->upload(neg1_head.data(), neg1_head.size() * sizeof(int32_t));
+    }
+
+    // Populate slot_lookup: -1 for every tile, then 0..K-1 for selected.
+    {
+        std::vector<int32_t> sl(num_tiles, -1);
+        for (uint32_t k = 0; k < K; ++k) {
+            if (selected_tiles[k] < num_tiles) sl[selected_tiles[k]] = int32_t(k);
+        }
+        slot_lookup_buf->upload(sl.data(), sl.size() * sizeof(int32_t));
+    }
+
+    // ---- Bind + dispatch -------------------------------------------------
+    RasterizePass::Buffers rb{};
+    rb.values_sorted        = vs_buf   ->handle();
+    rb.tile_ranges          = tr_buf   ->handle();
+    rb.means2D              = m2d_buf  ->handle();
+    rb.conic_opacity_packed = co_buf   ->handle();
+    rb.rgb                  = rgb_buf  ->handle();
+    rb.out_image            = img_buf  ->handle();
+    rb.transmittance        = t_buf    ->handle();
+    rb.n_contrib            = nc_buf   ->handle();
+    rb.raster_ubo           = ubo_buf  ->handle();
+    rb.gauss2screen         = g2s_buf  ->handle();
+    rb.opacities_2d         = opa2d_buf->handle();
+    rb.cov3D_inv            = cov3i_buf->handle();
+    rb.mean_offset          = mo_buf   ->handle();
+    rb.raster_eval3d_ubo    = e3d_ubo_buf->handle();
+    traced_pass_->bind_buffers(rb);
+
+    RasterizePass::TraceBuffers tb{};
+    tb.trace_meta_ubo    = meta_buf       ->handle();
+    tb.slot_lookup       = slot_lookup_buf->handle();
+    tb.tail_depths       = tail_depths_buf->handle();
+    tb.tail_ids          = tail_ids_buf   ->handle();
+    tb.tail_wcur         = tail_wcur_buf  ->handle();
+    tb.mid_depths        = mid_depths_buf ->handle();
+    tb.mid_ids           = mid_ids_buf    ->handle();
+    tb.mid_wcur          = mid_wcur_buf   ->handle();
+    tb.head_ins_depth    = hi_depth_buf   ->handle();
+    tb.head_ins_alpha    = hi_alpha_buf   ->handle();
+    tb.head_ins_gid      = hi_gid_buf     ->handle();
+    tb.head_ins_cursor   = hi_cursor_buf  ->handle();
+    tb.head_blend_depth  = hb_depth_buf   ->handle();
+    tb.head_blend_alpha  = hb_alpha_buf   ->handle();
+    tb.head_blend_T      = hb_T_buf       ->handle();
+    tb.head_blend_gid    = hb_gid_buf     ->handle();
+    tb.head_blend_cursor = hb_cursor_buf  ->handle();
+    traced_pass_->bind_trace_buffers(tb);
+
+    traced_pass_->dispatch_sync(N_eff,
+                                static_cast<uint32_t>(W),
+                                static_cast<uint32_t>(H),
+                                num_tiles_x, num_tiles_y);
+
+    // ---- Download outputs (image + cache + trace) -----------------------
+    img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+
+    // CHW -> HWC (match rasterize() contract for the image).
+    {
+        std::vector<float> chw(static_cast<std::size_t>(HW) * 3u);
+        std::memcpy(chw.data(), output_image,
+                    static_cast<std::size_t>(HW) * 3u * sizeof(float));
+        for (int px = 0; px < HW; ++px) {
+            for (int ch = 0; ch < 3; ++ch) {
+                output_image[static_cast<std::size_t>(px) * 3 + ch] =
+                    chw[static_cast<std::size_t>(ch) * HW + px];
+            }
+        }
+    }
+
+    if (cache) {
+        if (cache->T_final) {
+            t_buf->download(cache->T_final, static_cast<std::size_t>(bytes_tfinal));
+        }
+        if (cache->n_contrib) {
+            nc_buf->download(cache->n_contrib, static_cast<std::size_t>(bytes_ncontrib));
+        }
+    }
+
+    // Download trace buffers into TraceDump vectors.
+    dump.K         = K;
+    dump.num_tiles = num_tiles;
+
+    dump.slot_lookup.resize(num_tiles);
+    slot_lookup_buf->download(dump.slot_lookup.data(), static_cast<std::size_t>(bytes_slot_lookup));
+
+    dump.tail_depths.resize(n_tail_elems);
+    dump.tail_ids   .resize(n_tail_elems);
+    dump.tail_wcur  .resize(K);
+    tail_depths_buf->download(dump.tail_depths.data(), static_cast<std::size_t>(bytes_tail_f));
+    tail_ids_buf   ->download(dump.tail_ids   .data(), static_cast<std::size_t>(bytes_tail_i));
+    tail_wcur_buf  ->download(dump.tail_wcur  .data(), static_cast<std::size_t>(bytes_tail_wcur));
+
+    dump.mid_depths.resize(n_mid_elems);
+    dump.mid_ids   .resize(n_mid_elems);
+    dump.mid_wcur  .resize(K);
+    mid_depths_buf->download(dump.mid_depths.data(), static_cast<std::size_t>(bytes_mid_f));
+    mid_ids_buf   ->download(dump.mid_ids   .data(), static_cast<std::size_t>(bytes_mid_i));
+    mid_wcur_buf  ->download(dump.mid_wcur  .data(), static_cast<std::size_t>(bytes_mid_wcur));
+
+    dump.head_ins_depth  .resize(n_head_elems);
+    dump.head_ins_alpha  .resize(n_head_elems);
+    dump.head_ins_gid    .resize(n_head_elems);
+    dump.head_ins_cursor .resize(n_cur_elems);
+    hi_depth_buf ->download(dump.head_ins_depth .data(), static_cast<std::size_t>(bytes_head_f));
+    hi_alpha_buf ->download(dump.head_ins_alpha .data(), static_cast<std::size_t>(bytes_head_f));
+    hi_gid_buf   ->download(dump.head_ins_gid   .data(), static_cast<std::size_t>(bytes_head_i));
+    hi_cursor_buf->download(dump.head_ins_cursor.data(), static_cast<std::size_t>(bytes_head_cur));
+
+    dump.head_blend_depth  .resize(n_head_elems);
+    dump.head_blend_alpha  .resize(n_head_elems);
+    dump.head_blend_T      .resize(n_head_elems);
+    dump.head_blend_gid    .resize(n_head_elems);
+    dump.head_blend_cursor .resize(n_cur_elems);
+    hb_depth_buf ->download(dump.head_blend_depth .data(), static_cast<std::size_t>(bytes_head_f));
+    hb_alpha_buf ->download(dump.head_blend_alpha .data(), static_cast<std::size_t>(bytes_head_f));
+    hb_T_buf     ->download(dump.head_blend_T     .data(), static_cast<std::size_t>(bytes_head_f));
+    hb_gid_buf   ->download(dump.head_blend_gid   .data(), static_cast<std::size_t>(bytes_head_i));
+    hb_cursor_buf->download(dump.head_blend_cursor.data(), static_cast<std::size_t>(bytes_head_cur));
+
+    return dump;
+}
