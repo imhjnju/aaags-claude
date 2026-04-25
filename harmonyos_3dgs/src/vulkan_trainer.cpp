@@ -28,10 +28,10 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     , vulkan_adam_(ctx_, 0.9f, 0.999f, 1e-15f)
     , tcfg_(tcfg)
     , active_sh_degree_(0)
-    , preprocessor_(ctx)
+    , preprocessor_(ctx, /*eval_3D=*/tcfg.eval_3D, tcfg.proper_ewa)
     , binner_(ctx)
     , sorter_(ctx)
-    , rasterizer_(ctx)
+    , rasterizer_(ctx, /*eval_3D=*/tcfg.eval_3D, /*disable_subtile_resort=*/tcfg.parity_mode)
     , rasterizer_bwd_(ctx)
     , preprocessor_bwd_(ctx)
 {
@@ -299,6 +299,61 @@ float VulkanTrainer::step(const Camera& cam,
     // 4. Rasterize (populates cache.T_final and cache.n_contrib since they are non-null)
     rasterizer_.rasterize(pre, bin, cam, active_cfg, image_.data(),
                           /*depth=*/nullptr, &cache, &alloc_);
+
+    // 4b. Optional intermediate capture — for VK-vs-CUDA parity tests only.
+    //     All source pointers (pre.*, bin.*, cache.T_final/n_contrib) reference
+    //     CPU-side FrameAllocator memory that the subsequent backward pass is
+    //     free to overwrite, so we snapshot into owned std::vector storage here.
+    //     Zero-overhead when capture_intermediates_ is false.
+    if (capture_intermediates_) {
+        const size_t n = static_cast<size_t>(N_);
+        const size_t HW = static_cast<size_t>(HW_pixels);
+        const size_t R  = static_cast<size_t>(bin.total_pairs);
+        const size_t NT = static_cast<size_t>(bin.num_tiles);
+
+        captured_means2D_.assign(pre.means2D, pre.means2D + n * 2);
+        // Pack (a, b, c, opacity) per Gaussian into [N*4] — match CUDA layout.
+        captured_conic_opacity_.resize(n * 4);
+        for (size_t i = 0; i < n; ++i) {
+            captured_conic_opacity_[i * 4 + 0] = pre.conics[i * 3 + 0];
+            captured_conic_opacity_[i * 4 + 1] = pre.conics[i * 3 + 1];
+            captured_conic_opacity_[i * 4 + 2] = pre.conics[i * 3 + 2];
+            captured_conic_opacity_[i * 4 + 3] = pre.opacities_2d[i];
+        }
+        captured_rgb_.assign(pre.rgb, pre.rgb + n * 3);
+        captured_radii_.assign(pre.radii, pre.radii + n);
+        captured_tiles_touched_.assign(pre.tiles_touched, pre.tiles_touched + n);
+
+        if (bin.values_sorted && R > 0) {
+            captured_sorted_gaussian_ids_.resize(R);
+            for (size_t i = 0; i < R; ++i) {
+                captured_sorted_gaussian_ids_[i] =
+                    static_cast<int>(bin.values_sorted[i]);
+            }
+        } else {
+            captured_sorted_gaussian_ids_.clear();
+        }
+
+        if (bin.tile_ranges && NT > 0) {
+            captured_tile_offsets_.resize(NT * 2);
+            for (size_t i = 0; i < NT * 2; ++i) {
+                captured_tile_offsets_[i] = static_cast<int>(bin.tile_ranges[i]);
+            }
+        } else {
+            captured_tile_offsets_.clear();
+        }
+
+        if (cache.T_final) {
+            captured_T_final_.assign(cache.T_final, cache.T_final + HW);
+        } else {
+            captured_T_final_.clear();
+        }
+        if (cache.n_contrib) {
+            captured_n_contrib_.assign(cache.n_contrib, cache.n_contrib + HW);
+        } else {
+            captured_n_contrib_.clear();
+        }
+    }
 
     // 5. Combined L1 + DSSIM loss + gradient.
     //    lambda_dssim=0 disables the O(W*H*WINDOW^2) SSIM computation (use for large images).

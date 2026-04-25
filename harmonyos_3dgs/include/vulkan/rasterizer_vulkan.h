@@ -30,7 +30,9 @@ class VulkanBuffer;
 
 class RasterizerVulkan : public Rasterizer {
 public:
-    explicit RasterizerVulkan(VulkanContext& ctx, bool eval_3D = false);
+    explicit RasterizerVulkan(VulkanContext& ctx,
+                              bool eval_3D = false,
+                              bool disable_subtile_resort = false);
     ~RasterizerVulkan() override;
 
     RasterizerVulkan(const RasterizerVulkan&)            = delete;

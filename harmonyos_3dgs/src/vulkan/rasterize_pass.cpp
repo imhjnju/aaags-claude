@@ -14,12 +14,15 @@
 // xxd-embedded SPIR-V (CMake build dir produces rasterize_spv.h).
 #include "rasterize_spv.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
 
-RasterizePass::RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D)
+RasterizePass::RasterizePass(VulkanContext& ctx,
+                             uint32_t spec_eval_3D,
+                             uint32_t spec_disable_subtile_resort)
     : ctx_(ctx) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
     shader_ = std::make_unique<VulkanShader>(
@@ -27,16 +30,28 @@ RasterizePass::RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D)
         static_cast<const uint8_t*>(rasterize_spv),
         static_cast<std::size_t>(rasterize_spv_len));
 
-    // --- 2. Specialization constant: constant_id 0 = spec_eval_3D ----------
-    VkSpecializationMapEntry spec_entry{};
-    spec_entry.constantID = rasterize_spec::EVAL_3D;
-    spec_entry.offset     = 0u;
-    spec_entry.size       = sizeof(uint32_t);
+    // --- 2. Specialization constants:
+    //        constant_id 0 = spec_eval_3D
+    //        constant_id 1 = spec_disable_subtile_resort (parity_mode)
+    // ---------------------------------------------------------------------
+    struct SpecData {
+        uint32_t eval_3D;
+        uint32_t disable_subtile_resort;
+    };
+    SpecData spec_data{spec_eval_3D, spec_disable_subtile_resort};
+    std::array<VkSpecializationMapEntry, 2> spec_entries{{
+        {rasterize_spec::EVAL_3D,
+         static_cast<uint32_t>(offsetof(SpecData, eval_3D)),
+         sizeof(uint32_t)},
+        {rasterize_spec::DISABLE_SUBTILE_RESORT,
+         static_cast<uint32_t>(offsetof(SpecData, disable_subtile_resort)),
+         sizeof(uint32_t)},
+    }};
     VkSpecializationInfo spec_info{};
-    spec_info.mapEntryCount = 1u;
-    spec_info.pMapEntries   = &spec_entry;
-    spec_info.dataSize      = sizeof(uint32_t);
-    spec_info.pData         = &spec_eval_3D;
+    spec_info.mapEntryCount = static_cast<uint32_t>(spec_entries.size());
+    spec_info.pMapEntries   = spec_entries.data();
+    spec_info.dataSize      = sizeof(SpecData);
+    spec_info.pData         = &spec_data;
 
     // --- 3. Descriptor layout: 12 SSBOs + 2 UBOs (bindings 8, 13) ----------
     std::vector<VkDescriptorType> binding_types(14,

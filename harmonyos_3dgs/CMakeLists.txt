@@ -263,6 +263,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         add_dependencies(gs3d_vk_render gs3d_vulkan_shaders)
         target_link_libraries(gs3d_vk_render PRIVATE gs3d_vk_core gs3d_core)
 
+        add_executable(gs3d_vk_train src/vulkan/vk_train_main.cpp)
+        add_dependencies(gs3d_vk_train gs3d_vulkan_shaders)
+        target_link_libraries(gs3d_vk_train PRIVATE gs3d_vk_core gs3d_core)
+
         if(BUILD_TESTS)
             add_executable(gs3d_vk_tests
                 tests/test_vk_compute.cpp
@@ -289,10 +293,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vulkan_adam.cpp
                 tests/test_densification.cpp
                 tests/test_e2e_basketball.cpp
-                tests/test_cpu_vk_compare.cpp
                 tests/test_vk_vs_py_reference.cpp
                 tests/test_vk_vs_cpu_render.cpp
-                tests/test_vk_vs_cuda_basketball.cpp)
+                tests/test_vk_vs_cuda_basketball.cpp
+                tests/test_vk_vs_cuda_first_loss.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

@@ -46,7 +46,9 @@ public:
         VkBuffer raster_eval3d_ubo;     // UB  96 bytes    (binding 13, eval_3D only)
     };
 
-    explicit RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D = 0u);
+    explicit RasterizePass(VulkanContext& ctx,
+                           uint32_t spec_eval_3D = 0u,
+                           uint32_t spec_disable_subtile_resort = 0u);
     ~RasterizePass() = default;
 
     RasterizePass(const RasterizePass&)            = delete;

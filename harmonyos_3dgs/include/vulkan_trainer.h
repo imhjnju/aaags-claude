@@ -67,6 +67,22 @@ public:
     const std::vector<float>& captured_grad_sh()         const { return captured_grad_sh_; }
     const std::vector<float>& captured_grad_opacities()  const { return captured_grad_opacities_; }
 
+    // Intermediate forward-pass capture — for VK-vs-CUDA parity tests only.
+    // When enabled, step() copies per-Gaussian and per-tile forward-pass
+    // intermediates into CPU-side std::vector fields after the rasterize pass
+    // finishes but before the backward pass clobbers state. Zero overhead when
+    // disabled (no extra buffers allocated, no GPU-side sync added).
+    void enable_intermediate_capture(bool enable) { capture_intermediates_ = enable; }
+    const std::vector<float>&    captured_means2D()             const { return captured_means2D_; }
+    const std::vector<float>&    captured_conic_opacity()       const { return captured_conic_opacity_; }
+    const std::vector<float>&    captured_rgb()                 const { return captured_rgb_; }
+    const std::vector<int>&      captured_radii()               const { return captured_radii_; }
+    const std::vector<int>&      captured_tiles_touched()       const { return captured_tiles_touched_; }
+    const std::vector<int>&      captured_sorted_gaussian_ids() const { return captured_sorted_gaussian_ids_; }
+    const std::vector<int>&      captured_tile_offsets()        const { return captured_tile_offsets_; }
+    const std::vector<float>&    captured_T_final()             const { return captured_T_final_; }
+    const std::vector<int>&      captured_n_contrib()           const { return captured_n_contrib_; }
+
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
     // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
@@ -139,6 +155,20 @@ private:
     std::vector<float>         captured_grad_rotations_;   // [N*4]
     std::vector<float>         captured_grad_sh_;          // [N*max_coeffs*3]
     std::vector<float>         captured_grad_opacities_;   // [N]
+
+    // Intermediate forward-pass capture. All fields remain empty unless
+    // capture_intermediates_ is enabled; vectors are populated inside step()
+    // after rasterize and before backward.
+    bool                       capture_intermediates_ = false;
+    std::vector<float>         captured_means2D_;              // [N*2]
+    std::vector<float>         captured_conic_opacity_;        // [N*4] {a,b,c,opacity}
+    std::vector<float>         captured_rgb_;                  // [N*3]
+    std::vector<int>           captured_radii_;                // [N]
+    std::vector<int>           captured_tiles_touched_;        // [N]
+    std::vector<int>           captured_sorted_gaussian_ids_;  // [R] — flat (values_sorted)
+    std::vector<int>           captured_tile_offsets_;         // [num_tiles*2] (start, end) flat
+    std::vector<float>         captured_T_final_;              // [H*W]
+    std::vector<int>           captured_n_contrib_;            // [H*W]
 
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;

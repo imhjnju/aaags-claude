@@ -38,9 +38,14 @@
 #include <stdexcept>
 #include <vector>
 
-RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx, bool eval_3D)
+RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
+                                   bool eval_3D,
+                                   bool disable_subtile_resort)
     : ctx_(ctx), eval_3D_(eval_3D) {
-    pass_ = std::make_unique<RasterizePass>(ctx_, eval_3D ? 1u : 0u);
+    pass_ = std::make_unique<RasterizePass>(
+        ctx_,
+        eval_3D ? 1u : 0u,
+        disable_subtile_resort ? 1u : 0u);
 }
 
 // Out-of-line so unique_ptr<RasterizePass> can see the complete type from

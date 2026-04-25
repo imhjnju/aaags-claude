@@ -12,3 +12,9 @@ dev_notes/ground_truth/**/*.ply
 !dev_notes/ground_truth/.gitkeep
 !dev_notes/ground_truth/*/.gitkeep
 # tiny fixtures ARE committed (see tests/golden/tiny/)
+
+# Basketball CUDA reference dumps — large (~141 MB total), regeneratable via
+# tools/dump_cuda_training_step.py.  Only meta.json + the dump script are
+# committed; .npy/.npz produced at test-prep time.
+harmonyos_3dgs/tests/golden/basketball/cuda_ref/**/*.npy
+harmonyos_3dgs/tests/golden/basketball/cuda_ref/**/*.npz

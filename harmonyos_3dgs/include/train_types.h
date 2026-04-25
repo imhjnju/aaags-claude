@@ -191,4 +191,24 @@ struct VkTrainingConfig {
 
     // SP-6: spatial LR scale (cameras_extent from COLMAP; 1.0 = no scaling)
     float spatial_lr_scale   = 1.0f;
+
+    // AAA-Gaussians proper EWA scaling + tight opacity bounding + rect bounding
+    bool  proper_ewa         = false;
+
+    // Enable eval_3D path in the forward preprocessor + rasterizer.
+    // NOTE: CUDA training defaults to eval_3D=true, but the VK backward pass
+    // currently throws when eval_3D=true ("eval_3D is not supported" in
+    // RasterizerBackwardVulkan). Default kept at false to preserve the
+    // pre-plumbed behaviour of existing VulkanTrainer tests; parity harnesses
+    // must set this true explicitly (forward-only path). When true,
+    // `parity_mode` controls whether the VK rasterizer's sub-tile re-sort
+    // (which diverges from CUDA sort_mode=0) is bypassed.
+    bool  eval_3D            = false;
+
+    // Parity mode — disables the per-4x4 sub-tile re-sort inside rasterize.comp's
+    // eval_3D path so the Vulkan rasterizer's behaviour matches CUDA sort_mode=0
+    // (simple per-tile depth-ordered alpha blending with HEAD-only insertion
+    // sort). Costs about 2.3 dB of eval_3D rendering PSNR on its own, but
+    // required to bit-match the CUDA first-loss golden. Default false.
+    bool  parity_mode        = false;
 };

@@ -103,6 +103,11 @@ layout(std140, set = 0, binding = 13) uniform RasterEval3DUBO {
 
 // Specialization constant: 0=2D conic path, 1=eval_3D k-buffer path.
 layout(constant_id = 0) const uint spec_eval_3D = 0u;
+// Specialization constant: when 1, skip the per-4x4 sub-tile re-sort inside the
+// eval_3D path. HEAD then receives Gaussians in raw sorted-batch (tile-center
+// depth) order — matches CUDA sort_mode=0 behaviour. Used by `parity_mode` for
+// bit-level VK-vs-CUDA first-loss comparison. Default 0 (re-sort enabled).
+layout(constant_id = 1) const uint spec_disable_subtile_resort = 0u;
 
 // RasterizePushConstants — 20 bytes (spec §4.8.7).
 layout(push_constant) uniform PC {
@@ -301,7 +306,17 @@ void main() {
         //    depth keys. Only the 16 leader threads allocate it.
         //    Per-pixel alpha threshold, power>0 skip, and ALPHA_THRESHOLD
         //    filtering happen in step 3 where the actual pixel is known.
-        if (is_subtile_leader) {
+        if (spec_disable_subtile_resort == 1u) {
+            // Parity mode: skip depth-ordered sub-tile re-sort. Every leader
+            // thread writes an identity permutation so step 3 walks the batch
+            // in raw input (tile-center sorted) order — matches CUDA sort_mode=0.
+            if (is_subtile_leader) {
+                for (uint k = 0u; k < batch_size; ++k) {
+                    sub_order[subtile_id][k] = k;
+                }
+                sub_count[subtile_id] = int(batch_size);
+            }
+        } else if (is_subtile_leader) {
             float priv_depth[256];
             int cnt = 0;
 

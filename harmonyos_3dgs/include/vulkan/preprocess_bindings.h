@@ -44,8 +44,9 @@ static_assert(sizeof(PreprocessPushConstants) == 24,
 
 // Specialization constant IDs (spec §4.5)
 namespace preprocess_spec {
-constexpr uint32_t TRAINING = 0;  // spec_training: 1=training (no clamp), 0=inference (clamp)
-constexpr uint32_t EVAL_3D  = 1;  // spec_eval_3D: 0=2D conic path, 1=3D evaluation path
+constexpr uint32_t TRAINING    = 0;  // spec_training: 1=training (no clamp), 0=inference (clamp)
+constexpr uint32_t EVAL_3D     = 1;  // spec_eval_3D: 0=2D conic path, 1=3D evaluation path
+constexpr uint32_t PROPER_EWA  = 2;  // spec_proper_ewa: 1=AAA proper_ewa_scaling+tight_opacity_bounding+rect_bounding
 }  // namespace preprocess_spec
 
 // --- prefix_sum.comp bindings (spec §4.8.2) ---
@@ -172,4 +173,5 @@ static_assert(sizeof(RasterEval3DUBO) == 96, "RasterEval3DUBO must be 96 bytes (
 
 namespace rasterize_spec {
 constexpr uint32_t EVAL_3D = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
+constexpr uint32_t DISABLE_SUBTILE_RESORT = 1;  // 1 = skip per-4x4 sub-tile re-sort (parity_mode)
 }  // namespace rasterize_spec
