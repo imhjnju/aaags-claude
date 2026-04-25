@@ -1,5 +1,68 @@
 # Captain's Log
 
+## Session 11 — 2026-04-25 — Phase A + C.0 + D.deep SH layout closure
+
+Long, multi-arc session. Started after S10's master merge. Closed three major items: Phase A (CPU↔VK 99 dB via proper_ewa default flip), C.0 (Gate_P1_Means2D PASS via dilation gating + test wiring + masking + relative tolerance), and D.deep (the SH Adam-group layout bug — the most important find of the day). Plus latent-bug alignment in Python reference, full test sensitivity tightening with permanent sentinels, and ~3000× tighter parity verified to 10 steps.
+
+### Headline findings
+
+1. **MEMORY.md baseline numbers were stale.** Pre-session, MEMORY.md still claimed "VK eval_3D 42.8 dB / 17.2 dB gap to 60 dB". Empirically, post-S10 near-plane cull fix (commit `1b02ca2`) had already pushed `VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline` to **54.84 dB** — only 5.16 dB to 60 dB target. Updated MEMORY.md to reflect.
+
+2. **The atomicAdd hypothesis was wrong for the SH bug.** Earlier in the day I attributed VK↔Python gradient drift to `rasterize_backward.comp` atomicAdd nondeterminism. The user pushed back: "别怀疑 atomicAdd 这种不好定位的问题". Forced through a step-1 intermediate-value audit (14 forward stages dumped, dL_dimage confirmed bit-identical) and a 3-step trajectory analysis. The 3-step result showed **deterministic** 469% rel_diff on G[2] post-Adam SH — same Gaussian every run, every step. atomicAdd noise can't produce deterministic divergence. Lesson saved as `gotchas.md` "Don't default-blame atomicAdd for backward drift" and `memory/sh_adam_group_layout.md`.
+
+3. **Real root cause: SH Adam-group upload layout mismatch.** 3DGS uses two Adam groups for SH (DC lr=2.5e-3, REST lr=DC/20). VK trainer was `memcpy`-splitting the unified interleaved `[N,K,3]` CPU buffer by float-index — for K=16, the first N\*3 floats are NOT all DCs (G[0]'s entire 48 SH + G[1]'s first 4). G[2..N-1]'s DCs landed in REST and updated at 1/20 the correct lr. Fix: gather/scatter helpers in `vulkan_trainer.cpp` (5 call sites). Result: 3-step SH max-elem rel_diff 469% → 0.015%; step-2 loss 1.10e-3 → 5.5e-7; 10-step trajectory all groups bounded.
+
+4. **L2-norm tests systemically hide single-element drift.** The pre-fix bug passed `Step1GradientAndLoss` because L2-norm rel_diff 9.85e-7 (norm dominated by DC-zero magnitudes ~1) is small even when ONE DC element is 469% off. Tightened test: per-element max rel_diff assertion at 1e-4 + abs_diff column + `%.6e` print format. Graduated `TempDiag3StepSHCompare` and `TempDiag10StepAllGroups` to permanent sentinels with calibrated EXPECT_LT.
+
+### What was done (chronologically)
+
+1. `/resume` to recover state. Realized MEMORY.md numbers were stale; queued correction.
+2. **Phase A**: investigated why `VkVsCpuRender.FullFramePSNR` was 28.75 dB despite master claiming 99.15 dB after CPU 2D forward + h_conv backward fix. Diff between worktree-training and master: `proper_ewa` was added as a `PreprocessorVulkan` ctor parameter with default `false`, but the existing CPU↔VK test wasn't wired with explicit `true` opt-in; shader's else-branch (3.33σ basic, no convolution_scaling) was running. Fix: flip default to `true`, opt-out at parity-harness sites. Suite: `VkVsCpuRender` 28.75 → **99.15 dB**, `PreprocessPass.MatchesCUDAGolden_Tiny` also self-healed.
+3. **C.0**: Investigated `Gate_P1_Means2D` failure. First diagnosed `compute_aabb_view` bounded loop hypothesis (refuted: bit-identical output with iter cap raised). Then looked at masking: 336 CUDA "huge means" are CUDA's `tan(±π/2 - ε)` degenerate-AABB fallback (CUDA's "I give up, full screen" semantic), 5903 only-CUDA-rasterizes are dilation_factor mismatch (CUDA gates on `proper_ewa_scaling`, VK was unconditional), ~2887 "both rasterize" residual disappeared once dilation gating fixed. Final: gate dilation in `preprocess.comp:967` + wire basketball test 3 sites with `proper_ewa=true` (matches its golden's `aaa.json features = proper_ewa_scaling=True`) + test logic mask + reltol. `Gate_P1` FAIL (8790 bad) → **PASS (0 bad)**. Basketball PSNR preserved at 54.84 dB.
+4. **D.deep**: User pushed back on "atomicAdd is the bug". Did step-1 intermediate-value audit confirming forward sub-ULP-equivalent and `dL_dimage` bit-identical. Then 3-step trajectory analysis exposed the SH layout bug. Fixed `vulkan_trainer.cpp` with gather/scatter helpers. Verified at 10 steps: all groups bounded < 1e-3 rel_diff except documented gpos atomic noise debt.
+5. **Latent algorithmic bugs**: prior audit had flagged 2 inactive-on-fixture differences (det floor, frustum 1.3× clamp). Confirmed CUDA is canonical; aligned Python ref proactively. Goldens regenerated (1114 files, 937 perturbed at ≤2.4e-7). Basketball cam0 unchanged.
+6. **Test sensitivity**: tightened `Step1GradientAndLoss` (5% → 1e-3 norm; new 1e-4 per-elem; `%.6e` printing; abs_diff column). Graduated 2 sentinels with calibrated thresholds (`Step3PostAdamSHParity`, `Step10TrajectoryAllGroups`).
+7. **Memory updates**: `gotchas.md` + new `sh_adam_group_layout.md` + new `feedback_l2_strict_gradient_parity.md`. Captured the methodology lesson + the bug pattern + the strict-parity preference.
+8. **Commits**: `d8c388f` (Phase A + Gate_P1 + SH fix bundled), `c58f4eb` (test sensitivity + sentinels), `3dcfb04` (Python ref alignment + audit instrumentation + 1114 goldens).
+
+### Outstanding debt
+
+- **gpos atomic noise**: `Step1GradientAndLoss.gpos` per-element 1.89e-4 (sub-ULP abs 1.5e-9). `TODO(deterministic-backward)` in `rasterize_backward.comp` — 7 atomicAdd sites at lines 252, 282, 284, 297, 299, 301, 305. Adam smooths it; 10-step trajectory bounded; defer.
+- **L1b 5.16 dB to 60 dB**: Gates P2-P7 + L1 still SKIP. Phase C.1 (P2-P5 implementation) and Phase C.2 (cascade trace harness) remain open.
+- **L5 independent-train comparison test**: doesn't exist yet. Phase E.
+- **Python reference single-group SH Adam at sh_degree>0**: when fixture moves to higher SH degree, Python ref's single-group Adam (lr=2.5e-3 for all SH) will diverge from VK's two-group split. Update Python ref before running degree>0 tests.
+- **Basketball ply downsampled parity**: tried; full-resolution is days+ runtime in Python autograd; downsampled was launched and hit usage limit. Revisit after quota reset.
+
+## Session 10 — 2026-04-25 — Merge master → worktree-training
+
+Imported the latest `master` (CPU 2D forward + CPU/VK backward alignment) into
+`worktree-training` while the in-progress first-loss-parity work was still
+uncommitted on the working tree. Clean merge, no conflicts, build green, all
+local edits preserved.
+
+### What was done
+1. **Investigation**: confirmed remote layout — primary branch is `master` (not `main`); remotes are `github` and `gitee` (no `origin`). `github/master` is far behind local `master` (still at "add harness"); local `master` was the actual integration target.
+2. **Pre-merge analysis**: 3 commits on `master` not in `worktree-training`:
+   - `09217bb` fix(preprocess-2d-cpu): align proper_ewa_scaling + tight_opacity_bounding with VK/CUDA
+   - `612c125` fix(preprocess-backward): add h_conv_scaling chain rule to CPU and VK backward
+   - `ccd093e` Merge branch 'worktree-white-table': CPU 2D forward + CPU/VK backward alignment
+   Files changed by master: `src/cpu/preprocessor_cpu.cpp`, `src/cpu/preprocessor_backward_cpu.cpp`, `src/vulkan/shaders/preprocess_backward.comp`.
+3. **Overlap check**: working-tree dirty list (preprocess_pass.{h,cpp}, preprocessor_vulkan.{h,cpp}, preprocess.comp [forward, NOT backward], vulkan_trainer.{h,cpp}, camera_utils.cpp, tests, tools) — no overlap with master's 3 files. `git merge-tree` dry-run produced a single tree hash with no conflict markers. Case A.
+4. **Merge**: `git merge master --no-ff` with explanatory message, producing merge commit `5ee56bc`.
+5. **Build verification**: `cmake --build build` green end-to-end. CPU preprocessor objects rebuilt, `preprocess_backward.spv` recompiled, all executables relinked.
+6. **Working tree intact**: same 20 modified files + same untracked golden npy/tools/raw artifacts as before merge — nothing stashed, nothing reset.
+
+### Key findings
+- The user task spec named the branch `main` and the remote `origin`; this repo uses `master` and `github`/`gitee`. Adapted accordingly.
+- The dev_notes location the user pointed at (`harmonyos_3dgs/dev_notes/{session_state,captains_log}.md`) does not exist — the canonical files live at the worktree root `dev_notes/{session_state,captains_log}.md` per `MEMORY.md`. Updated those.
+- Master's changes are pure backward-parity fixes on CPU/VK backward; they unblock CPU↔VK numerical alignment but don't touch the VK forward `preprocess.comp` path the S10 first-loss-parity work is editing. Net safe pickup.
+
+### Next steps
+- Resume S10 first-loss-parity work on the now-rebased base. The new h_conv_scaling backward chain may shift VK gradient numbers slightly relative to pre-merge captures; if `VkVsPyReference.Step1GradientAndLoss` regresses, the chain-rule fix is the likely cause and should be reflected in any cached Python reference dumps.
+- Evaluate whether the 5 dB VK-vs-CUDA gap discussion in S8 is now (with `VkVsCpuRender.FullFramePSNR=99.15` from master's CPU alignment) re-framable: CPU↔VK is now nearly bit-exact at 2D, so any remaining VK↔CUDA gap is firmly in the rasterizer cascade, not the preprocess.
+
+---
+
 ## Session 8 — 2026-04-21
 
 VK eval_3D rasterizer vs CUDA golden parity push: PSNR 25.3 → 42.8 dB (17.2 dB gap remains to 60 dB target).

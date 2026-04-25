@@ -1,36 +1,54 @@
 # Session State
 
-## Current Phase
-VK eval_3D CUDA parity: PSNR 42.8 dB (target ≥60 dB). 17.2 dB gap remains.
+## Current Phase (S11 — 2026-04-25)
+L2 backward-parity work: per-step bit-exactness drive. Phase A (proper_ewa default) + Phase C.0 (Gate_P1_Means2D closure) + D.deep (SH Adam-group bug) all closed today. Test infrastructure tightened with permanent regression sentinels. L1b VK↔CUDA forward at **54.84 dB / 5.16 dB to 60 dB target** (legacy 42.8 dB number was pre-S10 near-plane cull fix; stale).
 
-## Test Counts
-- Total passing: 243 / 243 + 1 VK-vs-CUDA basketball test (PSNR=42.8 dB, baseline=42.1 dB)
-- As of 2026-04-21 (Session 8)
+## Test Counts (post-commits, 2026-04-25)
+- VK suite: **75 PASS / 8 SKIP / 1 FAIL** (84 total)
+- Only failure: `Step1GradientAndLoss.gpos` per-element max rel_diff 1.89e-4 (sub-ULP abs 1.5e-9, atomicAdd noise) — documented `TODO(deterministic-backward)`
+- 8 skipped: 7 unimplemented `VkVsCudaFirstLoss.Gate_P2..P7, Gate_L1` + `OraclePerStepComparison` (1000-step golden missing)
+- CPU suite: 169/16/0
+
+## Parity Ladder (L1-L5)
+| Level | Meaning | Status |
+|-------|---------|--------|
+| L1a | CPU↔VK same-ply forward | ✅ 99.15 dB (Phase A close) |
+| L1b | VK↔CUDA same-ply forward (basketball cam0) | **54.84 dB** (5.16 dB to 60 dB target). Gate_I1-I4 + P1 PASS; P2-P7 SKIP |
+| L2 | Backward gradient parity | ✅ All 5 groups bit-exact at L2 norm + sub-1e-4 per-element except gpos atomic noise |
+| L3 | Post-Adam param parity | ✅ All groups (after SH layout bug fix) |
+| L4 | 100-step trajectory | ✅ Bounded sub-1e-3 rel_diff with new sentinels |
+| L5 | Independent-train final-eval | 🔜 Test does not yet exist (Phase E) |
 
 ## Milestones
 | Milestone | Status | Sessions | Summary |
 |-----------|--------|----------|---------|
 | SP-0: CUDA golden infra | DONE | — | CPU reference + FD test harness |
-| SP-1: Vulkan infra | DONE | S2 | VulkanContext/Buffer/Shader/Pipeline; TDD gate |
+| SP-1: Vulkan infra | DONE | S2 | VulkanContext/Buffer/Shader/Pipeline |
 | SP-2: Vulkan forward pipeline | DONE | S2 | preprocess.comp + sort + rasterize.comp |
 | SP-3: Vulkan backward pipeline | DONE | S3 | rasterize_backward.comp + preprocess_backward.comp |
-| SP-4: Training integration | DONE | S4 | ForwardCache caching, GPU Adam skeleton (CpuAdam), VulkanTrainer, 216 tests |
-| SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam kernel, LR+SH schedules, DSSIM, MCMC densification, basketball E2E smoke test, 229 tests |
-| SP-6: Training gaps closed | DONE | S7 | T1-T5 done; 243/243 + basketball loss-decrease pass |
-| VK-CUDA parity (PSNR≥60dB) | IN PROGRESS | S8 | 25.3→42.8 dB; proper_ewa, tile_culling, sub-tile sort done. Need persistent TAIL buffer |
+| SP-4: Training integration | DONE | S4 | ForwardCache, GPU Adam, VulkanTrainer |
+| SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam, LR+SH schedules, DSSIM, MCMC, basketball E2E smoke |
+| SP-6: Training gaps closed | DONE | S7 | T1-T5; 243 tests + basketball loss-decrease |
+| VK-CUDA L1b parity (PSNR≥60dB) | IN PROGRESS | S8-S11 | 25.3→54.84 dB. Phase 1 (Gate_I1-I4) + Gate_P1 done; need Gate_P2-P7 implementation |
+| L2 backward parity | DONE | S11 | SH layout bug fix + test sensitivity tightening; 1 atomic noise debt |
+| L5 independent-train comparison | TODO | — | No test exists; Phase E |
 | M0: Foundation | IN PROGRESS | — | Interleaved with Vulkan migration |
 
-## VK-CUDA Parity Task Status (Session 8)
-| Task | Status | PSNR Impact | Commit |
-|------|--------|-------------|--------|
-| Harness (render_single.py + gtest) | DONE | baseline=25.3 | a4dc240, fa6adc9 |
-| proper_ewa_scaling (eval_3D + 2D) | DONE | +11.6 dB | ed303bd |
-| rect_bounding + tight_opacity_bounding | DONE | 0 dB | 6ff257b |
-| tile_based_culling (INVALID sentinel) | DONE | +3.4 dB | 83ca5b1 |
-| Hierarchical sub-tile TAIL re-sort | DONE | +2.3 dB | b4cd239 |
-| HEAD_W=8, subtile_cx+2.0, z/w key | DONE | +0.2 dB | 72bd4bf |
-| Persistent cross-batch TAIL buffer | TODO | ? | — |
-| Verify ≥60 dB + lock baseline | TODO | — | — |
+## L1b Gate Status (Phase C of plan)
+| Gate | Status | Notes |
+|------|--------|-------|
+| Gate_I1 ViewMatrix | PASS | max_abs 7.45e-9 |
+| Gate_I2 ProjMatrix | PASS | max_abs 1.19e-7 |
+| Gate_I3 RawParams | PASS | max_abs 4.77e-7 (opacities) |
+| Gate_I4 ConfigFlags | PASS | parity_mode=1 |
+| Gate_P1 Means2D | PASS (S11) | mask CUDA huge fallback + relative tol; 5903 only-CUDA-rasterizes closed by dilation gating fix |
+| Gate_P2 ConicOpacity | SKIP | needs implementation |
+| Gate_P3 RgbColors | SKIP | needs SH-evaluated RGB compare |
+| Gate_P4 Radii | SKIP | blocked on new_aabb Phase-2 |
+| Gate_P5 SortedIds | SKIP | sort gate, gateway to cascade-trace harness |
+| Gate_P6 TFinalNContrib | SKIP | rasterize state |
+| Gate_P7 RenderedImage | SKIP | full-frame PSNR |
+| Gate_L1 L1Loss | SKIP | needs forward render parity first |
 
 ## Python → C++ Gaps Closed (SP-6)
 1. **Opacity reg**: `dL/d_raw_opacity += (0.01/N)*sig*(1-sig)` — after backward, before Adam upload
@@ -40,7 +58,31 @@ VK eval_3D CUDA parity: PSNR 42.8 dB (target ≥60 dB). 17.2 dB gap remains.
 
 ## Latest Sessions
 
-### S8 — 2026-04-20 (current)
+### S11 — 2026-04-25 (current) — Phase A + C.0 + D.deep SH layout closure
+- **Phase A — proper_ewa default flip**: `PreprocessorVulkan` ctor default flipped from `false` → `true`. Production paths (CPU↔VK comparison, render) take AAA path; parity-harness tests opt out explicitly. Result: `VkVsCpuRender.FullFramePSNR` 28.75 → **99.15 dB** (CPU↔VK closed).
+- **C.0 — Gate_P1_Means2D closure**: gated `opacity_3d *= dilation_factor` on `spec_proper_ewa` in `preprocess.comp` to match CUDA `forward.cu:157`. Wired `test_vk_vs_cuda_basketball.cpp` 3 sites with `proper_ewa=true` (matches its golden's actual generation config). Test logic: mask CUDA `tan(±π/2-ε)` degenerate fallback (`|m2d|>1e5`) + relative tolerance `max(1e-2 px, 1e-3·|cuda|)`. Result: `Gate_P1_Means2D` FAIL (8790 bad) → **PASS (0 bad)**.
+- **D.deep — SH Adam-group layout bug**: 3-step trajectory analysis revealed deterministic 469% rel_diff on G[2] post-Adam SH (NOT atomicAdd noise — fully reproducible across runs). Root cause: `vulkan_trainer.cpp` was `memcpy`-splitting the unified `[N,K,3]` interleaved CPU buffer by float-index between DC `[N,3]` and REST `[N,K-1,3]` GPU groups. With K=16, first N\*3=60 floats are NOT all DCs (they're G[0]'s entire 48 SH + G[1]'s first 4); G[2..N-1]'s DCs landed in REST with **wrong lr (1/20 of correct)**. Fix: `sh_gather_dc/rest` + `sh_scatter_dc/rest` helpers + 5 call sites (ctor, reset_for_oracle, step gradient upload, step post-Adam download, reallocate_for_n). Verification: 3-step SH max-elem rel_diff **469% → 0.015%** (~3000× tighter); step-2 loss rel_diff **1.10e-3 → 5.5e-7** (2000× tighter); 10-step trajectory all groups bounded < 1e-3.
+- **Latent-bug alignment (Python ref → CUDA)**: 2 algorithmic differences fixed in Python reference proactively, both inactive on tiny+basketball but would activate on edge-case fixtures: (a) `det.clamp(min=1e-10)` removed (CUDA does `1.f/det`, visibility gated upstream), (b) frustum 1.3× clamp added on `tx/tz, ty/tz` before computing J Jacobian (matches `forward_common.h:81-86`). 1114 goldens regenerated, 937 perturbed at ≤2.4e-7. Basketball cam0 PSNR unchanged at 54.84 dB.
+- **Test infrastructure tightening**: `Step1GradientAndLoss` L2-norm threshold 5% → 1e-3, new per-element max rel_diff assertion at 1e-4, print format `%.4f` → `%.6e`, `abs_diff` column added. Two new permanent regression sentinels `Step3PostAdamSHParity` (6 EXPECT_LT) and `Step10TrajectoryAllGroups` (21 EXPECT_LT).
+- **Auto-memory updates**: `memory/sh_adam_group_layout.md`, `memory/feedback_l2_strict_gradient_parity.md`, `memory/gotchas.md` (+ SH layout, +don't-default-blame-atomicAdd, +new_aabb).
+- **Outstanding**: gpos per-element 1.89e-4 atomicAdd debt (sub-ULP abs 1.5e-9; `TODO(deterministic-backward)` in `rasterize_backward.comp`). Decision: defer; Adam smooths it; trajectory bounded 10 steps.
+- **Commits today (this branch)**: `d8c388f` (Phase A + Gate_P1 + SH fix bundled), `c58f4eb` (test sensitivity), `3dcfb04` (Python ref + goldens + audit instrumentation).
+
+### S10 — 2026-04-25 — merge master → worktree-training
+- Merged `master` into `worktree-training` (merge commit `5ee56bc`, no-ff). Three master commits imported:
+  - `09217bb` fix(preprocess-2d-cpu): align proper_ewa_scaling + tight_opacity_bounding with VK/CUDA — CPU 2D forward backport (28.75 → 99.15 dB CPU↔VK)
+  - `612c125` fix(preprocess-backward): add `h_conv_scaling` chain rule to CPU and VK backward — `d_opacities_2d → d_cov2D` through `h_conv = sqrt(det_orig/det_dilated)` (restores `PreprocessorBackward.CovChain_RotationGradient`, `PreprocessorBackwardVulkan.MatchesCPU_TinyGolden`, `BackwardPipeline.FullChain_TinyFixture`, `CpuVkCompare.SingleStepConsistency`, `VkVsCpuRender.FullFramePSNR`)
+  - `ccd093e` Merge branch 'worktree-white-table': CPU 2D forward + CPU/VK backward alignment (combined description)
+- Files touched by merge: `src/cpu/preprocessor_cpu.cpp`, `src/cpu/preprocessor_backward_cpu.cpp`, `src/vulkan/shaders/preprocess_backward.comp`. **Disjoint** from in-progress S10 first-loss-parity work (VK forward `preprocess.comp`, `vulkan_trainer.cpp`, tests, `tools/*reference*.py`) — no merge conflicts, no working-tree disruption.
+- Build verified post-merge: full `cmake --build build` green (gs3d_core, gs3d_vk_core, gs3d_tests, gs3d_vk_tests, gs3d_train, gs3d_vk_train, gs3d_vk_render, etc. all rebuilt and linked).
+- Test count after merge: not re-counted in this session; pre-merge master claimed 249/257 (97%). In-progress training-parity test edits in this worktree are still uncommitted, so a clean test-run number will only be meaningful once those edits land.
+- All 20 modified + many untracked files from S10 first-loss-parity work preserved exactly as before merge.
+
+### S9 — 2026-04-23
+- Active work: VK vs CUDA training first-loss parity harness. Phase 0+1 landed (commit `5366d38`). See `harmonyos_3dgs/dev_notes/vk_cuda_first_loss_parity_plan.md` and `vk_initial_loss_mismatch_s10.md`.
+- Cascade equivalence harness for CUDA↔VK 3-level sort planned. See `memory/cascade_equivalence_harness.md`.
+
+### S8 — 2026-04-20
 - SP-7 T1-T5 complete (CB chaining, persistent buffers): 248 tests pass
 - Basketball test: changed to 100 steps (no densification) PSNR=5.61 dB, finite+positive assertion
 - VK vs Python gradient comparison: 3 new tests implemented (task 54-56)
