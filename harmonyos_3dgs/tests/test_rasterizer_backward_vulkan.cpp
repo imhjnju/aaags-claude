@@ -7,9 +7,8 @@
 //   1. Load tiny golden fixture (input_*.npy + backward_dL_dout_color.npy).
 //   2. CPU forward chain: PreprocessorCPU → TileBinnerCPU → SorterCPU →
 //      RasterizerCPU  → populates ForwardCache (T_final, n_contrib, cov2D, …).
-//   3. Transpose dL_dout_color from channel-major [3][H][W] to
-//      pixel-major [H*W][3] (the CPU backward uses pixel-major indexing).
-//      Evidence: npy shape is (3, 64, 64), CUDA dumps in CHW order.
+//   3. Load dL_dout_color directly from npy (CHW [3][H][W], matching our
+//      backward pass input format).
 //   4. CPU backward  (RasterizerBackwardCPU::backward) → rgrad_cpu.
 //   5. Vulkan backward (RasterizerBackwardVulkan::backward) → rgrad_vk.
 //   6. Assert max abs diff < 1e-4 on d_means2D, d_conics, d_opacities_2d, d_rgb.
@@ -119,20 +118,10 @@ TEST(RasterizerBackwardVulkan, MatchesCPU_TinyFixture) {
     std::vector<float> sh_coeffs = npy_to_f32_vec(sh_npy);
     std::vector<float> filter_3d = npy_to_f32_vec(f3d_npy);
 
-    // ---- 5. Transpose dL_dout_color: channel-major → pixel-major -----------
-    // CUDA dump layout: data[ch * H * W + pix_id] (channel-major CHW)
-    // CPU/Vulkan backward expect pixel-major: data[pix * 3 + ch]
-    // Evidence: npy shape is (3, 64, 64) — channel first.
+    // Gradient data is CHW [3,H,W] — matches our backward pass input format.
+    std::vector<float> d_image(dL_npy.f32(), dL_npy.f32() + dL_npy.numel());
+
     const int HW = H * W;
-    std::vector<float> d_image(static_cast<size_t>(HW) * 3);
-    {
-        const float* src = dL_npy.f32();   // [3][H*W] in memory (C-major)
-        for (int pix = 0; pix < HW; ++pix) {
-            for (int ch = 0; ch < 3; ++ch) {
-                d_image[pix * 3 + ch] = src[ch * HW + pix];
-            }
-        }
-    }
 
     // ---- 6. Build Camera ---------------------------------------------------
     Camera cam{};

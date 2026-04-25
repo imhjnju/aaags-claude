@@ -41,7 +41,7 @@ public:
     /// \param cam           Camera (provides W, H)
     /// \param cfg           Render config (provides bg_color, tile_w/h)
     /// \param cache         Forward pass cache (T_final, n_contrib)
-    /// \param dL_dpixels    Loss gradient w.r.t. output pixels, pixel-major [H*W*3]
+    /// \param dL_dpixels    Loss gradient w.r.t. output pixels, CHW [3*H*W]
     /// \param rgrad         Output gradients (allocated and zeroed internally)
     /// \param alloc         Frame allocator for rgrad arrays
     ///

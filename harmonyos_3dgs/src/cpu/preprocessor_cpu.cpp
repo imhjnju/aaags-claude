@@ -64,8 +64,11 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
 
         if (cfg.eval_3D) {
             // === AAA-Gaussians 3D evaluation path ===
-            if (p_view[2] < 0.2f)
-                continue;
+            // No hard near-plane cull here. CUDA reference (forward.cu:136) gates
+            // this on splatting_settings.near_clipping, which is false by default
+            // and not set in configs/aaa.json, so near-camera Gaussians are kept.
+            // The camera-inside-ellipsoid + frustum/AABB checks below reject
+            // degenerate splats.
 
             float opacity = g.opacities[i];
             float focal = std::max(focal_x, focal_y);
@@ -148,15 +151,15 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
             float pixel_x = ndc2Pix(p_hom[0]*p_w_inv, cam.width);
             float pixel_y = ndc2Pix(p_hom[1]*p_w_inv, cam.height);
 
-            // Screen-space AABB for extent estimation
+            // View-space AABB. Matches CUDA's new_aabb=true path (forward.cu:187)
+            // which uses compute_aabb_view exclusively when aaa.json sets new_aabb=true.
+            // Screen-space AABB fails on near-plane Gaussians, which are now kept
+            // (we no longer near-clip for eval_3D) — view-space AABB handles them.
             float mean2D_aabb[2], extent_aabb[2];
-            if (!computeAABBScreen(gauss2screen, cutoff, mean2D_aabb, extent_aabb)) {
-                // Fallback: view-space AABB (handles near-plane overflow)
-                if (!computeAABBView(gauss2view, p_view, focal_x, focal_y,
-                                     (float)cam.width, (float)cam.height, cutoff,
-                                     mean2D_aabb, extent_aabb))
-                    continue;
-            }
+            if (!computeAABBView(gauss2view, p_view, focal_x, focal_y,
+                                 (float)cam.width, (float)cam.height, cutoff,
+                                 mean2D_aabb, extent_aabb))
+                continue;
 
             int my_radius = (int)std::ceil(std::max(extent_aabb[0], extent_aabb[1]));
             my_radius = std::max(my_radius, 1);
@@ -207,29 +210,39 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
             computeCov2D(&g.positions[i*3], cov3d, cam.view_matrix,
                          focal_x, focal_y, cam.tan_fovx, cam.tan_fovy, cov2d);
 
+            // dilateCov2D: add h_var=0.3 to diagonal; proper_ewa_scaling is
+            // UNCONDITIONAL in VK's 2D path (preprocess.comp:1223) and in
+            // AAA-Gaussians CUDA (forward_common.h:dilateCov2D) — match that.
             float det_cov = cov2d[0] * cov2d[2] - cov2d[1] * cov2d[1];
             cov2d[0] += 0.3f;
             cov2d[2] += 0.3f;
             float det_cov_plus_h = cov2d[0] * cov2d[2] - cov2d[1] * cov2d[1];
-            float h_conv_scaling = 1.0f;
-            if (cfg.antialiasing)
-                h_conv_scaling = std::sqrt(std::max(0.000025f, det_cov / det_cov_plus_h));
+            float h_conv_scaling = std::sqrt(std::max(0.000025f, det_cov / det_cov_plus_h));
 
             float det = det_cov_plus_h;
             if (det == 0.0f) continue;
             float det_inv = 1.0f / det;
             float conic[3] = {cov2d[2]*det_inv, -cov2d[1]*det_inv, cov2d[0]*det_inv};
 
+            float opacity_scaled = g.opacities[i] * h_conv_scaling;
+
+            // tight_opacity_bounding (adaptive extent) + rect_bounding (per-axis AABB)
+            // — match VK preprocess.comp lines 1180-1196 / CUDA forward.cu:239-258.
+            const float TOB_ALPHA_THRESHOLD = 1.0f / 255.0f;
+            float opacity_pt = std::log(std::max(opacity_scaled, 1e-9f) / TOB_ALPHA_THRESHOLD);
+            float extent_2d = std::min(3.33f, std::sqrt(std::max(0.0f, 2.0f * opacity_pt)));
+
             float mid = 0.5f * (cov2d[0] + cov2d[2]);
             float disc = std::max(0.01f, mid * mid - det);
-            float lambda1 = mid + std::sqrt(disc);
-            float lambda2 = mid - std::sqrt(disc);
-            float radius_f_val = 3.33f * std::sqrt(std::max(lambda1, lambda2));
+            float lambda = mid + std::sqrt(disc);
+            float radius_f_val = extent_2d * std::sqrt(lambda);
             int my_radius = static_cast<int>(std::ceil(radius_f_val));
 
-            // Note: no max_screen_dim cull — matches CUDA which renders
-            // large-radius Gaussians (near camera) without this check.
-
+            // Note: no max_screen_dim cull — matches CUDA.
+            // NOTE: tile_binner_cpu re-computes rect from int radii[i] (isotropic)
+            // so we must use the isotropic radius_f_val here. Per-axis asymmetric
+            // extents (rect_bounding) would need a tile_binner_cpu update to mirror
+            // scatter.comp's radius_f_arr[i*2+0/1] pattern.
             float point_image[2] = {pixel_x, pixel_y};
             int rect_min[2], rect_max[2];
             {

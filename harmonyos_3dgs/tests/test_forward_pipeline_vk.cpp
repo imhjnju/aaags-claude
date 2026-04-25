@@ -300,15 +300,8 @@ TEST(ForwardPipeline, FullChain_TinyFixture) {
     // header) that can cause a small number of Gaussians to land in different
     // tiles than CUDA. Report the delta for visibility but do not fail.
     {
-        // Golden npy is CHW [3,H,W]; convert to HWC to match download_image().
-        const float* g_chw = img_npy.f32();
-        std::vector<float> golden_image(img_npy.numel());
-        for (int px = 0; px < HW; ++px) {
-            for (int ch = 0; ch < 3; ++ch) {
-                golden_image[static_cast<size_t>(px) * 3 + ch] =
-                    g_chw[static_cast<size_t>(ch) * HW + px];
-            }
-        }
+        // Golden npy is CHW [3,H,W]; matches our CHW output directly.
+        std::vector<float> golden_image(img_npy.f32(), img_npy.f32() + img_npy.numel());
         auto r = compare_f32(rec_out_image, golden_image,
                              /*abs_tol=*/1e-5f, /*rel_tol=*/1e-4f);
         if (!r.passed) {
@@ -557,15 +550,8 @@ TEST(ForwardPipeline, FullChain_TinyFixture_Eval3D) {
             ASSERT_EQ(e3d_npy.numel(),
                       static_cast<size_t>(3) * H * W);
 
-            // Convert CHW golden to HWC to match our output layout.
-            const float* g_chw = e3d_npy.f32();
-            std::vector<float> golden_eval3d(e3d_npy.numel());
-            for (int px = 0; px < HW; ++px) {
-                for (int ch = 0; ch < 3; ++ch) {
-                    golden_eval3d[static_cast<size_t>(px) * 3 + ch] =
-                        g_chw[static_cast<size_t>(ch) * HW + px];
-                }
-            }
+            // Golden npy is CHW [3,H,W]; matches our CHW output directly.
+            std::vector<float> golden_eval3d(e3d_npy.f32(), e3d_npy.f32() + e3d_npy.numel());
 
             auto r = compare_f32(rec_out, golden_eval3d,
                                  /*abs_tol=*/1e-3f, /*rel_tol=*/1e-2f);

@@ -35,7 +35,7 @@ public:
         VkBuffer means2D;               // RO float[N*2]
         VkBuffer conic_opacity_packed;  // RO float[N*4]  {a, b, c, opacity}
         VkBuffer rgb;                   // RO float[N*3]
-        VkBuffer out_image;             // WO float[3*H*W]  CHW
+        VkBuffer out_image;             // WO float[3*H*W]  CHW (channel-first, matches CUDA/PyTorch)
         VkBuffer transmittance;         // WO float[H*W]
         VkBuffer n_contrib;             // WO uint[H*W]
         VkBuffer raster_ubo;            // UB  RasterizeUBO (16 bytes)

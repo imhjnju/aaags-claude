@@ -26,6 +26,7 @@ When you create or update a memory file:
 
 ## Bug Patterns & Gotchas
 - [gotchas.md](gotchas.md) **(T1)** — known bug patterns, prevention rules
+- [image_layout_chw.md](image_layout_chw.md) **(T1)** — unified CHW layout convention, component map
 
 ## Methodology & Process
 - [lessons_learned.md](../dev_notes/lessons_learned.md) **(T3)** — methodology insights, pending promotion

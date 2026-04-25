@@ -125,8 +125,10 @@ TEST(VkVsCpuRender, FullFramePSNR) {
     double psnr = computePSNR(cpu_image.data(), vk_image.data(), num_pixels,
                                max_err, max_err_idx);
 
-    size_t max_px = max_err_idx / 3;
-    int max_ch = static_cast<int>(max_err_idx % 3);
+    // CHW layout: pixels 0..HW-1 are R, HW..2*HW-1 are G, 2*HW..3*HW-1 are B.
+    size_t hw = static_cast<size_t>(W) * H;
+    size_t max_px = max_err_idx % hw;
+    int max_ch = static_cast<int>(max_err_idx / hw);
     std::printf("  PSNR: %.2f dB\n", psnr);
     std::printf("  Max error: %.6f at pixel %zu channel %d "
                 "(cpu=%.6f, vk=%.6f)\n",

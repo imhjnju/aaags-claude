@@ -1,6 +1,6 @@
 #pragma once
 // Compute L1 loss and gradient.
-// rendered, gt: [H*W*3] HWC interleaved RGB
+// rendered, gt: [3*H*W] CHW channel-first RGB
 // d_image: [H*W*3] output gradient
 // Returns: mean absolute error
 float l1_loss(const float* rendered, const float* gt, int H, int W, float* d_image);

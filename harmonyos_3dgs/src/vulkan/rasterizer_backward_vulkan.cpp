@@ -13,7 +13,7 @@
 //   colors         : N * 3 * sizeof(float)
 //   T_final        : H*W * sizeof(float)
 //   n_contrib      : H*W * sizeof(uint32)
-//   dL_dpixels     : H*W * 3 * sizeof(float)  pixel-major
+//   dL_dpixels     : 3 * H*W * sizeof(float)  CHW channel-first
 //   dL_dmeans2D    : N * 2 * sizeof(float)    zeroed
 //   dL_dconics     : N * 3 * sizeof(float)    zeroed
 //   dL_dopacity    : N * sizeof(float)        zeroed

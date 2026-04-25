@@ -3,7 +3,7 @@
 // Bindings (mirroring rasterize_bind::):
 //   0..4  read-only SSBOs: values_sorted, tile_ranges, means2D,
 //                          conic_opacity_packed, rgb
-//   5..7  write-only SSBOs: out_image (CHW), transmittance, n_contrib
+//   5..7  write-only SSBOs: out_image (CHW channel-first), transmittance, n_contrib
 //   8     uniform buffer:   RasterizeUBO (bg_r, bg_g, bg_b, _pad)
 //
 // Dispatch: one 16x16 workgroup per tile. The shader itself is documented at

@@ -118,20 +118,33 @@ def forward_render_pytorch(raw_pos, raw_sc, raw_rot, raw_sh, raw_op,
     # cov2D = T @ cov3D @ T^T
     cov2D = T_mat @ cov3D @ T_mat.transpose(1, 2)  # [N, 2, 2]
 
-    # Add low-pass filter
-    cov2D[:, 0, 0] = cov2D[:, 0, 0] + 0.3
-    cov2D[:, 1, 1] = cov2D[:, 1, 1] + 0.3
+    # Add low-pass filter (match C++ preprocessor_cpu.cpp 2D path + VK preprocess.comp).
+    # Capture pre-dilation det for proper_ewa_scaling, then build the dilated cov2D
+    # out-of-place (cov2D may still be needed by autograd for the cov_ab_bc term).
+    det_orig = cov2D[:, 0, 0] * cov2D[:, 1, 1] - cov2D[:, 0, 1] * cov2D[:, 1, 0]
+    # Dilated entries: only (0,0) and (1,1) shift by 0.3; (0,1) / (1,0) unchanged.
+    cov2D_00 = cov2D[:, 0, 0] + 0.3
+    cov2D_11 = cov2D[:, 1, 1] + 0.3
+    cov2D_01 = cov2D[:, 0, 1]
+    det = cov2D_00 * cov2D_11 - cov2D_01 * cov2D[:, 1, 0]
 
-    det = cov2D[:, 0, 0] * cov2D[:, 1, 1] - cov2D[:, 0, 1] * cov2D[:, 1, 0]
+    # proper_ewa_scaling: opacity *= sqrt(det_orig / det_dilated), matching the
+    # unconditional convolution_scaling_factor in preprocess.comp and CUDA
+    # dilateCov2D.  Applied pre-blend so alpha = opacity_scaled * exp(power).
+    det_orig_safe = det_orig.clamp(min=1e-12)
+    det_safe_for_ratio = det.clamp(min=1e-12)
+    h_conv_scaling = torch.sqrt((det_orig_safe / det_safe_for_ratio).clamp(min=0.000025))
+    # opacities may be shape [N, 1] (sigmoid of raw_op) or [N]; match h_conv_scaling shape.
+    opacities = opacities * h_conv_scaling.view(*opacities.shape)
 
     # Visibility mask
     visible = (p_view[:, 2] > 0.2) & (det > 0)
 
-    # Conics (inverse 2D cov)
+    # Conics (inverse 2D cov) — use the out-of-place dilated entries.
     det_safe = det.clamp(min=1e-10)
-    conic_a = cov2D[:, 1, 1] / det_safe
-    conic_b = -cov2D[:, 0, 1] / det_safe
-    conic_c = cov2D[:, 0, 0] / det_safe
+    conic_a = cov2D_11 / det_safe
+    conic_b = -cov2D_01 / det_safe
+    conic_c = cov2D_00 / det_safe
 
     # Sort by depth
     depths = p_view[:, 2].clone()

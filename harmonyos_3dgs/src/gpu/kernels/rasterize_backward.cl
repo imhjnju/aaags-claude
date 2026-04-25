@@ -133,7 +133,8 @@ __kernel void rasterize_backward(
     // Phase 2: Backward pass (back-to-front through collected contributors)
     // -----------------------------------------------------------------------
     if (valid_pixel && c_count > 0) {
-        float d_C[3] = { d_image[pix*3], d_image[pix*3+1], d_image[pix*3+2] };
+        int HW = width * height;
+        float d_C[3] = { d_image[0*HW + pix], d_image[1*HW + pix], d_image[2*HW + pix] };
 
         // T_accum starts at final transmittance after all contributors
         float T_accum = T_replay;

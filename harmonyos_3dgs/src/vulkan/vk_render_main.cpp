@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
     std::printf("Saved → %s\n", out_path);
 
     // Dump raw float32 for precision comparison with CUDA golden.
-    // Format: raw little-endian float32, HWC layout, shape (H, W, 3).
+    // Format: raw little-endian float32, CHW layout, shape (3, H, W).
     {
         const char* raw_path = "vk_float.raw";
         size_t npx = static_cast<size_t>(W) * H * 3;
@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         if (fp) {
             std::fwrite(image.data(), sizeof(float), npx, fp);
             std::fclose(fp);
-            std::printf("Saved raw floats → %s (%zu floats, HWC %dx%dx3)\n",
+            std::printf("Saved raw floats → %s (%zu floats, CHW 3x%dx%d)\n",
                         raw_path, npx, H, W);
         }
     }

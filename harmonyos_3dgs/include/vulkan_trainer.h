@@ -35,7 +35,7 @@ public:
     // One training step. Returns L1 loss value.
     float step(const Camera& cam,
                const RenderConfig& cfg,
-               const float* target_image,   // [H*W*3] pixel-major
+               const float* target_image,   // [3*H*W] CHW channel-first
                int target_W,
                int target_H);
 
@@ -46,7 +46,7 @@ public:
     // Access current raw parameters (for inspection/checkpointing).
     const RawGaussianParams& raw_params() const { return raw_view_; }
 
-    // Access the last rendered image (pixel-major [H*W*3] float in [0,1]).
+    // Access the last rendered image (CHW [3*H*W] float in [0,1]).
     // Valid after the first call to step(). Size is cam_height * cam_width * 3.
     const float* rendered_image() const { return image_.data(); }
     int rendered_image_size() const { return static_cast<int>(image_.size()); }

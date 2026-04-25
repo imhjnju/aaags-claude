@@ -18,8 +18,8 @@
 //
 // Bindings match rasterize_backward_bind:: in include/vulkan/backward_bindings.h.
 //
-// dL_dpixels layout: pixel-major [H*W][C] — matches the CPU backward pass
-// (d_image[pix*3+ch]). The MSE loss gradient is computed in pixel-major order.
+// dL_dpixels layout: CHW channel-first [3][H*W] — dL_dpixels[ch*H*W+pix].
+// Matches CUDA/PyTorch convention.
 //
 // Gradient output buffers (dL_dmeans2D, dL_dconics, dL_dopacity, dL_dcolors)
 // must be zero-filled by the caller before dispatch; this shader uses
@@ -68,8 +68,8 @@ layout(std430, set = 0, binding = 6) readonly buffer NContrib {
     uint n_contrib[];
 };
 
-// binding 7 — loss gradient w.r.t. output pixels, pixel-major [H*W][3]:
-//   dL_dpixels[pix*3+ch]. Matches CPU backward (d_image[pix*3+ch]).
+// binding 7 — loss gradient w.r.t. output pixels, CHW channel-first [3][H*W]:
+//   dL_dpixels[ch*H*W+pix]. Matches CUDA/PyTorch convention.
 layout(std430, set = 0, binding = 7) readonly buffer DLDPixels {
     float dL_dpixels[];
 };
@@ -139,12 +139,13 @@ void main() {
     float T_pix       = inside ? T_final[pix]  : 0.0;
     uint  last_contrib = inside ? n_contrib[pix] : 0u;
 
-    // Load loss gradient for this pixel (pixel-major layout).
+    // Load loss gradient for this pixel (CHW channel-first layout).
     vec3 dL_dpix = vec3(0.0);
     if (inside) {
-        dL_dpix.x = dL_dpixels[pix * 3u + 0u];
-        dL_dpix.y = dL_dpixels[pix * 3u + 1u];
-        dL_dpix.z = dL_dpixels[pix * 3u + 2u];
+        uint HW = W * H;
+        dL_dpix.x = dL_dpixels[0u * HW + pix];
+        dL_dpix.y = dL_dpixels[1u * HW + pix];
+        dL_dpix.z = dL_dpixels[2u * HW + pix];
     }
 
     int  toDo = int(range_end - range_start);
