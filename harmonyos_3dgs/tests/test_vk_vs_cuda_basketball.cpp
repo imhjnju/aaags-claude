@@ -305,12 +305,14 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
 // always SUCCEED() after printing so ctest stays green; this is a data
 // gathering harness, not a gate.
 TEST(VkVsCudaBasketball, Cam0_TableSubset) {
+    // Subset artifacts are produced by tools/extract_gaussians_by_roi.py
+    // + tools/render_single.py and live under tools/out/ of the current worktree.
+    // Use REPO_ROOT_DIR so the test follows the developer between worktrees
+    // (was hardcoded to white-table, breaking other worktrees).
     const std::string kSubsetPlyPath =
-        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/white-table/"
-        "tools/out/basket-aaa-table.ply";
+        std::string(REPO_ROOT_DIR) + "/tools/out/basket-aaa-table.ply";
     const std::string kSubsetGoldenPath =
-        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/white-table/"
-        "tools/out/basket-aaa-table_cuda.raw";
+        std::string(REPO_ROOT_DIR) + "/tools/out/basket-aaa-table_cuda.raw";
 
     // ROI: bottom-left 160x240 window in image space.
     constexpr struct { int x_min, y_min, x_max, y_max; } kRoi{0, 720, 160, 960};
