@@ -167,6 +167,19 @@ shared uint  s_gid    [256];
 shared float s_g2s  [256 * 16];  // all 4 rows of gauss2screen (need row 2 for depth)
 shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
 
+// --- Non-traced eval_3D fallback (master pre-cascade): sub-tile sorted
+// permutation. Only used when spec_trace_enabled == 0u; restores master's
+// 54.3 dB PSNR for the basketball golden test while leaving the cascade
+// (spec_trace_enabled==1u) trace path untouched.
+//
+// SHARED MEMORY OVERLAY: when spec_trace_enabled==0u, the cascade TAIL/MID
+// state (s_tail_idx / s_tail_count below) is unused. We alias the fallback
+// permutation onto `s_tail_idx` (treated as packed 4×uint8 per int — batch
+// indices fit in 8 bits since BATCH_SIZE=256) and the per-subtile count
+// onto `s_tail_count`. This keeps total shared memory within the 49152 B
+// device limit on Tegra Thor.
+const int  NUM_SUBTILES_FB = 16;
+
 // --- Milestone B+C: TAIL/MID persistent state machine (spec_trace_enabled) ---
 // Port of CUDA sortGaussiansRayHierarchicaEvaluation cascade state machine
 // (AAA-Gaussians/.../hierarchical_render.cuh ~line 400-1100).
@@ -253,6 +266,20 @@ float maxContribRayPixel(float plane_a[4], float plane_b[4], out float max_pos[4
 
 // Helper: evaluate plane-x and plane-y rows of `g2s - g2s_row3 * pix.[xy]`
 // in homogeneous screen space. Writes out to plane_x/plane_y (length 4 each).
+// Packed sub_order_fb access helpers — overlay onto s_tail_idx [16*64].
+// 4 × uint8 per int, little-endian; batch indices 0..255 fit in 8 bits.
+uint subOrderRead(uint sub, int slot) {
+    uint word = uint(s_tail_idx[sub * 64u + (uint(slot) >> 2u)]);
+    return (word >> ((uint(slot) & 3u) * 8u)) & 0xFFu;
+}
+void subOrderWrite(uint sub, int slot, uint val) {
+    uint widx = uint(slot) >> 2u;
+    uint shift = (uint(slot) & 3u) * 8u;
+    uint cur = uint(s_tail_idx[sub * 64u + widx]);
+    uint mask = 0xFFu << shift;
+    s_tail_idx[sub * 64u + widx] = int((cur & ~mask) | ((val & 0xFFu) << shift));
+}
+
 void buildRayPlanes(uint k, float pix_x, float pix_y,
                     out float plane_x[4], out float plane_y[4]) {
     for (int j = 0; j < 4; ++j) {
@@ -713,6 +740,23 @@ void main() {
         head_color_b[i] = 0.0;
     }
 
+    // --- Non-trace eval_3D fallback HEAD k-buffer (master pre-cascade) ---
+    // Wider HEAD (8) + sub-tile-sorted batch walk reproduces master's 54.3 dB
+    // PSNR baseline. Disjoint from cascade `head_*` registers above. Only used
+    // when spec_trace_enabled == 0u (basketball golden / eval_3D unit tests).
+    const int FB_HEAD_W = 8;
+    float fb_kbuf_depth[FB_HEAD_W];
+    float fb_kbuf_alpha[FB_HEAD_W];
+    float fb_kbuf_r[FB_HEAD_W];
+    float fb_kbuf_g[FB_HEAD_W];
+    float fb_kbuf_b[FB_HEAD_W];
+    int   fb_kbuf_size = 0;
+    for (int i = 0; i < FB_HEAD_W; i++) {
+        fb_kbuf_depth[i] = 1e30;
+        fb_kbuf_alpha[i] = 0.0;
+        fb_kbuf_r[i] = 0.0; fb_kbuf_g[i] = 0.0; fb_kbuf_b[i] = 0.0;
+    }
+
     // --- Subtile / quadrant / in-subtile identity ------------------------
     // CUDA block dim is (16,4,4). threadIdx.y (0..3) scales X within subtile
     // layout; threadIdx.z (0..3) scales Y. cascade_trace.h:149 computes
@@ -803,6 +847,56 @@ void main() {
         barrier();
 
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+
+        // ---- Non-trace fallback: sub-tile sort prologue (master pre-cascade)
+        // Mirrors master rasterize.comp lines 291-350: each sub-tile leader
+        // (in_subtile == 0u) builds an ascending-depth permutation of the
+        // batch, indexed at the sub-tile centre. Pixels within the sub-tile
+        // then walk `sub_order_fb[sub_idx]` instead of raw input order.
+        // Only runs when spec_trace_enabled == 0u; cascade path uses its own
+        // TAIL/MID machinery below and ignores sub_order_fb.
+        if (spec_trace_enabled == 0u) {
+            if (local_idx < uint(NUM_SUBTILES_FB)) {
+                s_tail_count[local_idx] = 0u;  // overlay: reused as sub_count_fb
+            }
+            barrier();
+            if (in_subtile == 0u) {
+                float priv_depth_fb[256];
+                int cnt_fb = 0;
+                for (uint k = 0u; k < batch_size; ++k) {
+                    float plane_x[4], plane_y[4];
+                    buildRayPlanes(k, subtile_cx, subtile_cy, plane_x, plane_y);
+                    float max_pos[4];
+                    maxContribRayPixel(plane_x, plane_y, max_pos);
+                    float w_ndc = 0.0, z_ndc = 0.0;
+                    for (int j = 0; j < 4; j++) {
+                        w_ndc += s_g2s[k*16u + 12u + uint(j)] * max_pos[j];
+                        z_ndc += s_g2s[k*16u +  8u + uint(j)] * max_pos[j];
+                    }
+                    if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+                    float d = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc) + 8.0;
+
+                    priv_depth_fb[cnt_fb] = d;
+                    subOrderWrite(sub_idx, cnt_fb, k);
+                    for (int i = cnt_fb; i > 0; --i) {
+                        if (priv_depth_fb[i - 1] > priv_depth_fb[i]) {
+                            float td = priv_depth_fb[i];
+                            priv_depth_fb[i]     = priv_depth_fb[i - 1];
+                            priv_depth_fb[i - 1] = td;
+                            uint tk = subOrderRead(sub_idx, i);
+                            uint tk_prev = subOrderRead(sub_idx, i - 1);
+                            subOrderWrite(sub_idx, i, tk_prev);
+                            subOrderWrite(sub_idx, i - 1, tk);
+                        } else {
+                            break;
+                        }
+                    }
+                    cnt_fb += 1;
+                }
+                s_tail_count[sub_idx] = uint(cnt_fb);  // overlay
+            }
+            barrier();
+        }
 
         // ---- State-machine inner loop (32 Gaussians per step) ----------
         // Matches CUDA's `for progress in range(.., WARP_SIZE)` cadence.
@@ -1310,12 +1404,17 @@ void main() {
         // does NOT reset MID at outer-batch boundaries). End-of-range
         // flush below drains residual TAIL→MID→HEAD.
 
-        // Non-traced fallback: original simple per-pixel iteration over the
-        // 256-batch, useful when spec_trace_enabled=0 (eval_3D tests).
+        // Non-traced fallback: master pre-cascade per-pixel walk over
+        // `sub_order_fb` (sub-tile-sorted permutation). Wider HEAD k-buffer
+        // (FB_HEAD_W=8) reproduces master's 54.3 dB PSNR baseline. Uses local
+        // fb_kbuf_* state, disjoint from cascade head_*.
         if (spec_trace_enabled == 0u && !pixel_done) {
+            int tsz = int(s_tail_count[sub_idx]);  // overlay: sub_count_fb
             float fpx = float(pixel_x);
             float fpy = float(pixel_y);
-            for (uint k = 0u; k < batch_size; ++k) {
+            for (int t = 0; t < tsz; ++t) {
+                uint k = subOrderRead(sub_idx, t);
+
                 float plane_x[4], plane_y[4];
                 buildRayPlanes(k, fpx, fpy, plane_x, plane_y);
                 float max_pos[4];
@@ -1334,34 +1433,36 @@ void main() {
 
                 float sort_depth = z_ndc;
 
-                if (head_count == HEAD_W) {
-                    float a0 = head_alphas[0];
+                // HEAD overflow: blend shallowest entry, pop.
+                if (fb_kbuf_size == FB_HEAD_W) {
+                    float a0 = fb_kbuf_alpha[0];
                     float test_T0 = T * (1.0 - a0);
                     if (test_T0 < T_MIN) { pixel_done = true; break; }
-                    C.r += head_color_r[0] * a0 * T;
-                    C.g += head_color_g[0] * a0 * T;
-                    C.b += head_color_b[0] * a0 * T;
+                    C.r += fb_kbuf_r[0] * a0 * T;
+                    C.g += fb_kbuf_g[0] * a0 * T;
+                    C.b += fb_kbuf_b[0] * a0 * T;
                     T = test_T0; n += 1u;
-                    for (int i = 1; i < HEAD_W; i++) {
-                        head_depths[i-1]=head_depths[i]; head_alphas[i-1]=head_alphas[i];
-                        head_color_r[i-1]=head_color_r[i]; head_color_g[i-1]=head_color_g[i]; head_color_b[i-1]=head_color_b[i];
+                    for (int i = 1; i < FB_HEAD_W; i++) {
+                        fb_kbuf_depth[i-1] = fb_kbuf_depth[i]; fb_kbuf_alpha[i-1] = fb_kbuf_alpha[i];
+                        fb_kbuf_r[i-1] = fb_kbuf_r[i]; fb_kbuf_g[i-1] = fb_kbuf_g[i]; fb_kbuf_b[i-1] = fb_kbuf_b[i];
                     }
-                    head_depths[HEAD_W-1] = 3.402823e38; head_count -= 1;
+                    fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
                 }
                 if (pixel_done) break;
 
+                // Insertion-sort into HEAD (ascending per-pixel depth).
                 float id = sort_depth, ia = alpha;
                 float ir = s_rgb_r[k], ig = s_rgb_g[k], ib = s_rgb_b[k];
-                for (int i = 0; i < HEAD_W; i++) {
-                    if (id < head_depths[i]) {
-                        float td=head_depths[i]; head_depths[i]=id; id=td;
-                        float ta=head_alphas[i]; head_alphas[i]=ia; ia=ta;
-                        float tr=head_color_r[i]; head_color_r[i]=ir; ir=tr;
-                        float tg=head_color_g[i]; head_color_g[i]=ig; ig=tg;
-                        float tb=head_color_b[i]; head_color_b[i]=ib; ib=tb;
+                for (int i = 0; i < FB_HEAD_W; i++) {
+                    if (id < fb_kbuf_depth[i]) {
+                        float td = fb_kbuf_depth[i]; fb_kbuf_depth[i] = id; id = td;
+                        float ta = fb_kbuf_alpha[i]; fb_kbuf_alpha[i] = ia; ia = ta;
+                        float tr = fb_kbuf_r[i]; fb_kbuf_r[i] = ir; ir = tr;
+                        float tg = fb_kbuf_g[i]; fb_kbuf_g[i] = ig; ig = tg;
+                        float tb = fb_kbuf_b[i]; fb_kbuf_b[i] = ib; ib = tb;
                     }
                 }
-                head_count = min(head_count + 1, HEAD_W);
+                fb_kbuf_size += 1;
             }
         }
         barrier();
@@ -1759,6 +1860,27 @@ void main() {
                 }
             }
             barrier();
+        }
+    }
+
+    // Non-trace fallback flush: drain remaining fb_kbuf entries.
+    // Mirrors master rasterize.comp lines 423-440. Early-out on T < T_MIN
+    // (before blending the entry that would trip it) — matches master.
+    if (spec_trace_enabled == 0u && !pixel_done) {
+        for (int fi = 0; fi < FB_HEAD_W; fi++) {
+            if (fb_kbuf_size <= 0) break;
+            float a0 = fb_kbuf_alpha[0];
+            float test_T0 = T * (1.0 - a0);
+            if (test_T0 < T_MIN) { pixel_done = true; break; }
+            C.r += fb_kbuf_r[0] * a0 * T;
+            C.g += fb_kbuf_g[0] * a0 * T;
+            C.b += fb_kbuf_b[0] * a0 * T;
+            T = test_T0; n += 1u;
+            for (int j = 1; j < FB_HEAD_W; j++) {
+                fb_kbuf_depth[j-1] = fb_kbuf_depth[j]; fb_kbuf_alpha[j-1] = fb_kbuf_alpha[j];
+                fb_kbuf_r[j-1] = fb_kbuf_r[j]; fb_kbuf_g[j-1] = fb_kbuf_g[j]; fb_kbuf_b[j-1] = fb_kbuf_b[j];
+            }
+            fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
         }
     }
 
