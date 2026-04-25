@@ -30,14 +30,6 @@
 //   - background         : final color = C_accum + T_final * bg_color (always
 //                          applied, even when bg is zero).
 //
-// Shared memory footprint (2D path):  10 arrays * 256 floats/uints = 10.24 KB.
-// Shared memory footprint (eval_3D):   s_g2s (16 KB) + s_opa (1 KB) +
-//                                      s_rgb_{r,g,b}+s_gid reused (4 KB) +
-//                                      sub_order[16][256] uint (16 KB) +
-//                                      sub_count[16] (64 B) ≈ 37 KB.
-// All paths fit within typical Vulkan maxComputeSharedMemorySize (≥ 32 KB on
-// target hardware; 48 KB on desktop).
-//
 // Synchronisation: barriers bracket each batch's cooperative load; pixels
 // whose tile has early-terminated still participate in barriers so divergent
 // pixel_done states don't hang the workgroup (no barrier inside the per-pixel
@@ -104,6 +96,59 @@ layout(std140, set = 0, binding = 13) uniform RasterEval3DUBO {
 // Specialization constant: 0=2D conic path, 1=eval_3D k-buffer path.
 layout(constant_id = 0) const uint spec_eval_3D = 0u;
 
+// Specialization constant: 0=trace disabled (current behavior), 1=trace enabled.
+// When enabled, the traced cascade sort writes per-level state into the TraceMeta/
+// SlotLookup/Tail*/Mid*/Head* SSBOs below so the VK side can be compared against
+// CUDA gold (see dev_notes/phase4_vk_cascade_port_plan.md §5).
+layout(constant_id = 1) const uint spec_trace_enabled = 0u;
+
+// Specialization constant: CUDA SortMode enum (Y1 routing).
+//   0 = GLOBAL          → use existing HEAD_W=8 sub-tile-sort path
+//   3 = HIERARCHICAL    → use cascade (TAIL/MID/HEAD); falls back to HEAD_W=8
+//                          when spec_trace_enabled == 0u to preserve master's
+//                          54.3 dB PSNR baseline (commit af39d04).
+// default 3 preserves pre-Y1 behavior for callers that don't set it.
+layout(constant_id = 2) const uint spec_sort_mode = 3u;
+
+// Per-run trace metadata (UBO, 32 B). `K` is the number of selected tiles.
+// `num_tiles` matches push-constant num_tiles_x * num_tiles_y — kept in the
+// UBO so the shader does not have to multiply push-constants.
+layout(std140, set = 0, binding = 14) uniform TraceMetaUBO {
+    uint K;
+    uint num_tiles;
+    uint _pad0;
+    uint _pad1;
+    uvec4 _reserved;  // 16 B padding up to 32 B
+} trace_meta;
+
+// Per-tile slot lookup: -1 for unselected tiles, 0..K-1 for selected tiles.
+layout(std430, set = 0, binding = 15) readonly buffer TraceSlotLookup {
+    int slot_lookup[];
+};
+
+// TAIL trace buffers: flat [K, MAX_TAIL=512, 16 subtiles, 64 slots].
+layout(std430, set = 0, binding = 16) buffer TraceTailDepths { float tail_depths[]; };
+layout(std430, set = 0, binding = 17) buffer TraceTailIds    { int   tail_ids[];    };
+layout(std430, set = 0, binding = 18) buffer TraceTailWcur   { uint  tail_wcur[];   };
+
+// MID trace buffers: flat [K, MAX_MID=1024, 16 subtiles, 4 quadrants, 8 slots].
+layout(std430, set = 0, binding = 19) buffer TraceMidDepths  { float mid_depths[]; };
+layout(std430, set = 0, binding = 20) buffer TraceMidIds     { int   mid_ids[];    };
+layout(std430, set = 0, binding = 21) buffer TraceMidWcur    { uint  mid_wcur[];   };
+
+// HEAD insert trace: flat [K, 256 pixels, MAX_HEAD_INS=4096].
+layout(std430, set = 0, binding = 22) buffer TraceHeadInsDepth  { float head_ins_depth[];  };
+layout(std430, set = 0, binding = 23) buffer TraceHeadInsAlpha  { float head_ins_alpha[];  };
+layout(std430, set = 0, binding = 24) buffer TraceHeadInsGid    { int   head_ins_gid[];    };
+layout(std430, set = 0, binding = 25) buffer TraceHeadInsCursor { uint  head_ins_cursor[]; };
+
+// HEAD blend trace: flat [K, 256 pixels, MAX_HEAD_BLEND=4096].
+layout(std430, set = 0, binding = 26) buffer TraceHeadBlendDepth  { float head_blend_depth[];  };
+layout(std430, set = 0, binding = 27) buffer TraceHeadBlendAlpha  { float head_blend_alpha[];  };
+layout(std430, set = 0, binding = 28) buffer TraceHeadBlendT      { float head_blend_T[];      };
+layout(std430, set = 0, binding = 29) buffer TraceHeadBlendGid    { int   head_blend_gid[];    };
+layout(std430, set = 0, binding = 30) buffer TraceHeadBlendCursor { uint  head_blend_cursor[]; };
+
 // RasterizePushConstants — 20 bytes (spec §4.8.7).
 layout(push_constant) uniform PC {
     uint num_gaussians;  // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
@@ -127,38 +172,79 @@ shared uint  s_gid    [256];
 
 // eval_3D shared memory: gauss2screen all 4 rows (16 floats per Gaussian),
 // opacity. s_rgb_r/g/b and s_gid are reused from 2D path.
-// Total eval_3D: 16*256*4 + 1*256*4 + reused = ~17 KB + 4 KB reused.
 shared float s_g2s  [256 * 16];  // all 4 rows of gauss2screen (need row 2 for depth)
 shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
 
-// Hierarchical sub-tile re-sort (sort_mode=3 simplified — spec §4.8.7).
-// CUDA sortGaussiansRayHierarchicalCUDA_forward builds a per-4x4-sub-tile TAIL
-// that is sorted by sub-tile-center depth; the sorted TAIL is then streamed to
-// per-pixel HEAD k-buffers. We approximate that here with a PERMUTATION buffer
-// per sub-tile: for each batch of up to 256 Gaussians, one designated leader
-// thread per sub-tile sorts the batch indices by sub-tile-center NDC depth and
-// writes a permutation into `sub_order[subtile_id][0..BATCH_SIZE-1]`. Every
-// pixel in the sub-tile then walks the shared batch in THAT order (instead of
-// raw input order) and feeds its per-pixel HEAD k-buffer.
+// --- Non-traced eval_3D fallback (master pre-cascade): sub-tile sorted
+// permutation. Only used when spec_trace_enabled == 0u; restores master's
+// 54.3 dB PSNR for the basketball golden test while leaving the cascade
+// (spec_trace_enabled==1u) trace path untouched.
 //
-// Simplifications vs the full CUDA algorithm:
-//   - MID (2x2-group) queue is elided. Depth refinement jumps directly from
-//     4x4 sub-tile to per-pixel HEAD.
-//   - 4x4 alpha culling (hierarchical_4x4_culling) is NOT applied in step 2:
-//     CUDA uses max_contrib_gaussian_frustum_3D over the 3x3 rect; a cheap
-//     centre-alpha proxy over-culls Gaussians whose peak is off-centre. We
-//     rely on the per-pixel alpha test in step 3 instead.
-//   - Streaming drain to HEAD on TAIL overflow is replaced with a full-batch
-//     sort + sweep: every qualifying Gaussian is sorted once per batch and
-//     fed to HEAD in that order. No Gaussians are dropped.
-// Shared memory: 16 sub-tiles * 256 slots * 4B = 16 KB.
-const int  NUM_SUBTILES = 16;
-shared uint sub_order[NUM_SUBTILES][256];  // permutation of [0..batch_size) per sub-tile
-shared int  sub_count[NUM_SUBTILES];        // culled-in count per sub-tile for this batch
+// SHARED MEMORY OVERLAY: when spec_trace_enabled==0u, the cascade TAIL/MID
+// state (s_tail_idx / s_tail_count below) is unused. We alias the fallback
+// permutation onto `s_tail_idx` (treated as packed 4×uint8 per int — batch
+// indices fit in 8 bits since BATCH_SIZE=256) and the per-subtile count
+// onto `s_tail_count`. This keeps total shared memory within the 49152 B
+// device limit on Tegra Thor.
+const int  NUM_SUBTILES_FB = 16;
+
+// --- Milestone B+C: TAIL/MID persistent state machine (spec_trace_enabled) ---
+// Port of CUDA sortGaussiansRayHierarchicaEvaluation cascade state machine
+// (AAA-Gaussians/.../hierarchical_render.cuh ~line 400-1100).
+//
+// Key structural choice: process 32 Gaussians per INNER step (CUDA's outer
+// loop is `for progress in range(start, end, WARP_SIZE=32)`). Each outer VK
+// 256-batch is unrolled into 8 inner 32-batches; TAIL/MID persist across
+// those inner steps AND across outer batches.
+//
+// TAIL layout matches CUDA `tail_depths[sub_y][sub_z][64]`
+// (cascade_trace.h:141-163). Index into flat arrays:
+//   sub_idx = sub_y * 4 + sub_z        (matches cascade_trace.h:149)
+//   s_tail_depth[sub_idx * 64 + slot]
+//   s_tail_idx  [sub_idx * 64 + slot]
+// where slot in [0..63] and sub_idx in [0..15].
+//
+// MID layout matches CUDA `mid_depths[sub_y][sub_z][quad][8]`:
+//   s_mid_depth[sub_idx * 32 + quad * 8 + slot]
+// where quad in [0..3], slot in [0..7].
+shared float s_tail_depth [16 * 64];
+shared int   s_tail_idx   [16 * 64];
+shared uint  s_tail_count [16];
+shared float s_mid_depth  [16 * 4 * 8];
+shared int   s_mid_idx    [16 * 4 * 8];
+shared uint  s_mid_count  [16 * 4];
+shared int   s_trace_tail_slot;  // block-wide claimed TAIL snapshot slot (broadcast)
+shared int   s_trace_mid_slot;   // block-wide claimed MID  snapshot slot (broadcast)
+
+// Scratch for the per-quadrant TAIL→MID push: 4 register-equivalent
+// (depth, gid) entries per quadrant (16 subtiles × 4 quads = 64 quadrants
+// × 4 slots = 256 entries). Used by the mergeSortRegToSmem<4> port
+// (iter-3 fix). Each head_group thread (rank_hg 0..3) writes its
+// pre-sort depth+gid; thread rank_hg==0 of each quadrant cooperatively
+// rank-counts and stable-merges back into s_mid_depth/idx[..0..7].
+shared float s_push_d [16 * 4 * 4];
+shared int   s_push_i [16 * 4 * 4];
+
+// Scratch for mergeSortRegToSmem<32> port (TAIL merge): 32 entries per
+// subtile × 16 subtiles. Holds the saved `store_key` / `store_value`
+// (the existing[lane] before being overwritten by new[lane]) so phase-2
+// binary search has a stable input. Mirrors CUDA's per-thread register
+// `store_key`/`store_value` (hierarchical_render.cuh:43,61).
+shared float s_merge_store_d [16 * 32];
+shared int   s_merge_store_i [16 * 32];
+
+// Milestone D+E (simplified): the per-pixel HEAD state is fully thread-private
+// in registers. The CUDA cross-pixel head_group.shfl exchanges are replaced
+// with direct SSBO reads of (gauss2screen, conic_opacity, rgb) by gid — the
+// gid is shared across the head_group via s_mid_idx (already populated), so
+// reads coalesce. No additional shared scratch needed.
 
 const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
 const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
 const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
+const uint  TAIL_SLOTS      = 64u;          // per-subtile TAIL capacity (matches CUDA).
+const float Z_NEAR          = -1.0;         // AAA rasterizer.h:27
+const float Z_FAR           = 1.0;          // AAA rasterizer.h:28
 
 // --- eval_3D helper functions ------------------------------------------------
 
@@ -186,6 +272,426 @@ float maxContribRayPixel(float plane_a[4], float plane_b[4], out float max_pos[4
     return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
 }
 
+// Helper: evaluate plane-x and plane-y rows of `g2s - g2s_row3 * pix.[xy]`
+// in homogeneous screen space. Writes out to plane_x/plane_y (length 4 each).
+// Packed sub_order_fb access helpers — overlay onto s_tail_idx [16*64].
+// 4 × uint8 per int, little-endian; batch indices 0..255 fit in 8 bits.
+uint subOrderRead(uint sub, int slot) {
+    uint word = uint(s_tail_idx[sub * 64u + (uint(slot) >> 2u)]);
+    return (word >> ((uint(slot) & 3u) * 8u)) & 0xFFu;
+}
+void subOrderWrite(uint sub, int slot, uint val) {
+    uint widx = uint(slot) >> 2u;
+    uint shift = (uint(slot) & 3u) * 8u;
+    uint cur = uint(s_tail_idx[sub * 64u + widx]);
+    uint mask = 0xFFu << shift;
+    s_tail_idx[sub * 64u + widx] = int((cur & ~mask) | ((val & 0xFFu) << shift));
+}
+
+void buildRayPlanes(uint k, float pix_x, float pix_y,
+                    out float plane_x[4], out float plane_y[4]) {
+    for (int j = 0; j < 4; ++j) {
+        plane_x[j] = s_g2s[k*16u + uint(j)]
+                   - s_g2s[k*16u + 12u + uint(j)] * pix_x;
+        plane_y[j] = s_g2s[k*16u + 4u + uint(j)]
+                   - s_g2s[k*16u + 12u + uint(j)] * pix_y;
+    }
+}
+
+// Compute NDC depth for gaussian `gid` at pixel position (pix_x, pix_y) by
+// reading the global gauss2screen SSBO directly. Mirrors CUDA's depth-along-
+// ray computation in pushPullThroughMid (hierarchical_render.cuh:639-648).
+// Returns FLT_MAX if the ray-Gaussian intersection is degenerate.
+float depthAtQuadGlobal(int gid, float pix_x, float pix_y) {
+    if (gid < 0) return 3.402823e38;
+    float plane_x[4], plane_y[4];
+    for (int j = 0; j < 4; ++j) {
+        plane_x[j] = gauss2screen[uint(gid) * 16u + 0u * 4u + uint(j)]
+                   - gauss2screen[uint(gid) * 16u + 3u * 4u + uint(j)] * pix_x;
+        plane_y[j] = gauss2screen[uint(gid) * 16u + 1u * 4u + uint(j)]
+                   - gauss2screen[uint(gid) * 16u + 3u * 4u + uint(j)] * pix_y;
+    }
+    float dx = plane_x[1]*plane_y[2] - plane_x[2]*plane_y[1];
+    float dy = plane_x[2]*plane_y[0] - plane_x[0]*plane_y[2];
+    float dz = plane_x[0]*plane_y[1] - plane_x[1]*plane_y[0];
+    float mx = plane_x[3]*plane_y[0] - plane_x[0]*plane_y[3];
+    float my = plane_x[3]*plane_y[1] - plane_x[1]*plane_y[3];
+    float mz = plane_x[3]*plane_y[2] - plane_x[2]*plane_y[3];
+    float dd = dx*dx + dy*dy + dz*dz;
+    if (dd < 1e-8) return 3.402823e38;
+    float mpx = mx/dd, mpy = my/dd, mpz = mz/dd;
+    float max_pos[4];
+    max_pos[0] = dy*mpz - dz*mpy;
+    max_pos[1] = dz*mpx - dx*mpz;
+    max_pos[2] = dx*mpy - dy*mpx;
+    max_pos[3] = 1.0;
+    float w_ndc = 0.0, z_ndc = 0.0;
+    for (int j = 0; j < 4; ++j) {
+        w_ndc += gauss2screen[uint(gid) * 16u + 3u * 4u + uint(j)] * max_pos[j];
+        z_ndc += gauss2screen[uint(gid) * 16u + 2u * 4u + uint(j)] * max_pos[j];
+    }
+    return (abs(w_ndc) > 1e-6) ? (z_ndc / w_ndc) : z_ndc;
+}
+
+// Port of consistent_common.cuh:max_contrib_plane (line 80-87).
+// max_pos_screen = transpose(g2s) * max_pos_gauss_homog. Since g2s stores
+// the TRANSPOSED product (M^T where M = world2screen*gauss2world), transpose
+// (g2s) = M. So max_pos_screen = M * (mpx, mpy, mpz, 1).
+// In row-major s_g2s (where s_g2s[k*16 + row*4 + col] = M[row, col]):
+//   max_pos_screen[row] = sum_col M[row, col] * v[col]
+//                       = sum_c s_g2s[k*16 + row*4 + c] * v[c]
+// Returns contrib = plane.w^2 / (plane.x^2 + plane.y^2 + plane.z^2).
+float maxContribPlane(float plane[4], uint k, out float max_pos_screen[4]) {
+    float xyz_sq = plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2];
+    float norm = plane[3] / max(xyz_sq, 1e-20);
+    float mpx = -plane[0] * norm;
+    float mpy = -plane[1] * norm;
+    float mpz = -plane[2] * norm;
+    for (int row = 0; row < 4; ++row) {
+        max_pos_screen[row] = s_g2s[k*16u + uint(row)*4u + 0u] * mpx
+                            + s_g2s[k*16u + uint(row)*4u + 1u] * mpy
+                            + s_g2s[k*16u + uint(row)*4u + 2u] * mpz
+                            + s_g2s[k*16u + uint(row)*4u + 3u] * 1.0;
+    }
+    return plane[3] * plane[3] / max(xyz_sq, 1e-20);
+}
+
+// Variant of maxContribRayPixel that also returns screen-space max_pos.
+// max_pos_screen = transpose(g2s) * max_pos_gauss = M * max_pos_gauss.
+float maxContribRayScreen(float plane_a[4], float plane_b[4], uint k,
+                          out float max_pos_screen[4]) {
+    float mp[4];
+    float contrib = maxContribRayPixel(plane_a, plane_b, mp);
+    for (int row = 0; row < 4; ++row) {
+        max_pos_screen[row] = s_g2s[k*16u + uint(row)*4u + 0u] * mp[0]
+                            + s_g2s[k*16u + uint(row)*4u + 1u] * mp[1]
+                            + s_g2s[k*16u + uint(row)*4u + 2u] * mp[2]
+                            + s_g2s[k*16u + uint(row)*4u + 3u] * mp[3];
+    }
+    return contrib;
+}
+
+// In-screen-range check (consistent_common.cuh:117-128).
+// returns true if d = pos[DIM] - range_from[DIM]*pos.w in (0, extent*pos.w)
+bool inScreenRange(float pos[4], int DIM, vec3 range_from, vec3 extent) {
+    float d = pos[DIM] - range_from[DIM] * pos[3];
+    return d > 0.0 && d < extent[DIM] * pos[3];
+}
+
+// Port of consistent_common.cuh:max_contrib_gaussian_frustum_3D<true,3,3>
+// (line 130-207). Computes max alpha within a rect×depth frustum by
+// enumerating candidate closest-approach positions (mean + 4 cone rays +
+// 4 plane hits) and picking the smallest-power (highest-alpha) one.
+// Input: rect_min, rect_max are the xy pixel bounds of the 3x3 region;
+// z bounds are [Z_NEAR, Z_FAR]. Returns 0.5*max_contrib == the power
+// exponent (caller uses alpha = opa * exp(-power)).
+float maxContribGaussianFrustum3D(vec2 rect_min, vec2 rect_max, uint k,
+                                  out float max_pos_depth) {
+    float max_contrib = 3.402823e38;  // FLT_MAX
+    float max_pos_screen[4] = float[4](1.0, 1.0, 1.0, 1.0);
+
+    vec3 RANGE_FROM = vec3(rect_min.x, rect_min.y, Z_NEAR);
+    vec3 EXTENT     = vec3(3.0, 3.0, Z_FAR - Z_NEAR);  // KNOWN_DIMENSIONS = true
+
+    // mean_screen = (g2s[0][3], g2s[1][3], g2s[2][3], g2s[3][3])
+    // = (row 0 col 3, row 1 col 3, row 2 col 3, row 3 col 3).
+    // In s_g2s: s_g2s[k*16 + row*4 + 3].
+    // NOTE: CUDA uses GLM col-major; g2s[i][j] is column i row j. But the
+    // matrix is stored as glm::transpose(world2screen * gauss2world), so
+    // g2s's columns store the original rows. So g2s[i][j] = original (row i, col j).
+    // Thus mean_screen = (original row 0 col 3, row 1 col 3, row 2 col 3, row 3 col 3)
+    // which is the last column of the original matrix.
+    float mean_screen[4];
+    for (int j = 0; j < 4; ++j) {
+        mean_screen[j] = s_g2s[k*16u + uint(j)*4u + 3u];
+    }
+
+    vec3 d_test;
+    bool bx = inScreenRange(mean_screen, 0, RANGE_FROM, EXTENT);
+    d_test.x = mean_screen[0] - RANGE_FROM.x * mean_screen[3];
+    bool by = inScreenRange(mean_screen, 1, RANGE_FROM, EXTENT);
+    d_test.y = mean_screen[1] - RANGE_FROM.y * mean_screen[3];
+    bool bz = inScreenRange(mean_screen, 2, RANGE_FROM, EXTENT);
+    d_test.z = mean_screen[2] - RANGE_FROM.z * mean_screen[3];
+
+    if (bx && by && bz) {
+        for (int j = 0; j < 4; ++j) max_pos_screen[j] = mean_screen[j];
+        max_contrib = 0.0;
+    } else {
+        // Rectangle closest edges (in view-clip space).
+        float dx = (d_test.x - (EXTENT.x * 0.5 * mean_screen[3])) >= 0.0
+                 ? (EXTENT.x * 0.5) : -(EXTENT.x * 0.5);
+        float dy = (d_test.y - (EXTENT.y * 0.5 * mean_screen[3])) >= 0.0
+                 ? (EXTENT.y * 0.5) : -(EXTENT.y * 0.5);
+
+        // closer_plane_x = g2s[0] - g2s[3] * (rect_min.x + 1.5 + dx)
+        // closer_plane_y = g2s[1] - g2s[3] * (rect_min.y + 1.5 + dy)
+        float closer_plane_x[4];
+        float closer_plane_y[4];
+        float other_plane_x[4];
+        float other_plane_y[4];
+        float px_val = RANGE_FROM.x + EXTENT.x * 0.5 + dx;
+        float py_val = RANGE_FROM.y + EXTENT.y * 0.5 + dy;
+        float qx_val = RANGE_FROM.x + EXTENT.x * 0.5 - dx;
+        float qy_val = RANGE_FROM.y + EXTENT.y * 0.5 - dy;
+        for (int j = 0; j < 4; ++j) {
+            closer_plane_x[j] = s_g2s[k*16u + 0u*4u + uint(j)]
+                              - s_g2s[k*16u + 3u*4u + uint(j)] * px_val;
+            closer_plane_y[j] = s_g2s[k*16u + 1u*4u + uint(j)]
+                              - s_g2s[k*16u + 3u*4u + uint(j)] * py_val;
+            other_plane_x[j]  = s_g2s[k*16u + 0u*4u + uint(j)]
+                              - s_g2s[k*16u + 3u*4u + uint(j)] * qx_val;
+            other_plane_y[j]  = s_g2s[k*16u + 1u*4u + uint(j)]
+                              - s_g2s[k*16u + 3u*4u + uint(j)] * qy_val;
+        }
+
+        float pos[4];
+        float contrib;
+
+        // Candidate 1: closer_plane_x line hit
+        contrib = maxContribPlane(closer_plane_x, k, pos);
+        if (contrib < max_contrib
+            && inScreenRange(pos, 1, RANGE_FROM, EXTENT)
+            && inScreenRange(pos, 2, RANGE_FROM, EXTENT)) {
+            max_contrib = contrib;
+            for (int j = 0; j < 4; ++j) max_pos_screen[j] = pos[j];
+        }
+
+        // Candidate 2: closer_plane_y line hit
+        contrib = maxContribPlane(closer_plane_y, k, pos);
+        if (contrib < max_contrib
+            && inScreenRange(pos, 0, RANGE_FROM, EXTENT)
+            && inScreenRange(pos, 2, RANGE_FROM, EXTENT)) {
+            max_contrib = contrib;
+            for (int j = 0; j < 4; ++j) max_pos_screen[j] = pos[j];
+        }
+
+        // Candidate 3: closer_plane_x x closer_plane_y ray
+        contrib = maxContribRayScreen(closer_plane_x, closer_plane_y, k, pos);
+        if (contrib < max_contrib && inScreenRange(pos, 2, RANGE_FROM, EXTENT)) {
+            max_contrib = contrib;
+            for (int j = 0; j < 4; ++j) max_pos_screen[j] = pos[j];
+        }
+
+        // Candidate 4: closer_plane_x x other_plane_y ray
+        contrib = maxContribRayScreen(closer_plane_x, other_plane_y, k, pos);
+        if (contrib < max_contrib && inScreenRange(pos, 2, RANGE_FROM, EXTENT)) {
+            max_contrib = contrib;
+            for (int j = 0; j < 4; ++j) max_pos_screen[j] = pos[j];
+        }
+
+        // Candidate 5: other_plane_x x closer_plane_y ray
+        contrib = maxContribRayScreen(other_plane_x, closer_plane_y, k, pos);
+        if (contrib < max_contrib && inScreenRange(pos, 2, RANGE_FROM, EXTENT)) {
+            max_contrib = contrib;
+            for (int j = 0; j < 4; ++j) max_pos_screen[j] = pos[j];
+        }
+    }
+
+    max_pos_depth = (abs(max_pos_screen[3]) > 1e-20)
+                  ? (max_pos_screen[2] / max_pos_screen[3])
+                  : max_pos_screen[2];
+    return 0.5 * max_contrib;
+}
+
+// Per-Gaussian depth evaluation at a given pixel (ray) position.
+// Returns (depth, z_ndc, w_ndc) via out params; also returns max_pos.
+// Caller can use max_pos for alpha evaluation via power = -0.5*maxContribRay.
+void rayDepth(uint k, float pix_x, float pix_y,
+              out float depth, out float z_ndc, out float w_ndc,
+              out float max_pos[4], out float power_sq) {
+    float plane_x[4], plane_y[4];
+    buildRayPlanes(k, pix_x, pix_y, plane_x, plane_y);
+    power_sq = maxContribRayPixel(plane_x, plane_y, max_pos);
+    w_ndc = 0.0; z_ndc = 0.0;
+    for (int j = 0; j < 4; ++j) {
+        w_ndc += s_g2s[k*16u + 12u + uint(j)] * max_pos[j];
+        z_ndc += s_g2s[k*16u + 8u  + uint(j)] * max_pos[j];
+    }
+    depth = (abs(w_ndc) > 1e-6) ? (z_ndc / w_ndc) : z_ndc;
+}
+
+// ---------- state-machine helpers (trace path) ----------------------------
+//
+// Port of CUDA `batcherSort<32>` (stopthepop_common.cuh /
+// hierarchical_render.cuh:159-191). Bit-exact: same compare-swap network,
+// same strict `>` comparator (so tied keys remain in their original lane
+// order, which IS the implicit secondary key). Operates in-place on the
+// 32 slots starting at `base`. 16 threads per subtile each cover two CUDA
+// thread-ranks (r and r+16). The CUDA `cg.sync()` is replaced by a full
+// `barrier()` at the start of each sub-step so all 16 subtiles stay
+// synchronised.
+void batcherSort32(uint sub_idx, uint in_subtile, uint base) {
+    for (uint size = 2u; size <= 32u; size <<= 1) {
+        // First sub-step: pos = 2*r - (r & (stride-1)); compare (pos, pos+stride)
+        uint stride = size >> 1u;
+        barrier();
+        for (uint pp = 0u; pp < 2u; ++pp) {
+            uint r = in_subtile + pp * 16u;  // 0..31
+            uint pos = (r << 1u) - (r & (stride - 1u));
+            float d0 = s_tail_depth[base + pos];
+            float d1 = s_tail_depth[base + pos + stride];
+            if (d0 > d1) {
+                int g0 = s_tail_idx[base + pos];
+                int g1 = s_tail_idx[base + pos + stride];
+                s_tail_depth[base + pos]          = d1;
+                s_tail_depth[base + pos + stride] = d0;
+                s_tail_idx  [base + pos]          = g1;
+                s_tail_idx  [base + pos + stride] = g0;
+            }
+        }
+        // Subsequent sub-steps: stride /= 2, then for stride>0:
+        //   pos = 2*r - (r & (stride_outer-1));  // NB: offset uses outer stride
+        //   if (offset >= stride_inner) compare (pos-stride_inner, pos)
+        // CUDA computes `offset = thread_rank & (size/2 - 1)` ONCE outside the
+        // inner loop. We mirror that.
+        for (uint inner_stride = stride >> 1u; inner_stride > 0u; inner_stride >>= 1u) {
+            barrier();
+            for (uint pp = 0u; pp < 2u; ++pp) {
+                uint r = in_subtile + pp * 16u;  // 0..31
+                uint offset = r & (stride - 1u);  // outer stride==size/2
+                uint pos = (r << 1u) - (r & (inner_stride - 1u));
+                if (offset >= inner_stride) {
+                    float d0 = s_tail_depth[base + pos - inner_stride];
+                    float d1 = s_tail_depth[base + pos];
+                    if (d0 > d1) {
+                        int g0 = s_tail_idx[base + pos - inner_stride];
+                        int g1 = s_tail_idx[base + pos];
+                        s_tail_depth[base + pos - inner_stride] = d1;
+                        s_tail_depth[base + pos]                = d0;
+                        s_tail_idx  [base + pos - inner_stride] = g1;
+                        s_tail_idx  [base + pos]                = g0;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+}
+
+// Port of CUDA `mergeSortRegToSmem<32>` (hierarchical_render.cuh:25-69)
+// applied to TAIL: merges sorted-existing in slots [base..base+31] with
+// sorted-new in slots [base+32..base+63] (lane r reads slot base+32+r as
+// its "register" key, mirroring CUDA's `k = d[32 + warp.thread_rank()]`).
+//
+// Asymmetric `<=` / `<` comparison gives bit-exact CUDA semantics for
+// tied keys: existing-with-equal-depth is placed BEFORE new-with-equal-
+// depth, and ties within each side preserve lane order.
+//
+// Layout: 16 threads per subtile cover 32 CUDA lanes via (r, r+16).
+// `s_merge_store_d/i[sub_idx*32 + r]` holds the saved existing[r] across
+// the two binary searches (the CUDA register `store_key/value`).
+void mergeSortRegToSmem32_Tail(uint sub_idx, uint in_subtile) {
+    uint base       = sub_idx * 64u;
+    uint store_base = sub_idx * 32u;
+
+    // CUDA reads `k = d[32 + r]; v = id[32 + r]` per lane. We do likewise
+    // for both r and r+16, then run the two phases.
+    float key0 = s_tail_depth[base + 32u + in_subtile];
+    int   val0 = s_tail_idx  [base + 32u + in_subtile];
+    float key1 = s_tail_depth[base + 32u + in_subtile + 16u];
+    int   val1 = s_tail_idx  [base + 32u + in_subtile + 16u];
+
+    // ---- Phase 1: binary-search NEW key into the existing-sorted-32 ----
+    // s0 counts existing entries with key_existing <= key (i.e., the new
+    // key lands AT position s0 after them). CUDA lines 28-40.
+    int s0_0 = 0;
+    int s0_1 = 0;
+    for (int i = 16; i > 0; i >>= 1) {
+        if (s_tail_depth[base + uint(s0_0 + i)] <= key0) s0_0 += i;
+        if (s_tail_depth[base + uint(s0_1 + i)] <= key1) s0_1 += i;
+    }
+    s0_0 += 1;
+    s0_1 += 1;
+    if (s_tail_depth[base + 0u] > key0) s0_0 = 0;
+    if (s_tail_depth[base + 0u] > key1) s0_1 = 0;
+    // Add own thread-rank (r and r+16).
+    s0_0 += int(in_subtile);
+    s0_1 += int(in_subtile + 16u);
+
+    // ---- Save existing[r] then overwrite with new key (in lane order) ----
+    // CUDA: store_key = keys[rank]; keys[rank] = key. Done per lane.
+    float store_key0 = s_tail_depth[base + in_subtile];
+    int   store_val0 = s_tail_idx  [base + in_subtile];
+    float store_key1 = s_tail_depth[base + in_subtile + 16u];
+    int   store_val1 = s_tail_idx  [base + in_subtile + 16u];
+
+    barrier();
+
+    // Overwrite lane r's existing slot with new key (in lane order).
+    s_tail_depth[base + in_subtile]        = key0;
+    s_tail_depth[base + in_subtile + 16u]  = key1;
+    // (idx slots are not used as the binary-search key in phase 2; they
+    // can be left for the final write below. But for safety we also
+    // overwrite the idx slots so a later reader doesn't see stale data —
+    // the final write will overwrite again.)
+    s_tail_idx  [base + in_subtile]        = val0;
+    s_tail_idx  [base + in_subtile + 16u]  = val1;
+
+    barrier();
+
+    // ---- Phase 2: binary-search OLD key into the now-new-sorted-32 ----
+    // s1 counts new entries with key_new < store_key (strict). CUDA lines
+    // 47-60.
+    int s1_0 = 0;
+    int s1_1 = 0;
+    for (int i = 16; i > 0; i >>= 1) {
+        if (s_tail_depth[base + uint(s1_0 + i)] < store_key0) s1_0 += i;
+        if (s_tail_depth[base + uint(s1_1 + i)] < store_key1) s1_1 += i;
+    }
+    s1_0 += 1;
+    s1_1 += 1;
+    if (s_tail_depth[base + 0u] >= store_key0) s1_0 = 0;
+    if (s_tail_depth[base + 0u] >= store_key1) s1_1 = 0;
+    s1_0 += int(in_subtile);
+    s1_1 += int(in_subtile + 16u);
+
+    barrier();
+
+    // ---- Phase 3: write the 64 merged entries in-place ----
+    // CUDA: fin_keys[s0] = key; fin_keys[s1] = store_key; same for values.
+    // Each lane writes to s0 (its new key's final position) and s1 (its
+    // old key's final position). All 64 positions covered exactly once
+    // because the merge is well-defined.
+    s_tail_depth[base + uint(s0_0)] = key0;
+    s_tail_idx  [base + uint(s0_0)] = val0;
+    s_tail_depth[base + uint(s0_1)] = key1;
+    s_tail_idx  [base + uint(s0_1)] = val1;
+    s_tail_depth[base + uint(s1_0)] = store_key0;
+    s_tail_idx  [base + uint(s1_0)] = store_val0;
+    s_tail_depth[base + uint(s1_1)] = store_key1;
+    s_tail_idx  [base + uint(s1_1)] = store_val1;
+
+    barrier();
+}
+
+// Per-quadrant bitonic sort of 8 entries in-place
+// (s_mid_depth/idx[sub_idx*32 + quad*8 + 0..7]). 4 threads per head_group
+// handle 1 pair each per pass.
+void bitonicSort8Quad(uint sub_idx, uint quad, uint rank_hg) {
+    uint base = sub_idx * 32u + quad * 8u;
+    for (uint size = 2u; size <= 8u; size <<= 1) {
+        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            barrier();
+            uint tid_p = rank_hg;  // 0..3 pair index per quadrant
+            uint i = (tid_p << 1u) - (tid_p & (stride - 1u));
+            if (i + stride < 8u) {
+                float d0 = s_mid_depth[base + i];
+                float d1 = s_mid_depth[base + i + stride];
+                if (d0 > d1) {
+                    int g0 = s_mid_idx[base + i];
+                    int g1 = s_mid_idx[base + i + stride];
+                    s_mid_depth[base + i]            = d1;
+                    s_mid_depth[base + i + stride]   = d0;
+                    s_mid_idx  [base + i]            = g1;
+                    s_mid_idx  [base + i + stride]   = g0;
+                }
+            }
+        }
+    }
+    barrier();
+}
+
 void main() {
     // --- Tile → range lookup ---
     uint tile_id = gl_WorkGroupID.y * pc.num_tiles_x + gl_WorkGroupID.x;
@@ -210,62 +716,127 @@ void main() {
 
     if (spec_eval_3D == 1u) {
     // =================================================================
-    // eval_3D path: simplified hierarchical cascade (sort_mode=3).
-    //
-    // Port of CUDA sortGaussiansRayHierarchicalCUDA_forward (hierarchical_
-    // render.cuh) with MID queue elided. The 16x16 tile is decomposed into
-    // sixteen 4x4 sub-tiles. Per batch of up to 256 Gaussians, one leader
-    // thread per sub-tile (pixel (0,0) within each 4x4 block) sorts the
-    // batch indices by sub-tile-center NDC depth and writes a permutation
-    // into `sub_order[subtile_id]`. Every pixel in the sub-tile then walks
-    // the batch in that sub-tile-sorted order (not the raw tile-center-sorted
-    // input order) and feeds its private 4-entry HEAD k-buffer.
-    //
-    // Why it helps over pure HEAD-only: the global sort is by tile-center
-    // depth, a coarse proxy. At 4x4 granularity neighbouring Gaussians can
-    // swap depth positions — a 4-entry HEAD k-buffer alone cannot correct
-    // large reorderings. The sub-tile re-sort delivers Gaussians to HEAD
-    // already in near-correct per-pixel depth order, so HEAD's small window
-    // suffices.
-    //
-    // Streaming semantics: every batch Gaussian that passes 4x4-center
-    // culling is placed into `sub_order` (no drops), so each pixel still
-    // sees every qualifying Gaussian — we only REORDER the stream.
+    // eval_3D path: cascade state machine for TAIL/MID trace + per-pixel
+    // HEAD register k-buffer (CUDA PerThreadSortWindow=4) for the cascade
+    // pixel output and HEAD_INS/HEAD_BLEND trace.
+    // CUDA reference: hierarchical_render.cuh blend_one() lines 393-424,
+    // front4OneFromMid() lines 428-591.
     // =================================================================
 
-    // Per-pixel k-buffer (HEAD): HEAD_W sorted slots (ascending per-pixel depth).
-    // Private (per-thread register/local memory) — no shared memory needed.
-    // HEAD_W=4 matches CUDA exactly. Depth refinement comes from the TAIL
-    // (sub-tile-center) re-sort upstream, not from a wider HEAD window.
-    const int HEAD_W = 8;
-    float kbuf_depth[HEAD_W];
-    float kbuf_alpha[HEAD_W];
-    float kbuf_r[HEAD_W];
-    float kbuf_g[HEAD_W];
-    float kbuf_b[HEAD_W];
-    int kbuf_size = 0;
+    // CUDA HEAD register state (hierarchical_render.cuh:283-288):
+    //   float head_depths[4]; int head_ids[4]; float head_stores[4];
+    // We split head_stores (originally an alpha-cached store) into per-channel
+    // colour caches so blend_one() can emit (alpha*T*color) without re-reading
+    // the gid back through SSBO. We additionally cache opacity to support a
+    // potential late-eval path; current impl computes alpha at insertion.
+    const int HEAD_W = 4;  // CUDA PerThreadSortWindow=4
+    float head_depths[HEAD_W];
+    int   head_ids   [HEAD_W];
+    float head_alphas[HEAD_W];   // pre-computed alpha at insertion
+    float head_color_r[HEAD_W];
+    float head_color_g[HEAD_W];
+    float head_color_b[HEAD_W];
+    int   head_count = 0;
+    uint  head_ins_cur   = 0u;   // per-pixel HEAD_INS cursor
+    uint  head_blend_cur = 0u;   // per-pixel HEAD_BLEND cursor
     for (int i = 0; i < HEAD_W; i++) {
-        kbuf_depth[i] = 1e30;
-        kbuf_alpha[i] = 0.0;
-        kbuf_r[i] = 0.0; kbuf_g[i] = 0.0; kbuf_b[i] = 0.0;
+        head_depths[i]  = 3.402823e38;
+        head_ids[i]     = -1;
+        head_alphas[i]  = 0.0;
+        head_color_r[i] = 0.0;
+        head_color_g[i] = 0.0;
+        head_color_b[i] = 0.0;
     }
 
-    // Sub-tile identification (4x4 pixel blocks in the 16x16 workgroup).
-    uint stx = gl_LocalInvocationID.x / 4u;   // 0..3
-    uint sty = gl_LocalInvocationID.y / 4u;   // 0..3
-    uint subtile_id = sty * 4u + stx;          // 0..15
-    float subtile_cx = float(gl_WorkGroupID.x * 16u + 4u * stx) + 2.0;
-    float subtile_cy = float(gl_WorkGroupID.y * 16u + 4u * sty) + 2.0;
+    // --- Non-trace eval_3D fallback HEAD k-buffer (master pre-cascade) ---
+    // Wider HEAD (8) + sub-tile-sorted batch walk reproduces master's 54.3 dB
+    // PSNR baseline. Disjoint from cascade `head_*` registers above. Only used
+    // when spec_trace_enabled == 0u (basketball golden / eval_3D unit tests).
+    const int FB_HEAD_W = 8;
+    float fb_kbuf_depth[FB_HEAD_W];
+    float fb_kbuf_alpha[FB_HEAD_W];
+    float fb_kbuf_r[FB_HEAD_W];
+    float fb_kbuf_g[FB_HEAD_W];
+    float fb_kbuf_b[FB_HEAD_W];
+    int   fb_kbuf_size = 0;
+    for (int i = 0; i < FB_HEAD_W; i++) {
+        fb_kbuf_depth[i] = 1e30;
+        fb_kbuf_alpha[i] = 0.0;
+        fb_kbuf_r[i] = 0.0; fb_kbuf_g[i] = 0.0; fb_kbuf_b[i] = 0.0;
+    }
 
-    // Leader thread for each sub-tile: pixel (0,0) within its 4x4 block.
-    bool is_subtile_leader = ((gl_LocalInvocationID.x % 4u) == 0u) &&
-                             ((gl_LocalInvocationID.y % 4u) == 0u);
+    // --- Subtile / quadrant / in-subtile identity ------------------------
+    // CUDA block dim is (16,4,4). threadIdx.y (0..3) scales X within subtile
+    // layout; threadIdx.z (0..3) scales Y. cascade_trace.h:149 computes
+    // sub_idx = sub_y * 4 + sub_z. In our (16,16,1) VK workgroup: sub_y is
+    // the subtile's X-position (pix_x/4) and sub_z is Y-position (pix_y/4).
+    uint sub_y = gl_LocalInvocationID.x / 4u;         // 0..3 (CUDA's threadIdx.y)
+    uint sub_z = gl_LocalInvocationID.y / 4u;         // 0..3 (CUDA's threadIdx.z)
+    uint sub_idx = sub_y * 4u + sub_z;                // 0..15 (flat subtile id)
+    // in_subtile: rank 0..15 within the 4×4 subtile (row-major within subtile).
+    // Matches CUDA halfwarp.thread_rank() for the trace stride-16 write pattern.
+    uint in_subtile = (gl_LocalInvocationID.y & 3u) * 4u
+                    + (gl_LocalInvocationID.x & 3u);  // 0..15
+    // quad / rank_hg: 2×2 quadrant within subtile, rank within quadrant.
+    uint quad_x = (gl_LocalInvocationID.x & 3u) / 2u; // 0..1
+    uint quad_y = (gl_LocalInvocationID.y & 3u) / 2u; // 0..1
+    uint quad   = quad_y * 2u + quad_x;               // 0..3
+    uint rank_hg_x = (gl_LocalInvocationID.x & 1u);
+    uint rank_hg_y = (gl_LocalInvocationID.y & 1u);
+    uint rank_hg   = rank_hg_y * 2u + rank_hg_x;      // 0..3
 
+    // Subtile center (pixpos ray origin) in pixel coordinates.
+    // CUDA init (hierarchical_render.cuh:335-354): for thread.x==0,
+    //   pos = tail_corner + (1.5, 1.5); tail_and_mid_pixpos[y][z][0] = pos + 0.5
+    // So the evaluated center is tail_corner + (2.0, 2.0) — matching pixel-
+    // center convention (+0.5 on integer pixel coords). tail_corner itself
+    // is tile_min + (4*sub_y, 4*sub_z).
+    float subtile_cx = float(gl_WorkGroupID.x * 16u + 4u * sub_y) + 2.0;
+    float subtile_cy = float(gl_WorkGroupID.y * 16u + 4u * sub_z) + 2.0;
+
+    // Per-quadrant pixpos (CUDA hierarchical_render.cuh:333-339, init for
+    // thread.x in 1..4). pos = tail_corner + (0.5 + 2*qx, 0.5 + 2*qy);
+    // pixpos used for ray-plane is pos + 0.5. So:
+    //   quad_cx = tile_min.x + 4*sub_y + 1.0 + 2*quad_x
+    //   quad_cy = tile_min.y + 4*sub_z + 1.0 + 2*quad_y
+    // Used when pushing TAIL→MID — CUDA recomputes depth at the quadrant
+    // pixpos in pushPullThroughMid (line 635-647). Not the subtile center.
+    float quad_cx = float(gl_WorkGroupID.x * 16u + 4u * sub_y) + 1.0 + 2.0 * float(quad_x);
+    float quad_cy = float(gl_WorkGroupID.y * 16u + 4u * sub_z) + 1.0 + 2.0 * float(quad_y);
+
+    // --- Init persistent TAIL/MID state (once per tile) ------------------
+    if (spec_trace_enabled == 1u) {
+        // Zero out per-subtile counts (16 subtiles; 16 threads of subtile 0
+        // could do it, but simpler: first 16 threads zero all 16).
+        if (local_idx < 16u) {
+            s_tail_count[local_idx] = 0u;
+        }
+        // Zero MID counts (64 entries).
+        if (local_idx < 64u) {
+            s_mid_count[local_idx] = 0u;
+        }
+        // Init TAIL slots to sentinel (FLT_MAX, -1).
+        for (uint i = 0u; i < 4u; ++i) {
+            uint s = in_subtile + i * 16u;
+            s_tail_depth[sub_idx * 64u + s] = 3.402823e38;
+            s_tail_idx  [sub_idx * 64u + s] = -1;
+        }
+        // Init MID slots (8 per quadrant). 4 threads in quadrant write 2 each.
+        for (uint i = 0u; i < 2u; ++i) {
+            uint s = rank_hg + i * 4u;
+            uint mid_base = sub_idx * 32u + quad * 8u;
+            s_mid_depth[mid_base + s] = 3.402823e38;
+            s_mid_idx  [mid_base + s] = -1;
+        }
+    }
+    barrier();
+
+    // ---- Outer batch loop (256 Gaussians per outer step) ---------------
     for (uint batch_start = range_start;
          batch_start < range_end;
          batch_start += BATCH_SIZE)
     {
-        // 1. Cooperative load into shared memory.
+        // 1. Cooperative load into shared memory (256 Gaussians).
         uint load_idx = batch_start + local_idx;
         if (load_idx < range_end) {
             uint gid = values_sorted[load_idx];
@@ -281,90 +852,582 @@ void main() {
             s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
             s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
         }
-        if (local_idx < uint(NUM_SUBTILES)) {
-            sub_count[local_idx] = 0;
-        }
         barrier();
 
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
 
-        // 2. Leader thread per sub-tile builds the sorted permutation.
-        //    For each Gaussian k in [0, batch_size):
-        //      - Evaluate at sub-tile centre -> max_pos, depth_c = z_ndc + 8.
-        //      - Skip only if z/w clip fails (keep Gaussians whose PEAK is
-        //        off-centre but still contribute to some pixel in the sub-
-        //        tile; 4x4-centre alpha culling is too aggressive without
-        //        the max-contrib-over-rect form CUDA uses).
-        //      - Else insert k into sub_order[subtile_id] in depth_c-
-        //        ascending order via bubble-up.
-        //    `priv_depth` is a private scratch array mirroring the sorted
-        //    depth keys. Only the 16 leader threads allocate it.
-        //    Per-pixel alpha threshold, power>0 skip, and ALPHA_THRESHOLD
-        //    filtering happen in step 3 where the actual pixel is known.
-        if (is_subtile_leader) {
-            float priv_depth[256];
-            int cnt = 0;
+        // ---- Non-trace fallback: sub-tile sort prologue (master pre-cascade)
+        // Mirrors master rasterize.comp lines 291-350: each sub-tile leader
+        // (in_subtile == 0u) builds an ascending-depth permutation of the
+        // batch, indexed at the sub-tile centre. Pixels within the sub-tile
+        // then walk `sub_order_fb[sub_idx]` instead of raw input order.
+        // Runs when spec_sort_mode == GLOBAL (Y1) OR spec_trace_enabled == 0u
+        // (HIERARCHICAL non-trace fallback). Cascade path uses its own
+        // TAIL/MID machinery below (gated by spec_trace_enabled == 1u) and
+        // ignores sub_order_fb.
+        if (spec_sort_mode == 0u || spec_trace_enabled == 0u) {
+            if (local_idx < uint(NUM_SUBTILES_FB)) {
+                s_tail_count[local_idx] = 0u;  // overlay: reused as sub_count_fb
+            }
+            barrier();
+            if (in_subtile == 0u) {
+                float priv_depth_fb[256];
+                int cnt_fb = 0;
+                for (uint k = 0u; k < batch_size; ++k) {
+                    float plane_x[4], plane_y[4];
+                    buildRayPlanes(k, subtile_cx, subtile_cy, plane_x, plane_y);
+                    float max_pos[4];
+                    maxContribRayPixel(plane_x, plane_y, max_pos);
+                    float w_ndc = 0.0, z_ndc = 0.0;
+                    for (int j = 0; j < 4; j++) {
+                        w_ndc += s_g2s[k*16u + 12u + uint(j)] * max_pos[j];
+                        z_ndc += s_g2s[k*16u +  8u + uint(j)] * max_pos[j];
+                    }
+                    if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+                    float d = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc) + 8.0;
 
-            for (uint k = 0u; k < batch_size; ++k) {
-                float plane_x[4], plane_y[4];
-                for (int j = 0; j < 4; j++) {
-                    plane_x[j] = s_g2s[k * 16u + uint(j)]      - s_g2s[k * 16u + 12u + uint(j)] * subtile_cx;
-                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)] - s_g2s[k * 16u + 12u + uint(j)] * subtile_cy;
+                    priv_depth_fb[cnt_fb] = d;
+                    subOrderWrite(sub_idx, cnt_fb, k);
+                    for (int i = cnt_fb; i > 0; --i) {
+                        if (priv_depth_fb[i - 1] > priv_depth_fb[i]) {
+                            float td = priv_depth_fb[i];
+                            priv_depth_fb[i]     = priv_depth_fb[i - 1];
+                            priv_depth_fb[i - 1] = td;
+                            uint tk = subOrderRead(sub_idx, i);
+                            uint tk_prev = subOrderRead(sub_idx, i - 1);
+                            subOrderWrite(sub_idx, i, tk_prev);
+                            subOrderWrite(sub_idx, i - 1, tk);
+                        } else {
+                            break;
+                        }
+                    }
+                    cnt_fb += 1;
                 }
+                s_tail_count[sub_idx] = uint(cnt_fb);  // overlay
+            }
+            barrier();
+        }
 
-                float max_pos[4];
-                // Ignore power sign / alpha at sub-tile centre: a Gaussian whose peak
-                // is off-centre (outside the centre ray) can still contribute at some
-                // pixel in the sub-tile. Full per-pixel filtering happens in step 3.
-                maxContribRayPixel(plane_x, plane_y, max_pos);
+        // ---- State-machine inner loop (32 Gaussians per step) ----------
+        // Matches CUDA's `for progress in range(.., WARP_SIZE)` cadence.
+        // Each inner step: fill TAIL new-half (32 slots), sort, merge,
+        // drain to MID if overflow, emit TAIL+(optional MID) snapshot.
+        //
+        // Uniform control flow: the inner trip count is fixed at 8 regardless
+        // of batch_size. For trailing Gaussians beyond `range_end`, we
+        // compute FLT_MAX / gid=-1 sentinels so the sort still produces valid
+        // state. This keeps `barrier()` reachable on all threads.
+        if (spec_trace_enabled == 1u) {
+            const uint INNER_TRIPS = 8u;  // 256 / 32
+            uint num_inner = (batch_size + 31u) / 32u;
 
-                float w_ndc = 0.0, z_ndc = 0.0;
-                for (int j = 0; j < 4; j++) {
-                    w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
-                    z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+            for (uint inner = 0u; inner < INNER_TRIPS; ++inner) {
+                bool this_inner_active = (inner < num_inner);
+
+                // Snapshot TAIL count BEFORE this inner step's fill, per
+                // subtile. Needed so the post-sort "duplicate first-32"
+                // copy (to match CUDA's `else {copy}` branch from
+                // hierarchical_render.cuh:987-1005) fires only on iters
+                // where TAIL was previously empty.
+                uint pre_tc = s_tail_count[sub_idx];
+
+                // Each thread owns 2 of 32 new gaussians this step: positions
+                // `in_subtile` and `in_subtile + 16` within [inner*32, inner*32+32).
+                // Place them at TAIL slots [32 + in_subtile] and [32 + in_subtile+16].
+                // All 16 threads of the subtile write all 32 new slots of their
+                // subtile's TAIL (one subtile's new half is 32 slots).
+                // We use `t0 = in_subtile` and `t1 = in_subtile + 16`.
+                for (uint h = 0u; h < 2u; ++h) {
+                    uint local_slot = 32u + in_subtile + h * 16u;
+                    uint candidate_pos = inner * 32u + in_subtile + h * 16u;
+
+                    float new_depth = 3.402823e38;
+                    int   new_gid   = -1;
+                    if (this_inner_active && candidate_pos < batch_size) {
+                        uint k = candidate_pos;
+                        // NOTE (B+C partial): CUDA applies alpha culling via
+                        // max_contrib_gaussian_frustum_3D<true,3,3> over the
+                        // 3×3 subtile rect + z frustum (hierarchical_render
+                        // .cuh:882-906). The port is DEFERRED: our current
+                        // implementation of that function over-rejects
+                        // Gaussians and distorts TAIL content worse than
+                        // skipping the cull entirely. Skipping alpha cull
+                        // gives snap 0 byte-exact TAIL agreement (32/32 gids
+                        // match). Subsequent snapshots still diverge because
+                        // CUDA drops some alpha-culled Gaussians that VK
+                        // keeps, shifting drain boundaries. Left as TODO for
+                        // a dedicated fix cycle on the frustum-3D port.
+                        float plane_x[4], plane_y[4];
+                        buildRayPlanes(k, subtile_cx, subtile_cy,
+                                       plane_x, plane_y);
+                        float mp[4];
+                        maxContribRayPixel(plane_x, plane_y, mp);
+                        float w_ndc = 0.0, z_ndc = 0.0;
+                        for (int j = 0; j < 4; ++j) {
+                            w_ndc += s_g2s[k*16u + 12u + uint(j)] * mp[j];
+                            z_ndc += s_g2s[k*16u + 8u  + uint(j)] * mp[j];
+                        }
+                        new_depth = (abs(w_ndc) > 1e-6) ? (z_ndc / w_ndc) : z_ndc;
+                        new_gid   = int(s_gid[k]);
+                    }
+                    s_tail_depth[sub_idx * 64u + local_slot] = new_depth;
+                    s_tail_idx  [sub_idx * 64u + local_slot] = new_gid;
                 }
-                // Cull only at the coarse z-range level (keeps cost low but removes
-                // behind-camera / far-plane Gaussians).
-                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+                barrier();
 
-                float d = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc) + 8.0;
+                // Two-stage TAIL sort that mirrors CUDA exactly
+                // (hierarchical_render.cuh:897, 921):
+                //   (1) batcherSort<32> on slots [32..63] — sorts the new
+                //       half. Strict `>` compare; tied keys preserve their
+                //       original lane order (which IS the implicit
+                //       secondary key, matching CUDA).
+                //   (2) mergeSortRegToSmem<32> — merges sorted-existing
+                //       (slots [0..31]) with sorted-new (slot 32+lane read
+                //       per lane). Asymmetric `<=` / `<` compare:
+                //       existing-with-tied-depth comes before new-with-tied-
+                //       depth (CUDA stable-merge semantics).
+                batcherSort32(sub_idx, in_subtile, sub_idx * 64u + 32u);
+                mergeSortRegToSmem32_Tail(sub_idx, in_subtile);
 
-                // Bubble-up insertion into the ascending-depth permutation.
-                priv_depth[cnt] = d;
-                sub_order[subtile_id][cnt] = k;
-                for (int i = cnt; i > 0; --i) {
-                    if (priv_depth[i - 1] > priv_depth[i]) {
-                        float td = priv_depth[i];
-                        priv_depth[i]     = priv_depth[i - 1];
-                        priv_depth[i - 1] = td;
-                        uint tk = sub_order[subtile_id][i];
-                        sub_order[subtile_id][i]     = sub_order[subtile_id][i - 1];
-                        sub_order[subtile_id][i - 1] = tk;
-                    } else {
-                        break;
+                // Count valid entries in sorted TAIL (entries with depth <
+                // FLT_MAX / gid != -1 sit at the front).
+                // Each subtile's thread 0 (in_subtile==0) does the scan and
+                // writes to s_tail_count[sub_idx]; others wait for barrier.
+                if (in_subtile == 0u) {
+                    uint cnt = 0u;
+                    for (uint s = 0u; s < 64u; ++s) {
+                        if (s_tail_idx[sub_idx * 64u + s] != -1) {
+                            cnt = s + 1u;
+                        }
+                    }
+                    s_tail_count[sub_idx] = cnt;
+                }
+                barrier();
+
+                // CUDA copy-branch artifact (hierarchical_render.cuh:987-1005):
+                // When old TAIL was empty, CUDA copies the 32 new (sorted at
+                // slots [32..63]) down to [0..31] WITHOUT clearing [32..63].
+                // Result: snapshot shows 32 valid entries duplicated across
+                // [0..31] and [32..63]. Reproduce that on the VK side when
+                // pre_tc == 0 so the trace matches byte-for-byte.
+                if (pre_tc == 0u) {
+                    for (uint i = 0u; i < 2u; ++i) {
+                        uint src = in_subtile + i * 16u;             // 0..31
+                        uint dst = 32u + in_subtile + i * 16u;        // 32..63
+                        s_tail_depth[sub_idx * 64u + dst] = s_tail_depth[sub_idx * 64u + src];
+                        s_tail_idx  [sub_idx * 64u + dst] = s_tail_idx  [sub_idx * 64u + src];
                     }
                 }
-                cnt += 1;
-            }
-            sub_count[subtile_id] = cnt;
-        }
-        barrier();
+                barrier();
 
-        // 3. Each pixel streams the sub-tile-sorted batch into HEAD.
-        if (!pixel_done) {
-            int tsz = sub_count[subtile_id];
+                int k_slot = slot_lookup[tile_id];
+
+                // ---- Overflow drain: TAIL -> MID (CUDA's paired two-round)
+                // CUDA (hierarchical_render.cuh:1008-1027) iterates over
+                // halfwarp pairs (half=0 drains y_even subtile → 3-iter
+                // shift; half=1 drains y_odd subtile → 2-iter shift). The
+                // NET effect on the (y_even, z) TAIL specifically — seen
+                // in the shifted state — is that slots [16..63] all end up
+                // holding the back-16 of the original sorted-64, because
+                // the double shift (3+2 total iters) cumulatively drags
+                // the back-16 down over slots [16..47] while slots [48..63]
+                // stay untouched. Snapshot then captures this post-double-
+                // shift state.
+                //
+                // VK port: each subtile (independent of CUDA's warp pairing)
+                // runs a full two-round drain whenever `count > 32`. Round
+                // 1 drains the front 16 to MID (emits 1 MID snapshot) and
+                // runs the 3-iter shift. Round 2 drains the next 16 to MID
+                // (emits another MID snapshot) and runs the 2-iter shift.
+                // The 3+2 iteration counts replicate CUDA's cumulative
+                // shift pattern so the snapshot layout matches byte-for-
+                // byte (slots [16..47] all equal original [48..63], same
+                // as [48..63]).
+                for (uint drain_round = 0u; drain_round < 2u; ++drain_round) {
+                    uint tc = s_tail_count[sub_idx];
+                    bool my_drain = (tc > 32u);
+
+                    // Block-wide any-overflow flag.
+                    if (local_idx == 0u) {
+                        s_trace_mid_slot = 0;  // 0 = no overflow
+                    }
+                    barrier();
+                    if (my_drain && in_subtile == 0u) {
+                        atomicMax(s_trace_mid_slot, 1);
+                    }
+                    barrier();
+                    bool any_drain = (s_trace_mid_slot != 0);
+
+                    if (any_drain) {
+                        uint mid_base = sub_idx * 32u + quad * 8u;
+
+                        // ---- CUDA pushPullThroughMid (MidSortWindow=8) ----
+                        // 4 sequential mid sub-iters; each pushes 1 entry
+                        // per head_group thread (= 4 entries per quadrant).
+                        // Reference: hierarchical_render.cuh:619-770.
+                        //
+                        // For each mid in [0..3]:
+                        //   1. Pick tail entry tid = 4*mid + rank_hg (CUDA
+                        //      line 627). The tail slot is the same for all
+                        //      4 quadrants of this halfwarp; depth is then
+                        //      RECOMPUTED at the per-quadrant pixpos.
+                        //   2. shflSortLocal2Shared<4>: sort the 4 register
+                        //      entries among themselves; write to mid[0..3].
+                        //   3. If mid != 0 OR previous mid_count > 0:
+                        //        - mergeSortRegToSmem<4>: merge mid[4..7]
+                        //          (back-4, sorted from prev iter) + mid[0..3]
+                        //          (regs, sorted) → mid[0..7] (sorted).
+                        //        - front4OneFromMid: drain mid[0..3] into
+                        //          per-pixel HEAD k-buffer.
+                        //        - Compact mid[4..7] → mid[0..3]; clear [4..7].
+                        //      Else:
+                        //        - Write regs to mid[4..7]; mid_count=4.
+                        for (uint mid_iter = 0u; mid_iter < 4u; ++mid_iter) {
+                            // (1) Pick tail entry — same slot for all quads.
+                            uint tail_slot = 4u * mid_iter + rank_hg;
+                            int  ti_raw    = my_drain
+                                           ? s_tail_idx  [sub_idx * 64u + tail_slot]
+                                           : -1;
+                            // Depth recomputed at THIS QUADRANT's pixpos.
+                            float td_q = depthAtQuadGlobal(ti_raw, quad_cx, quad_cy);
+
+                            // (2) Local sort 4 register entries → mid[0..3].
+                            // shflSortLocal2Shared<4>: stable rank-count.
+                            // Write our (td_q, ti_raw) into per-quadrant scratch
+                            // and rank-count via shared mem reads.
+                            uint scratch_base = sub_idx * 16u + quad * 4u;
+                            s_push_d[scratch_base + rank_hg] = td_q;
+                            s_push_i[scratch_base + rank_hg] = ti_raw;
+                            barrier();
+                            // Rank-count: how many entries are strictly less
+                            // (or equal-and-lower-rank) than mine? Matches
+                            // shflRankingLocal<4> tie-break (stopthepop_common
+                            // .cuh / hierarchical_render.cuh:130-146).
+                            int my_rank = 0;
+                            for (uint r = 0u; r < 4u; ++r) {
+                                if (r == rank_hg) continue;
+                                float od = s_push_d[scratch_base + r];
+                                if (od < td_q || (od == td_q && r < rank_hg)) {
+                                    my_rank += 1;
+                                }
+                            }
+                            barrier();
+                            // Each thread writes to its sorted position in
+                            // mid[0..3]. Note: mid[0..3] is unconditionally
+                            // overwritten here (matching CUDA shflSortLocal
+                            // 2Shared, line 671-673). Gated by my_drain so
+                            // non-draining subtiles' MID is untouched.
+                            if (my_drain) {
+                                s_mid_depth[mid_base + uint(my_rank)] = td_q;
+                                s_mid_idx  [mid_base + uint(my_rank)] = ti_raw;
+                            }
+                            barrier();
+
+                            // (3) Read pre-iter mid_count; decide branch.
+                            uint pre_qc = s_mid_count[sub_idx * 4u + quad];
+                            bool do_merge = (mid_iter != 0u) || (pre_qc > 0u);
+
+                            if (do_merge) {
+                                // mergeSortRegToSmem<4>: stable merge of two
+                                // sorted-4 sequences. A = mid[4..7] (back-4
+                                // from prior iter), B = mid[0..3] (just
+                                // written). Output 8 sorted into mid[0..7].
+                                // Tie-break: A wins (matches CUDA's `<=`
+                                // first-search / `<` second-search; see
+                                // hierarchical_render.cuh:25-70).
+                                // Done serially by rank_hg==0 of each
+                                // quadrant; others wait at barrier.
+                                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                                int   ia0 = 0, ia1 = 0, ia2 = 0, ia3 = 0;
+                                float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+                                int   ib0 = 0, ib1 = 0, ib2 = 0, ib3 = 0;
+                                if (my_drain && rank_hg == 0u) {
+                                    a0 = s_mid_depth[mid_base + 4u]; ia0 = s_mid_idx[mid_base + 4u];
+                                    a1 = s_mid_depth[mid_base + 5u]; ia1 = s_mid_idx[mid_base + 5u];
+                                    a2 = s_mid_depth[mid_base + 6u]; ia2 = s_mid_idx[mid_base + 6u];
+                                    a3 = s_mid_depth[mid_base + 7u]; ia3 = s_mid_idx[mid_base + 7u];
+                                    b0 = s_mid_depth[mid_base + 0u]; ib0 = s_mid_idx[mid_base + 0u];
+                                    b1 = s_mid_depth[mid_base + 1u]; ib1 = s_mid_idx[mid_base + 1u];
+                                    b2 = s_mid_depth[mid_base + 2u]; ib2 = s_mid_idx[mid_base + 2u];
+                                    b3 = s_mid_depth[mid_base + 3u]; ib3 = s_mid_idx[mid_base + 3u];
+                                }
+                                barrier();
+                                if (my_drain && rank_hg == 0u) {
+                                    // Walk A and B ascending; on tie A wins.
+                                    float av[4] = float[4](a0, a1, a2, a3);
+                                    int   ai[4] = int[4](ia0, ia1, ia2, ia3);
+                                    float bv[4] = float[4](b0, b1, b2, b3);
+                                    int   bi[4] = int[4](ib0, ib1, ib2, ib3);
+                                    int ia_p = 0, ib_p = 0;
+                                    for (int o = 0; o < 8; ++o) {
+                                        bool take_a;
+                                        if (ia_p >= 4) take_a = false;
+                                        else if (ib_p >= 4) take_a = true;
+                                        else take_a = (av[ia_p] <= bv[ib_p]);
+                                        if (take_a) {
+                                            s_mid_depth[mid_base + uint(o)] = av[ia_p];
+                                            s_mid_idx  [mid_base + uint(o)] = ai[ia_p];
+                                            ia_p += 1;
+                                        } else {
+                                            s_mid_depth[mid_base + uint(o)] = bv[ib_p];
+                                            s_mid_idx  [mid_base + uint(o)] = bi[ib_p];
+                                            ib_p += 1;
+                                        }
+                                    }
+                                }
+                                barrier();
+
+                                // mid_count temporarily +4 (push) then -4
+                                // (front4) → unchanged. But we need it to be
+                                // valid for any per-iter logic below.
+                                // (4) front4OneFromMid: per-pixel HEAD pull
+                                // reading mid[0..3]. Fires unconditionally
+                                // here since CUDA mid != 0 path always fires
+                                // front4 (line 707). For mid == 0 with
+                                // pre_qc > 0, also fires (line 689 condition).
+                                if (my_drain && !pixel_done) {
+                                    float fpx_h = float(pixel_x);
+                                    float fpy_h = float(pixel_y);
+                                    int   k_slot_h = k_slot;
+                                    uint  pix_in_tile_h = gl_LocalInvocationID.y * 16u
+                                                        + gl_LocalInvocationID.x;
+                                    for (uint inner_h = 0u; inner_h < 4u; ++inner_h) {
+                                        int gid_h = s_mid_idx[mid_base + inner_h];
+                                        if (gid_h < 0) continue;
+                                        float plane_x_h[4], plane_y_h[4];
+                                        for (int j = 0; j < 4; ++j) {
+                                            plane_x_h[j] = gauss2screen[uint(gid_h) * 16u + 0u * 4u + uint(j)]
+                                                         - gauss2screen[uint(gid_h) * 16u + 3u * 4u + uint(j)] * fpx_h;
+                                            plane_y_h[j] = gauss2screen[uint(gid_h) * 16u + 1u * 4u + uint(j)]
+                                                         - gauss2screen[uint(gid_h) * 16u + 3u * 4u + uint(j)] * fpy_h;
+                                        }
+                                        float dx_h = plane_x_h[1]*plane_y_h[2] - plane_x_h[2]*plane_y_h[1];
+                                        float dy_h = plane_x_h[2]*plane_y_h[0] - plane_x_h[0]*plane_y_h[2];
+                                        float dz_h = plane_x_h[0]*plane_y_h[1] - plane_x_h[1]*plane_y_h[0];
+                                        float mxh_ = plane_x_h[3]*plane_y_h[0] - plane_x_h[0]*plane_y_h[3];
+                                        float myh_ = plane_x_h[3]*plane_y_h[1] - plane_x_h[1]*plane_y_h[3];
+                                        float mzh_ = plane_x_h[3]*plane_y_h[2] - plane_x_h[2]*plane_y_h[3];
+                                        float dd_h = dx_h*dx_h + dy_h*dy_h + dz_h*dz_h;
+                                        if (dd_h < 1e-8) continue;
+                                        float mpx_h = mxh_/dd_h, mpy_h = myh_/dd_h, mpz_h = mzh_/dd_h;
+                                        float mp_h[4];
+                                        mp_h[0] = dy_h*mpz_h - dz_h*mpy_h;
+                                        mp_h[1] = dz_h*mpx_h - dx_h*mpz_h;
+                                        mp_h[2] = dx_h*mpy_h - dy_h*mpx_h;
+                                        mp_h[3] = 1.0;
+                                        float power_hh = -0.5 * (mxh_*mpx_h + myh_*mpy_h + mzh_*mpz_h);
+                                        if (power_hh > 0.0) continue;
+                                        float w_ndc_hh = 0.0, z_ndc_hh = 0.0;
+                                        for (int j = 0; j < 4; ++j) {
+                                            w_ndc_hh += gauss2screen[uint(gid_h) * 16u + 3u * 4u + uint(j)] * mp_h[j];
+                                            z_ndc_hh += gauss2screen[uint(gid_h) * 16u + 2u * 4u + uint(j)] * mp_h[j];
+                                        }
+                                        float depth_hh = (abs(w_ndc_hh) > 1e-6)
+                                                       ? (z_ndc_hh / w_ndc_hh) : z_ndc_hh;
+                                        if (depth_hh < -1.0 || depth_hh > 1.0) continue;
+                                        float opa_hh   = conic_opacity[uint(gid_h) * 4u + 3u];
+                                        float G_hh     = exp(power_hh);
+                                        float alpha_hh = min(0.99, opa_hh * G_hh);
+                                        if (alpha_hh < ALPHA_THRESHOLD) continue;
+                                        float r_hh = rgb[uint(gid_h) * 3u + 0u];
+                                        float g_hh = rgb[uint(gid_h) * 3u + 1u];
+                                        float b_hh = rgb[uint(gid_h) * 3u + 2u];
+                                        if (head_count == HEAD_W) {
+                                            float T_before_h = T;
+                                            float a0_h = head_alphas[0];
+                                            if (k_slot_h >= 0 && head_blend_cur < 4096u) {
+                                                uint base_hb_ = (uint(k_slot_h) * 256u + pix_in_tile_h)
+                                                              * 4096u + head_blend_cur;
+                                                head_blend_depth[base_hb_] = head_depths[0];
+                                                head_blend_alpha[base_hb_] = a0_h;
+                                                head_blend_T    [base_hb_] = T_before_h;
+                                                head_blend_gid  [base_hb_] = head_ids[0];
+                                            }
+                                            head_blend_cur += 1u;
+                                            C.r += head_color_r[0] * a0_h * T_before_h;
+                                            C.g += head_color_g[0] * a0_h * T_before_h;
+                                            C.b += head_color_b[0] * a0_h * T_before_h;
+                                            T = T_before_h * (1.0 - a0_h);
+                                            n += 1u;
+                                            for (int i = 1; i < HEAD_W; ++i) {
+                                                head_depths [i-1] = head_depths [i];
+                                                head_ids    [i-1] = head_ids    [i];
+                                                head_alphas [i-1] = head_alphas [i];
+                                                head_color_r[i-1] = head_color_r[i];
+                                                head_color_g[i-1] = head_color_g[i];
+                                                head_color_b[i-1] = head_color_b[i];
+                                            }
+                                            head_depths [HEAD_W-1] = 3.402823e38;
+                                            head_ids    [HEAD_W-1] = -1;
+                                            head_count -= 1;
+                                            if (T < T_MIN) { pixel_done = true; }
+                                        }
+                                        if (pixel_done) break;
+                                        if (k_slot_h >= 0 && head_ins_cur < 4096u) {
+                                            uint base_hi_ = (uint(k_slot_h) * 256u + pix_in_tile_h)
+                                                          * 4096u + head_ins_cur;
+                                            head_ins_depth[base_hi_] = depth_hh;
+                                            head_ins_alpha[base_hi_] = alpha_hh;
+                                            head_ins_gid  [base_hi_] = gid_h;
+                                        }
+                                        head_ins_cur += 1u;
+                                        {
+                                            float id_h = depth_hh, ia_h = alpha_hh;
+                                            int   ig_h = gid_h;
+                                            float ir_h = r_hh, igc_h = g_hh, ibc_h = b_hh;
+                                            for (int i = 0; i < HEAD_W; ++i) {
+                                                if (id_h < head_depths[i]) {
+                                                    float td_ = head_depths[i];  head_depths[i]  = id_h;  id_h  = td_;
+                                                    int   tg_ = head_ids[i];     head_ids[i]     = ig_h;  ig_h  = tg_;
+                                                    float ta_ = head_alphas[i];  head_alphas[i]  = ia_h;  ia_h  = ta_;
+                                                    float tr_ = head_color_r[i]; head_color_r[i] = ir_h;  ir_h  = tr_;
+                                                    float tg2_ = head_color_g[i]; head_color_g[i] = igc_h; igc_h = tg2_;
+                                                    float tb_ = head_color_b[i]; head_color_b[i] = ibc_h; ibc_h = tb_;
+                                                }
+                                            }
+                                            head_count = min(head_count + 1, HEAD_W);
+                                        }
+                                    } // inner_h
+                                } // !pixel_done
+                                barrier();
+
+                                // CUDA does NOT compact post-front4: mid[0..7]
+                                // retain the merged 8 sorted values; the
+                                // front-4 is "logically consumed" but the
+                                // memory keeps them. Next iter's shflSort
+                                // Local2Shared overwrites mid[0..3] with the
+                                // new register entries. mergeSortRegToSmem
+                                // then sources back-4 from mid[4..7] only.
+                                // Snapshot at end of pushPullThroughMid sees
+                                // all 8 sorted entries; MID compare in test
+                                // accepts that.
+                                if (my_drain && rank_hg == 0u) {
+                                    s_mid_count[sub_idx * 4u + quad] = 4u;
+                                }
+                            } else {
+                                // First push with empty MID: write regs to
+                                // mid[4..7] (CUDA line 712-713). CUDA leaves
+                                // mid[0..3] holding the just-shfl-sorted regs
+                                // (which are identical to what we put in
+                                // mid[4..7]); they will be overwritten by the
+                                // next iter's shflSortLocal2Shared and not
+                                // participate in any read prior. Match that.
+                                float prom_d = my_drain
+                                             ? s_mid_depth[mid_base + rank_hg]
+                                             : 0.0;
+                                int   prom_i = my_drain
+                                             ? s_mid_idx  [mid_base + rank_hg]
+                                             : -1;
+                                barrier();
+                                if (my_drain) {
+                                    s_mid_depth[mid_base + 4u + rank_hg] = prom_d;
+                                    s_mid_idx  [mid_base + 4u + rank_hg] = prom_i;
+                                    // Note: do NOT clear [0..3]; CUDA keeps
+                                    // them with the same sorted values.
+                                }
+                                barrier();
+                                if (my_drain && rank_hg == 0u) {
+                                    s_mid_count[sub_idx * 4u + quad] = 4u;
+                                }
+                            }
+                            barrier();
+                        } // mid_iter loop
+
+                        // ---- Post-pushPullThroughMid: TAIL shift -----------
+                        // CUDA line 769: fill_counters -= 16 * FillTailOne
+                        // (i.e., consumed 16 tail entries). Plus the paired
+                        // halfwarp-stride shift to compact remaining tail.
+                        uint shift_iters = (drain_round == 0u) ? 3u : 2u;
+                        if (my_drain) {
+                            for (uint i = 0u; i < shift_iters; ++i) {
+                                uint src = 16u + in_subtile + i * 16u;
+                                uint dst = in_subtile + i * 16u;
+                                s_tail_depth[sub_idx * 64u + dst] = s_tail_depth[sub_idx * 64u + src];
+                                s_tail_idx  [sub_idx * 64u + dst] = s_tail_idx  [sub_idx * 64u + src];
+                            }
+                        }
+                        barrier();
+
+                        if (my_drain && in_subtile == 0u) {
+                            s_tail_count[sub_idx] = s_tail_count[sub_idx] - 16u;
+                        }
+                        barrier();
+
+                        // Part E: MID trace snapshot (block-wide) for each
+                        // round that actually drained.
+                        if (k_slot >= 0) {
+                            if (local_idx == 0u) {
+                                s_trace_mid_slot = int(atomicAdd(mid_wcur[k_slot], 1u));
+                            }
+                            barrier();
+                            int ms = s_trace_mid_slot;
+                            if (ms >= 0 && ms < 1024) {
+                                uint w_base = (((uint(k_slot) * 1024u + uint(ms)) * 16u
+                                              + sub_idx) * 4u + quad) * 8u;
+                                for (uint i = 0u; i < 2u; ++i) {
+                                    uint s = rank_hg + i * 4u;
+                                    mid_depths[w_base + s] = s_mid_depth[sub_idx * 32u + quad * 8u + s];
+                                    mid_ids   [w_base + s] = s_mid_idx  [sub_idx * 32u + quad * 8u + s];
+                                }
+                            }
+                        }
+                        barrier();
+
+                    }
+                    // end of any_drain block within this drain_round
+                }
+                // end drain_round loop
+
+                // ---- TAIL trace snapshot emission (AFTER drain) ---------
+                // Matches CUDA cadence (hierarchical_render.cuh:1029-1044):
+                // snapshot is emitted at the end of the outer iteration,
+                // after sort+merge+(optional drain+shift). Captures the
+                // shifted TAIL including stale duplicates at slots [48..63]
+                // if a drain occurred this step.
+                if (k_slot >= 0 && this_inner_active) {
+                    if (local_idx == 0u) {
+                        s_trace_tail_slot = int(atomicAdd(tail_wcur[k_slot], 1u));
+                    }
+                    barrier();
+                    int t = s_trace_tail_slot;
+                    if (t >= 0 && t < 512) {
+                        uint write_base = ((uint(k_slot) * 512u + uint(t)) * 16u
+                                          + sub_idx) * 64u;
+                        // Each of 16 subtile-threads writes 4 slots strided
+                        // by 16 — matches cascade_trace.h:141-163 exactly.
+                        for (uint i = 0u; i < 4u; ++i) {
+                            uint s = in_subtile + i * 16u;
+                            tail_depths[write_base + s] = s_tail_depth[sub_idx * 64u + s];
+                            tail_ids   [write_base + s] = s_tail_idx  [sub_idx * 64u + s];
+                        }
+                    }
+                }
+                barrier();
+            }
+            // end inner-trip loop
+        }
+
+        // ---- Milestone D+E: HEAD state machine (per-pixel) ----------------
+        // HEAD pull is now invoked INSIDE the drain_round loop above,
+        // matching CUDA's `front4OneFromMid` call from inside
+        // `pushPullThroughMid`. MID state persists across batches (CUDA
+        // does NOT reset MID at outer-batch boundaries). End-of-range
+        // flush below drains residual TAIL→MID→HEAD.
+
+        // Non-traced fallback: master pre-cascade per-pixel walk over
+        // `sub_order_fb` (sub-tile-sorted permutation). Wider HEAD k-buffer
+        // (FB_HEAD_W=8) reproduces master's 54.3 dB PSNR baseline. Uses local
+        // fb_kbuf_* state, disjoint from cascade head_*. Y1: also runs when
+        // spec_sort_mode == GLOBAL (the FB path IS the GLOBAL path).
+        if ((spec_sort_mode == 0u || spec_trace_enabled == 0u) && !pixel_done) {
+            int tsz = int(s_tail_count[sub_idx]);  // overlay: sub_count_fb
             float fpx = float(pixel_x);
             float fpy = float(pixel_y);
-
             for (int t = 0; t < tsz; ++t) {
-                uint k = sub_order[subtile_id][t];
+                uint k = subOrderRead(sub_idx, t);
 
                 float plane_x[4], plane_y[4];
-                for (int j = 0; j < 4; j++) {
-                    plane_x[j] = s_g2s[k * 16u + uint(j)]      - s_g2s[k * 16u + 12u + uint(j)] * fpx;
-                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)] - s_g2s[k * 16u + 12u + uint(j)] * fpy;
-                }
-
+                buildRayPlanes(k, fpx, fpy, plane_x, plane_y);
                 float max_pos[4];
                 float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
                 if (power > 0.0) continue;
@@ -374,69 +1437,513 @@ void main() {
 
                 float w_ndc = 0.0, z_ndc = 0.0;
                 for (int j = 0; j < 4; j++) {
-                    w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
-                    z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                    w_ndc += s_g2s[k*16u + 12u + uint(j)] * max_pos[j];
+                    z_ndc += s_g2s[k*16u + 8u  + uint(j)] * max_pos[j];
                 }
                 if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
-                // Per-pixel depth for HEAD k-buffer.
-                // Use z_ndc + 8.0 (same +8 bias as scatter.comp; w_ndc is ~ constant per tile,
-                // so z_ndc alone gives correct relative ordering within a tile's pre-sorted list).
                 float sort_depth = z_ndc;
 
                 // HEAD overflow: blend shallowest entry, pop.
-                if (kbuf_size == HEAD_W) {
-                    float a0 = kbuf_alpha[0];
+                if (fb_kbuf_size == FB_HEAD_W) {
+                    float a0 = fb_kbuf_alpha[0];
                     float test_T0 = T * (1.0 - a0);
                     if (test_T0 < T_MIN) { pixel_done = true; break; }
-                    C.r += kbuf_r[0] * a0 * T;
-                    C.g += kbuf_g[0] * a0 * T;
-                    C.b += kbuf_b[0] * a0 * T;
+                    C.r += fb_kbuf_r[0] * a0 * T;
+                    C.g += fb_kbuf_g[0] * a0 * T;
+                    C.b += fb_kbuf_b[0] * a0 * T;
                     T = test_T0; n += 1u;
-                    for (int i = 1; i < HEAD_W; i++) {
-                        kbuf_depth[i-1] = kbuf_depth[i]; kbuf_alpha[i-1] = kbuf_alpha[i];
-                        kbuf_r[i-1] = kbuf_r[i]; kbuf_g[i-1] = kbuf_g[i]; kbuf_b[i-1] = kbuf_b[i];
+                    for (int i = 1; i < FB_HEAD_W; i++) {
+                        fb_kbuf_depth[i-1] = fb_kbuf_depth[i]; fb_kbuf_alpha[i-1] = fb_kbuf_alpha[i];
+                        fb_kbuf_r[i-1] = fb_kbuf_r[i]; fb_kbuf_g[i-1] = fb_kbuf_g[i]; fb_kbuf_b[i-1] = fb_kbuf_b[i];
                     }
-                    kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+                    fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
                 }
-
                 if (pixel_done) break;
 
                 // Insertion-sort into HEAD (ascending per-pixel depth).
                 float id = sort_depth, ia = alpha;
                 float ir = s_rgb_r[k], ig = s_rgb_g[k], ib = s_rgb_b[k];
-                for (int i = 0; i < HEAD_W; i++) {
-                    if (id < kbuf_depth[i]) {
-                        float td = kbuf_depth[i]; kbuf_depth[i] = id; id = td;
-                        float ta = kbuf_alpha[i]; kbuf_alpha[i] = ia; ia = ta;
-                        float tr = kbuf_r[i]; kbuf_r[i] = ir; ir = tr;
-                        float tg = kbuf_g[i]; kbuf_g[i] = ig; ig = tg;
-                        float tb = kbuf_b[i]; kbuf_b[i] = ib; ib = tb;
+                for (int i = 0; i < FB_HEAD_W; i++) {
+                    if (id < fb_kbuf_depth[i]) {
+                        float td = fb_kbuf_depth[i]; fb_kbuf_depth[i] = id; id = td;
+                        float ta = fb_kbuf_alpha[i]; fb_kbuf_alpha[i] = ia; ia = ta;
+                        float tr = fb_kbuf_r[i]; fb_kbuf_r[i] = ir; ir = tr;
+                        float tg = fb_kbuf_g[i]; fb_kbuf_g[i] = ig; ig = tg;
+                        float tb = fb_kbuf_b[i]; fb_kbuf_b[i] = ib; ib = tb;
                     }
                 }
-                kbuf_size += 1;
+                fb_kbuf_size += 1;
             }
         }
         barrier();
     }
 
-    // Flush remaining HEAD entries.
-    if (!pixel_done) {
-        for (int i = 0; i < HEAD_W; i++) {
-            if (kbuf_size <= 0) break;
-            float a0 = kbuf_alpha[0];
+    // ---- End-of-range flush (CUDA hierarchical_render.cuh:1054-1078) ------
+    // Three-phase port:
+    //   Phase 1: Drain residual TAIL → MID (two rounds, mirroring CUDA's
+    //            two pushPullThroughMid(true) calls per warp). Each round
+    //            pushes 4 per quadrant into MID and triggers HEAD pull
+    //            on overflow (post-push count > 4).
+    //   Phase 2: Drain remaining MID → HEAD via front4-style pulls,
+    //            looping until MID is empty for this pixel's quadrant.
+    //   Phase 3: Blend remaining HEAD entries.
+    int k_slot_final = slot_lookup[tile_id];
+    uint pix_in_tile_final = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
+
+    // Phase 1: residual TAIL → MID with HEAD overflow pull.
+    // Mirror the in-loop drain_round structure but checkvalid=true: the
+    // residual tail may include sentinel (-1, FLT_MAX) entries, which we
+    // pass through (they sort to the back and a -1 gid will be culled by
+    // the per-pixel HEAD pull's `if (gid < 0) continue;`).
+    if (spec_trace_enabled == 1u) {
+        for (uint flush_round = 0u; flush_round < 2u; ++flush_round) {
+            uint tc = s_tail_count[sub_idx];
+            bool my_drain_f = (tc > 0u);
+            bool any_tail = false;
+            // workgroup-uniform any-residual-tail flag.
+            if (local_idx == 0u) {
+                s_trace_mid_slot = 0;
+            }
+            barrier();
+            if (my_drain_f && in_subtile == 0u) {
+                atomicMax(s_trace_mid_slot, 1);
+            }
+            barrier();
+            any_tail = (s_trace_mid_slot != 0);
+            if (!any_tail) break;
+
+            // ---- Mirror in-loop pushPullThroughMid 4-mid-iter cadence ----
+            // Same algorithm as the in-loop drain, with checkvalid=true
+            // (residual tail entries with gid == -1 are pushed as sentinels;
+            // depthAtQuadGlobal returns FLT_MAX so they sort to the back).
+            uint mid_base_f = sub_idx * 32u + quad * 8u;
+            for (uint mid_iter = 0u; mid_iter < 4u; ++mid_iter) {
+                uint tail_slot_ff = 4u * mid_iter + rank_hg;
+                int  ti_raw_f     = my_drain_f
+                                  ? s_tail_idx  [sub_idx * 64u + tail_slot_ff]
+                                  : -1;
+                float td_qf = depthAtQuadGlobal(ti_raw_f, quad_cx, quad_cy);
+
+                uint scratch_base_f = sub_idx * 16u + quad * 4u;
+                s_push_d[scratch_base_f + rank_hg] = td_qf;
+                s_push_i[scratch_base_f + rank_hg] = ti_raw_f;
+                barrier();
+                int my_rank_f = 0;
+                for (uint r = 0u; r < 4u; ++r) {
+                    if (r == rank_hg) continue;
+                    float od = s_push_d[scratch_base_f + r];
+                    if (od < td_qf || (od == td_qf && r < rank_hg)) {
+                        my_rank_f += 1;
+                    }
+                }
+                barrier();
+                if (my_drain_f) {
+                    s_mid_depth[mid_base_f + uint(my_rank_f)] = td_qf;
+                    s_mid_idx  [mid_base_f + uint(my_rank_f)] = ti_raw_f;
+                }
+                barrier();
+
+                uint pre_qcf = s_mid_count[sub_idx * 4u + quad];
+                bool do_merge_f = (mid_iter != 0u) || (pre_qcf > 0u);
+
+                if (do_merge_f) {
+                    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                    int   ia0 = 0, ia1 = 0, ia2 = 0, ia3 = 0;
+                    float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+                    int   ib0 = 0, ib1 = 0, ib2 = 0, ib3 = 0;
+                    if (my_drain_f && rank_hg == 0u) {
+                        a0 = s_mid_depth[mid_base_f + 4u]; ia0 = s_mid_idx[mid_base_f + 4u];
+                        a1 = s_mid_depth[mid_base_f + 5u]; ia1 = s_mid_idx[mid_base_f + 5u];
+                        a2 = s_mid_depth[mid_base_f + 6u]; ia2 = s_mid_idx[mid_base_f + 6u];
+                        a3 = s_mid_depth[mid_base_f + 7u]; ia3 = s_mid_idx[mid_base_f + 7u];
+                        b0 = s_mid_depth[mid_base_f + 0u]; ib0 = s_mid_idx[mid_base_f + 0u];
+                        b1 = s_mid_depth[mid_base_f + 1u]; ib1 = s_mid_idx[mid_base_f + 1u];
+                        b2 = s_mid_depth[mid_base_f + 2u]; ib2 = s_mid_idx[mid_base_f + 2u];
+                        b3 = s_mid_depth[mid_base_f + 3u]; ib3 = s_mid_idx[mid_base_f + 3u];
+                    }
+                    barrier();
+                    if (my_drain_f && rank_hg == 0u) {
+                        float av[4] = float[4](a0, a1, a2, a3);
+                        int   ai[4] = int[4](ia0, ia1, ia2, ia3);
+                        float bv[4] = float[4](b0, b1, b2, b3);
+                        int   bi[4] = int[4](ib0, ib1, ib2, ib3);
+                        int ia_p = 0, ib_p = 0;
+                        for (int o = 0; o < 8; ++o) {
+                            bool take_a;
+                            if (ia_p >= 4) take_a = false;
+                            else if (ib_p >= 4) take_a = true;
+                            else take_a = (av[ia_p] <= bv[ib_p]);
+                            if (take_a) {
+                                s_mid_depth[mid_base_f + uint(o)] = av[ia_p];
+                                s_mid_idx  [mid_base_f + uint(o)] = ai[ia_p];
+                                ia_p += 1;
+                            } else {
+                                s_mid_depth[mid_base_f + uint(o)] = bv[ib_p];
+                                s_mid_idx  [mid_base_f + uint(o)] = bi[ib_p];
+                                ib_p += 1;
+                            }
+                        }
+                    }
+                    barrier();
+
+                    if (my_drain_f && !pixel_done) {
+                        float fpx_f = float(pixel_x);
+                        float fpy_f = float(pixel_y);
+                        for (uint inner_f = 0u; inner_f < 4u; ++inner_f) {
+                            int gid_f = s_mid_idx[mid_base_f + inner_f];
+                            if (gid_f < 0) continue;
+                            float plane_x_f[4], plane_y_f[4];
+                            for (int j = 0; j < 4; ++j) {
+                                plane_x_f[j] = gauss2screen[uint(gid_f) * 16u + 0u * 4u + uint(j)]
+                                             - gauss2screen[uint(gid_f) * 16u + 3u * 4u + uint(j)] * fpx_f;
+                                plane_y_f[j] = gauss2screen[uint(gid_f) * 16u + 1u * 4u + uint(j)]
+                                             - gauss2screen[uint(gid_f) * 16u + 3u * 4u + uint(j)] * fpy_f;
+                            }
+                            float dxf_ = plane_x_f[1]*plane_y_f[2] - plane_x_f[2]*plane_y_f[1];
+                            float dyf_ = plane_x_f[2]*plane_y_f[0] - plane_x_f[0]*plane_y_f[2];
+                            float dzf_ = plane_x_f[0]*plane_y_f[1] - plane_x_f[1]*plane_y_f[0];
+                            float mxf_ = plane_x_f[3]*plane_y_f[0] - plane_x_f[0]*plane_y_f[3];
+                            float myf_ = plane_x_f[3]*plane_y_f[1] - plane_x_f[1]*plane_y_f[3];
+                            float mzf_ = plane_x_f[3]*plane_y_f[2] - plane_x_f[2]*plane_y_f[3];
+                            float ddf_ = dxf_*dxf_ + dyf_*dyf_ + dzf_*dzf_;
+                            if (ddf_ < 1e-8) continue;
+                            float mpxf = mxf_/ddf_, mpyf = myf_/ddf_, mpzf = mzf_/ddf_;
+                            float mp_f[4];
+                            mp_f[0] = dyf_*mpzf - dzf_*mpyf;
+                            mp_f[1] = dzf_*mpxf - dxf_*mpzf;
+                            mp_f[2] = dxf_*mpyf - dyf_*mpxf;
+                            mp_f[3] = 1.0;
+                            float power_f = -0.5 * (mxf_*mpxf + myf_*mpyf + mzf_*mpzf);
+                            if (power_f > 0.0) continue;
+                            float wnf = 0.0, znf = 0.0;
+                            for (int j = 0; j < 4; ++j) {
+                                wnf += gauss2screen[uint(gid_f) * 16u + 3u * 4u + uint(j)] * mp_f[j];
+                                znf += gauss2screen[uint(gid_f) * 16u + 2u * 4u + uint(j)] * mp_f[j];
+                            }
+                            float depth_f = (abs(wnf) > 1e-6) ? (znf / wnf) : znf;
+                            if (depth_f < -1.0 || depth_f > 1.0) continue;
+                            float opa_f = conic_opacity[uint(gid_f) * 4u + 3u];
+                            float alpha_f = min(0.99, opa_f * exp(power_f));
+                            if (alpha_f < ALPHA_THRESHOLD) continue;
+                            float r_f = rgb[uint(gid_f) * 3u + 0u];
+                            float g_f = rgb[uint(gid_f) * 3u + 1u];
+                            float b_f = rgb[uint(gid_f) * 3u + 2u];
+                            if (head_count == HEAD_W) {
+                                float Tb_f = T;
+                                float a0f = head_alphas[0];
+                                if (k_slot_final >= 0 && head_blend_cur < 4096u) {
+                                    uint bhb = (uint(k_slot_final) * 256u + pix_in_tile_final)
+                                             * 4096u + head_blend_cur;
+                                    head_blend_depth[bhb] = head_depths[0];
+                                    head_blend_alpha[bhb] = a0f;
+                                    head_blend_T    [bhb] = Tb_f;
+                                    head_blend_gid  [bhb] = head_ids[0];
+                                }
+                                head_blend_cur += 1u;
+                                C.r += head_color_r[0] * a0f * Tb_f;
+                                C.g += head_color_g[0] * a0f * Tb_f;
+                                C.b += head_color_b[0] * a0f * Tb_f;
+                                T = Tb_f * (1.0 - a0f);
+                                n += 1u;
+                                for (int i = 1; i < HEAD_W; ++i) {
+                                    head_depths [i-1] = head_depths [i];
+                                    head_ids    [i-1] = head_ids    [i];
+                                    head_alphas [i-1] = head_alphas [i];
+                                    head_color_r[i-1] = head_color_r[i];
+                                    head_color_g[i-1] = head_color_g[i];
+                                    head_color_b[i-1] = head_color_b[i];
+                                }
+                                head_depths [HEAD_W-1] = 3.402823e38;
+                                head_ids    [HEAD_W-1] = -1;
+                                head_count -= 1;
+                                if (T < T_MIN) { pixel_done = true; }
+                            }
+                            if (pixel_done) break;
+                            if (k_slot_final >= 0 && head_ins_cur < 4096u) {
+                                uint bhi = (uint(k_slot_final) * 256u + pix_in_tile_final)
+                                         * 4096u + head_ins_cur;
+                                head_ins_depth[bhi] = depth_f;
+                                head_ins_alpha[bhi] = alpha_f;
+                                head_ins_gid  [bhi] = gid_f;
+                            }
+                            head_ins_cur += 1u;
+                            {
+                                float idf = depth_f, iaf = alpha_f;
+                                int   igf = gid_f;
+                                float irf = r_f, igcf = g_f, ibcf = b_f;
+                                for (int i = 0; i < HEAD_W; ++i) {
+                                    if (idf < head_depths[i]) {
+                                        float td_ = head_depths[i];  head_depths[i]  = idf;  idf  = td_;
+                                        int   tg_ = head_ids[i];     head_ids[i]     = igf;  igf  = tg_;
+                                        float ta_ = head_alphas[i];  head_alphas[i]  = iaf;  iaf  = ta_;
+                                        float tr_ = head_color_r[i]; head_color_r[i] = irf;  irf  = tr_;
+                                        float tg2_ = head_color_g[i]; head_color_g[i] = igcf; igcf = tg2_;
+                                        float tb_ = head_color_b[i]; head_color_b[i] = ibcf; ibcf = tb_;
+                                    }
+                                }
+                                head_count = min(head_count + 1, HEAD_W);
+                            }
+                        }
+                    }
+                    barrier();
+
+                    if (my_drain_f && rank_hg == 0u) {
+                        s_mid_count[sub_idx * 4u + quad] = 4u;
+                    }
+                } else {
+                    float prom_d = my_drain_f
+                                 ? s_mid_depth[mid_base_f + rank_hg]
+                                 : 0.0;
+                    int   prom_i = my_drain_f
+                                 ? s_mid_idx  [mid_base_f + rank_hg]
+                                 : -1;
+                    barrier();
+                    if (my_drain_f) {
+                        s_mid_depth[mid_base_f + 4u + rank_hg] = prom_d;
+                        s_mid_idx  [mid_base_f + 4u + rank_hg] = prom_i;
+                    }
+                    barrier();
+                    if (my_drain_f && rank_hg == 0u) {
+                        s_mid_count[sub_idx * 4u + quad] = 4u;
+                    }
+                }
+                barrier();
+            } // mid_iter loop
+
+            // Shift TAIL down by 16 (residual → front).
+            if (my_drain_f) {
+                for (uint i = 0u; i < 3u; ++i) {
+                    uint src = 16u + in_subtile + i * 16u;
+                    uint dst = in_subtile + i * 16u;
+                    s_tail_depth[sub_idx * 64u + dst] = s_tail_depth[sub_idx * 64u + src];
+                    s_tail_idx  [sub_idx * 64u + dst] = s_tail_idx  [sub_idx * 64u + src];
+                }
+                uint blank_slot = 48u + in_subtile;
+                s_tail_depth[sub_idx * 64u + blank_slot] = 3.402823e38;
+                s_tail_idx  [sub_idx * 64u + blank_slot] = -1;
+            }
+            barrier();
+            if (my_drain_f && in_subtile == 0u) {
+                s_tail_count[sub_idx] = (tc >= 16u) ? (tc - 16u) : 0u;
+            }
+            barrier();
+        }
+
+        // Phase 2: drain remaining MID → HEAD.
+        // CUDA: while (mid_count != 0) { front4OneFromMid(true); } — for
+        // each call, slots [0..3] are read; after consume, slots [4..7]
+        // are shifted to [0..3]. We loop up to 2 times since MID has at
+        // most 8 entries (two front4 calls drain it).
+        for (uint mid_drain_iter = 0u; mid_drain_iter < 2u; ++mid_drain_iter) {
+            // Workgroup-uniform: any quadrant has data?
+            if (local_idx == 0u) {
+                s_trace_mid_slot = 0;
+            }
+            barrier();
+            if (rank_hg == 0u) {
+                uint qcm = s_mid_count[sub_idx * 4u + quad];
+                if (qcm > 0u) atomicMax(s_trace_mid_slot, 1);
+            }
+            barrier();
+            if (s_trace_mid_slot == 0) break;
+
+            uint mb_m = sub_idx * 32u + quad * 8u;
+            uint qcm_pre = s_mid_count[sub_idx * 4u + quad];
+            bool quad_has = (qcm_pre > 0u);
+
+            if (quad_has && !pixel_done) {
+                float fpx_m = float(pixel_x);
+                float fpy_m = float(pixel_y);
+                for (uint inner_m = 0u; inner_m < 4u; ++inner_m) {
+                    int gid_m = s_mid_idx[mb_m + inner_m];
+                    if (gid_m < 0) continue;
+                    float plane_x_m[4], plane_y_m[4];
+                    for (int j = 0; j < 4; ++j) {
+                        plane_x_m[j] = gauss2screen[uint(gid_m) * 16u + 0u * 4u + uint(j)]
+                                     - gauss2screen[uint(gid_m) * 16u + 3u * 4u + uint(j)] * fpx_m;
+                        plane_y_m[j] = gauss2screen[uint(gid_m) * 16u + 1u * 4u + uint(j)]
+                                     - gauss2screen[uint(gid_m) * 16u + 3u * 4u + uint(j)] * fpy_m;
+                    }
+                    float dxm = plane_x_m[1]*plane_y_m[2] - plane_x_m[2]*plane_y_m[1];
+                    float dym = plane_x_m[2]*plane_y_m[0] - plane_x_m[0]*plane_y_m[2];
+                    float dzm = plane_x_m[0]*plane_y_m[1] - plane_x_m[1]*plane_y_m[0];
+                    float mxm = plane_x_m[3]*plane_y_m[0] - plane_x_m[0]*plane_y_m[3];
+                    float mym = plane_x_m[3]*plane_y_m[1] - plane_x_m[1]*plane_y_m[3];
+                    float mzm = plane_x_m[3]*plane_y_m[2] - plane_x_m[2]*plane_y_m[3];
+                    float ddm = dxm*dxm + dym*dym + dzm*dzm;
+                    if (ddm < 1e-8) continue;
+                    float mpxm = mxm/ddm, mpym = mym/ddm, mpzm = mzm/ddm;
+                    float mp_m[4];
+                    mp_m[0] = dym*mpzm - dzm*mpym;
+                    mp_m[1] = dzm*mpxm - dxm*mpzm;
+                    mp_m[2] = dxm*mpym - dym*mpxm;
+                    mp_m[3] = 1.0;
+                    float power_m = -0.5 * (mxm*mpxm + mym*mpym + mzm*mpzm);
+                    if (power_m > 0.0) continue;
+                    float wnm = 0.0, znm = 0.0;
+                    for (int j = 0; j < 4; ++j) {
+                        wnm += gauss2screen[uint(gid_m) * 16u + 3u * 4u + uint(j)] * mp_m[j];
+                        znm += gauss2screen[uint(gid_m) * 16u + 2u * 4u + uint(j)] * mp_m[j];
+                    }
+                    float depth_m = (abs(wnm) > 1e-6) ? (znm / wnm) : znm;
+                    if (depth_m < -1.0 || depth_m > 1.0) continue;
+                    float opa_m = conic_opacity[uint(gid_m) * 4u + 3u];
+                    float alpha_m = min(0.99, opa_m * exp(power_m));
+                    if (alpha_m < ALPHA_THRESHOLD) continue;
+                    float r_m = rgb[uint(gid_m) * 3u + 0u];
+                    float g_m = rgb[uint(gid_m) * 3u + 1u];
+                    float b_m = rgb[uint(gid_m) * 3u + 2u];
+
+                    if (head_count == HEAD_W) {
+                        float Tb_m = T;
+                        float a0m = head_alphas[0];
+                        if (k_slot_final >= 0 && head_blend_cur < 4096u) {
+                            uint bhb_m = (uint(k_slot_final) * 256u + pix_in_tile_final)
+                                       * 4096u + head_blend_cur;
+                            head_blend_depth[bhb_m] = head_depths[0];
+                            head_blend_alpha[bhb_m] = a0m;
+                            head_blend_T    [bhb_m] = Tb_m;
+                            head_blend_gid  [bhb_m] = head_ids[0];
+                        }
+                        head_blend_cur += 1u;
+                        C.r += head_color_r[0] * a0m * Tb_m;
+                        C.g += head_color_g[0] * a0m * Tb_m;
+                        C.b += head_color_b[0] * a0m * Tb_m;
+                        T = Tb_m * (1.0 - a0m);
+                        n += 1u;
+                        for (int i = 1; i < HEAD_W; ++i) {
+                            head_depths [i-1] = head_depths [i];
+                            head_ids    [i-1] = head_ids    [i];
+                            head_alphas [i-1] = head_alphas [i];
+                            head_color_r[i-1] = head_color_r[i];
+                            head_color_g[i-1] = head_color_g[i];
+                            head_color_b[i-1] = head_color_b[i];
+                        }
+                        head_depths [HEAD_W-1] = 3.402823e38;
+                        head_ids    [HEAD_W-1] = -1;
+                        head_count -= 1;
+                        if (T < T_MIN) { pixel_done = true; }
+                    }
+                    if (pixel_done) break;
+                    if (k_slot_final >= 0 && head_ins_cur < 4096u) {
+                        uint bhi_m = (uint(k_slot_final) * 256u + pix_in_tile_final)
+                                   * 4096u + head_ins_cur;
+                        head_ins_depth[bhi_m] = depth_m;
+                        head_ins_alpha[bhi_m] = alpha_m;
+                        head_ins_gid  [bhi_m] = gid_m;
+                    }
+                    head_ins_cur += 1u;
+                    {
+                        float idm = depth_m, iam = alpha_m;
+                        int   igm = gid_m;
+                        float irm = r_m, igcm = g_m, ibcm = b_m;
+                        for (int i = 0; i < HEAD_W; ++i) {
+                            if (idm < head_depths[i]) {
+                                float td_ = head_depths[i];  head_depths[i]  = idm;  idm  = td_;
+                                int   tg_ = head_ids[i];     head_ids[i]     = igm;  igm  = tg_;
+                                float ta_ = head_alphas[i];  head_alphas[i]  = iam;  iam  = ta_;
+                                float tr_ = head_color_r[i]; head_color_r[i] = irm;  irm  = tr_;
+                                float tg2_ = head_color_g[i]; head_color_g[i] = igcm; igcm = tg2_;
+                                float tb_ = head_color_b[i]; head_color_b[i] = ibcm; ibcm = tb_;
+                            }
+                        }
+                        head_count = min(head_count + 1, HEAD_W);
+                    }
+                }
+            }
+            barrier();
+
+            // Shift MID [4..7] → [0..3] for this quadrant; decrement count.
+            if (quad_has) {
+                uint qb_m = sub_idx * 32u + quad * 8u;
+                float sd_m = s_mid_depth[qb_m + 4u + rank_hg];
+                int   si_m = s_mid_idx  [qb_m + 4u + rank_hg];
+                barrier();
+                s_mid_depth[qb_m + rank_hg] = sd_m;
+                s_mid_idx  [qb_m + rank_hg] = si_m;
+                s_mid_depth[qb_m + 4u + rank_hg] = 3.402823e38;
+                s_mid_idx  [qb_m + 4u + rank_hg] = -1;
+                if (rank_hg == 0u) {
+                    uint qc4 = s_mid_count[sub_idx * 4u + quad];
+                    s_mid_count[sub_idx * 4u + quad] =
+                        (qc4 >= 4u) ? (qc4 - 4u) : 0u;
+                }
+            }
+            barrier();
+        }
+    }
+
+    // Non-trace fallback flush: drain remaining fb_kbuf entries.
+    // Mirrors master rasterize.comp lines 423-440. Early-out on T < T_MIN
+    // (before blending the entry that would trip it) — matches master.
+    // Y1: also runs under spec_sort_mode == GLOBAL.
+    if ((spec_sort_mode == 0u || spec_trace_enabled == 0u) && !pixel_done) {
+        for (int fi = 0; fi < FB_HEAD_W; fi++) {
+            if (fb_kbuf_size <= 0) break;
+            float a0 = fb_kbuf_alpha[0];
             float test_T0 = T * (1.0 - a0);
             if (test_T0 < T_MIN) { pixel_done = true; break; }
-            C.r += kbuf_r[0] * a0 * T;
-            C.g += kbuf_g[0] * a0 * T;
-            C.b += kbuf_b[0] * a0 * T;
+            C.r += fb_kbuf_r[0] * a0 * T;
+            C.g += fb_kbuf_g[0] * a0 * T;
+            C.b += fb_kbuf_b[0] * a0 * T;
             T = test_T0; n += 1u;
-            for (int j = 1; j < HEAD_W; j++) {
-                kbuf_depth[j-1] = kbuf_depth[j]; kbuf_alpha[j-1] = kbuf_alpha[j];
-                kbuf_r[j-1] = kbuf_r[j]; kbuf_g[j-1] = kbuf_g[j]; kbuf_b[j-1] = kbuf_b[j];
+            for (int j = 1; j < FB_HEAD_W; j++) {
+                fb_kbuf_depth[j-1] = fb_kbuf_depth[j]; fb_kbuf_alpha[j-1] = fb_kbuf_alpha[j];
+                fb_kbuf_r[j-1] = fb_kbuf_r[j]; fb_kbuf_g[j-1] = fb_kbuf_g[j]; fb_kbuf_b[j-1] = fb_kbuf_b[j];
             }
-            kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+            fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
         }
+    }
+
+    // Phase 3: blend remaining HEAD.
+    if (!pixel_done) {
+        for (int flush_i = 0; flush_i < HEAD_W; ++flush_i) {
+            if (head_count <= 0) break;
+            float T_before = T;
+            float a0 = head_alphas[0];
+
+            if (spec_trace_enabled == 1u
+                && k_slot_final >= 0
+                && head_blend_cur < 4096u) {
+                uint base_hb = (uint(k_slot_final) * 256u + pix_in_tile_final)
+                             * 4096u + head_blend_cur;
+                head_blend_depth[base_hb] = head_depths[0];
+                head_blend_alpha[base_hb] = a0;
+                head_blend_T    [base_hb] = T_before;
+                head_blend_gid  [base_hb] = head_ids[0];
+            }
+            if (spec_trace_enabled == 1u) head_blend_cur += 1u;
+
+            float test_T0 = T_before * (1.0 - a0);
+            // CUDA hier blend continues even past T_MIN (HIER_CULLING=false
+            // ⇒ ALPHA_THRESHOLD already filters; no early-T cull on flush).
+            C.r += head_color_r[0] * a0 * T_before;
+            C.g += head_color_g[0] * a0 * T_before;
+            C.b += head_color_b[0] * a0 * T_before;
+            T = test_T0; n += 1u;
+
+            for (int j = 1; j < HEAD_W; ++j) {
+                head_depths [j-1] = head_depths [j];
+                head_ids    [j-1] = head_ids    [j];
+                head_alphas [j-1] = head_alphas [j];
+                head_color_r[j-1] = head_color_r[j];
+                head_color_g[j-1] = head_color_g[j];
+                head_color_b[j-1] = head_color_b[j];
+            }
+            head_depths [HEAD_W-1] = 3.402823e38;
+            head_ids    [HEAD_W-1] = -1;
+            head_count -= 1;
+
+            if (T < T_MIN) break;
+        }
+    }
+
+    // Persist HEAD_INS / HEAD_BLEND cursors per pixel.
+    if (spec_trace_enabled == 1u && k_slot_final >= 0) {
+        uint cur_idx = uint(k_slot_final) * 256u + pix_in_tile_final;
+        head_ins_cursor[cur_idx]   = head_ins_cur;
+        head_blend_cursor[cur_idx] = head_blend_cur;
     }
 
     } else {

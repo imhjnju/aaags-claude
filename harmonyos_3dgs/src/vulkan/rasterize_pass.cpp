@@ -19,30 +19,61 @@
 #include <stdexcept>
 #include <vector>
 
-RasterizePass::RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D)
-    : ctx_(ctx) {
+RasterizePass::RasterizePass(VulkanContext& ctx,
+                             uint32_t spec_eval_3D,
+                             uint32_t spec_trace_enabled,
+                             uint32_t spec_sort_mode)
+    : ctx_(ctx), trace_enabled_(spec_trace_enabled != 0u) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
     shader_ = std::make_unique<VulkanShader>(
         ctx_,
         static_cast<const uint8_t*>(rasterize_spv),
         static_cast<std::size_t>(rasterize_spv_len));
 
-    // --- 2. Specialization constant: constant_id 0 = spec_eval_3D ----------
-    VkSpecializationMapEntry spec_entry{};
-    spec_entry.constantID = rasterize_spec::EVAL_3D;
-    spec_entry.offset     = 0u;
-    spec_entry.size       = sizeof(uint32_t);
-    VkSpecializationInfo spec_info{};
-    spec_info.mapEntryCount = 1u;
-    spec_info.pMapEntries   = &spec_entry;
-    spec_info.dataSize      = sizeof(uint32_t);
-    spec_info.pData         = &spec_eval_3D;
+    // --- 2. Specialization constants ---------------------------------------
+    //   constant_id 0 = spec_eval_3D
+    //   constant_id 1 = spec_trace_enabled
+    //   constant_id 2 = spec_sort_mode (Y1 routing)
+    // All three are emitted into the same specialization blob so the driver
+    // folds the branches at pipeline-create time.
+    struct SpecBlob {
+        uint32_t eval_3D;
+        uint32_t trace_enabled;
+        uint32_t sort_mode;
+    } spec_data{ spec_eval_3D, spec_trace_enabled, spec_sort_mode };
 
-    // --- 3. Descriptor layout: 12 SSBOs + 2 UBOs (bindings 8, 13) ----------
-    std::vector<VkDescriptorType> binding_types(14,
+    VkSpecializationMapEntry spec_entries[3]{};
+    spec_entries[0].constantID = rasterize_spec::EVAL_3D;
+    spec_entries[0].offset     = offsetof(SpecBlob, eval_3D);
+    spec_entries[0].size       = sizeof(uint32_t);
+    spec_entries[1].constantID = rasterize_spec::TRACE_ENABLED;
+    spec_entries[1].offset     = offsetof(SpecBlob, trace_enabled);
+    spec_entries[1].size       = sizeof(uint32_t);
+    spec_entries[2].constantID = rasterize_spec::SORT_MODE;
+    spec_entries[2].offset     = offsetof(SpecBlob, sort_mode);
+    spec_entries[2].size       = sizeof(uint32_t);
+
+    VkSpecializationInfo spec_info{};
+    spec_info.mapEntryCount = 3u;
+    spec_info.pMapEntries   = spec_entries;
+    spec_info.dataSize      = sizeof(SpecBlob);
+    spec_info.pData         = &spec_data;
+
+    // --- 3. Descriptor layout ----------------------------------------------
+    // Trace OFF: 14 bindings (12 SSBO + 2 UBO at 8, 13).
+    // Trace ON : 31 bindings (bindings 0..30). Layout must match the shader
+    //            declarations in rasterize.comp (§5.2 of the plan).
+    const uint32_t binding_count = trace_enabled_
+        ? rasterize_trace_bind::BINDING_COUNT
+        : 14u;
+    std::vector<VkDescriptorType> binding_types(binding_count,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[rasterize_bind::RASTER_UBO]        = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding_types[rasterize_bind::RASTER_EVAL3D_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    if (trace_enabled_) {
+        // Binding 14 is the TraceMetaUBO; all other trace bindings are SSBOs.
+        binding_types[rasterize_trace_bind::TRACE_META] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    }
 
     pipeline_ = std::make_unique<VulkanComputePipeline>(
         ctx_,
@@ -80,6 +111,35 @@ void RasterizePass::bind_buffers(const Buffers& b) {
                           rasterize_bind::RASTER_EVAL3D_UBO,
                           b.raster_eval3d_ubo,
                           sizeof(RasterEval3DUBO));
+}
+
+void RasterizePass::bind_trace_buffers(const TraceBuffers& tb) {
+    if (!trace_enabled_)
+        throw std::runtime_error(
+            "RasterizePass::bind_trace_buffers called on a non-trace pass; "
+            "construct with spec_trace_enabled=1 first");
+    // Binding 14: TraceMetaUBO (32 B).
+    pipeline_->update_ubo(descriptor_set_,
+                          rasterize_trace_bind::TRACE_META,
+                          tb.trace_meta_ubo,
+                          sizeof(TraceMetaUBO));
+    // Bindings 15..30: SSBOs.
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::SLOT_LOOKUP,       tb.slot_lookup);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::TAIL_DEPTHS,       tb.tail_depths);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::TAIL_IDS,          tb.tail_ids);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::TAIL_WCUR,         tb.tail_wcur);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::MID_DEPTHS,        tb.mid_depths);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::MID_IDS,           tb.mid_ids);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::MID_WCUR,          tb.mid_wcur);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_INS_DEPTH,    tb.head_ins_depth);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_INS_ALPHA,    tb.head_ins_alpha);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_INS_GID,      tb.head_ins_gid);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_INS_CURSOR,   tb.head_ins_cursor);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_BLEND_DEPTH,  tb.head_blend_depth);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_BLEND_ALPHA,  tb.head_blend_alpha);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_BLEND_T,      tb.head_blend_T);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_BLEND_GID,    tb.head_blend_gid);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_trace_bind::HEAD_BLEND_CURSOR, tb.head_blend_cursor);
 }
 
 void RasterizePass::dispatch_sync(uint32_t num_gaussians,

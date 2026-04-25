@@ -46,7 +46,43 @@ public:
         VkBuffer raster_eval3d_ubo;     // UB  96 bytes    (binding 13, eval_3D only)
     };
 
-    explicit RasterizePass(VulkanContext& ctx, uint32_t spec_eval_3D = 0u);
+    /// Cascade trace buffers — only consumed when the pass was constructed
+    /// with `spec_trace_enabled=1`. Bindings 14..30 follow the layout in
+    /// dev_notes/phase4_vk_cascade_port_plan.md §5.2 and must match
+    /// rasterize_trace_bind:: in preprocess_bindings.h.
+    struct TraceBuffers {
+        VkBuffer trace_meta_ubo;    // UB 32 B TraceMetaUBO (binding 14)
+        VkBuffer slot_lookup;       // SSBO int[num_tiles]           (15)
+        VkBuffer tail_depths;       // SSBO float[K*512*16*64]       (16)
+        VkBuffer tail_ids;          // SSBO int  [K*512*16*64]       (17)
+        VkBuffer tail_wcur;         // SSBO uint [K]                 (18)
+        VkBuffer mid_depths;        // SSBO float[K*1024*16*4*8]     (19)
+        VkBuffer mid_ids;           // SSBO int  [K*1024*16*4*8]     (20)
+        VkBuffer mid_wcur;          // SSBO uint [K]                 (21)
+        VkBuffer head_ins_depth;    // SSBO float[K*256*4096]        (22)
+        VkBuffer head_ins_alpha;    // SSBO float[K*256*4096]        (23)
+        VkBuffer head_ins_gid;      // SSBO int  [K*256*4096]        (24)
+        VkBuffer head_ins_cursor;   // SSBO uint [K*256]             (25)
+        VkBuffer head_blend_depth;  // SSBO float[K*256*4096]        (26)
+        VkBuffer head_blend_alpha;  // SSBO float[K*256*4096]        (27)
+        VkBuffer head_blend_T;      // SSBO float[K*256*4096]        (28)
+        VkBuffer head_blend_gid;    // SSBO int  [K*256*4096]        (29)
+        VkBuffer head_blend_cursor; // SSBO uint [K*256]             (30)
+    };
+
+    /// Construct a pass with the three specialization constants fixed at
+    /// build-time.
+    /// `spec_eval_3D`       : 0 = 2D conic path, 1 = eval_3D k-buffer path.
+    /// `spec_trace_enabled` : 0 = trace OFF (14-binding DSL), 1 = trace ON
+    ///                        (31-binding DSL; caller must also supply
+    ///                        TraceBuffers via bind_trace_buffers()).
+    /// `spec_sort_mode`     : Y1 — CUDA SortMode enum routing.
+    ///                        0 = GLOBAL (HEAD_W=8 fallback path)
+    ///                        3 = HIERARCHICAL (cascade; default for back-compat)
+    explicit RasterizePass(VulkanContext& ctx,
+                           uint32_t spec_eval_3D = 0u,
+                           uint32_t spec_trace_enabled = 0u,
+                           uint32_t spec_sort_mode = 3u);
     ~RasterizePass() = default;
 
     RasterizePass(const RasterizePass&)            = delete;
@@ -55,6 +91,13 @@ public:
     /// Rewire the descriptor set to these buffers. Safe to call per-frame —
     /// updates the pre-allocated set in place.
     void bind_buffers(const Buffers& b);
+
+    /// Rewire the descriptor set's cascade-trace bindings (14..30). Only
+    /// valid when constructed with spec_trace_enabled=1 — throws otherwise.
+    void bind_trace_buffers(const TraceBuffers& tb);
+
+    /// Whether this pass was built with cascade trace plumbing enabled.
+    bool trace_enabled() const { return trace_enabled_; }
 
     /// Layer 1: synchronous dispatch. Grid = (num_tiles_x, num_tiles_y, 1).
     /// Each workgroup is 16x16 and renders one 16x16 tile.
@@ -76,4 +119,5 @@ private:
     std::unique_ptr<VulkanShader>          shader_;
     std::unique_ptr<VulkanComputePipeline> pipeline_;
     VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
+    bool                                   trace_enabled_ = false;
 };
