@@ -268,6 +268,31 @@ void main() {
                + dc1 * (fa*fb * inv_det2)
                + dc2 * (-fa*fa * inv_det2);
 
+    // Add h_conv_scaling chain contributions (matches preprocessor_backward_cpu.cpp).
+    // Forward (preprocess.comp): opa_2d = sigma * h_conv, h_conv = sqrt(max(0.000025, det_orig/det_dilated))
+    //   det_orig    = (fa-0.3)*(fc-0.3) - fb^2     (pre-dilation diag det)
+    //   det_dilated = fa*fc - fb^2 = det           (post-dilation, cached)
+    // Only applies when h_conv is unclamped (r > 0.000025), otherwise dh/d* = 0.
+    float a_raw_cov  = fa - 0.3;
+    float c_raw_cov  = fc - 0.3;
+    float det_orig   = a_raw_cov * c_raw_cov - fb * fb;
+    float r_bwd      = (det != 0.0) ? (det_orig / det) : 0.0;
+    if (r_bwd > 0.000025) {
+        float h_conv_bwd = sqrt(r_bwd);
+        // d_h = d_opacities_2d[i] * sigma; d_r = d_h * 0.5/h_conv
+        float sigma_bwd = opacities[i];
+        float d_h       = d_opacity[i] * sigma_bwd;
+        float d_r       = d_h * 0.5 / h_conv_bwd;
+        float d_det_orig    = d_r / det;
+        float d_det_dilated = d_r * (-det_orig / (det * det));
+        // d_det_orig/d_fa = c_raw, d_det_dilated/d_fa = fc (post-dilation)
+        // d_det_orig/d_fb = -2*fb, d_det_dilated/d_fb = -2*fb
+        // d_det_orig/d_fc = a_raw, d_det_dilated/d_fc = fa
+        d_fa += d_det_orig * c_raw_cov + d_det_dilated * fc;
+        d_fb += (d_det_orig + d_det_dilated) * (-2.0 * fb);
+        d_fc += d_det_orig * a_raw_cov + d_det_dilated * fa;
+    }
+
     // Gradient through the +0.3 filter (constant offset, gradient passes through)
     // d_cov2D_a = d_fa, d_cov2D_b = d_fb, d_cov2D_c = d_fc
 
@@ -767,8 +792,13 @@ void main() {
     d_means3D[base3 + 1u] = d_pos_y;
     d_means3D[base3 + 2u] = d_pos_z;
 
-    // Part E: d_opacity_2d -> d_raw_opacity (sigmoid backward)
-    // CPU ref: grads.d_raw_opacities[i] = rgrad.d_opacities_2d[i] * sigma * (1 - sigma)
+    // Part E: d_opacity_2d -> d_raw_opacity (sigmoid backward + h_conv_scaling)
+    // Forward: opa_2d = sigma(raw) * h_conv. Recompute h_conv from the cached
+    // post-dilation cov2D so the backward matches the forward bit-exactly.
+    // (Variables fa, fb, fc, det, det_orig, r_bwd are in scope from Part A above.)
     float sigma = opacities[i];
-    d_raw_opacities[i] = d_opacity[i] * sigma * (1.0 - sigma);
+    float h_conv_out = 1.0;
+    if (r_bwd > 0.000025) h_conv_out = sqrt(r_bwd);
+    else if (r_bwd > 0.0) h_conv_out = sqrt(0.000025);
+    d_raw_opacities[i] = d_opacity[i] * sigma * (1.0 - sigma) * h_conv_out;
 }
