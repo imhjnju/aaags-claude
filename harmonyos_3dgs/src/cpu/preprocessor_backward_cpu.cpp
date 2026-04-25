@@ -227,9 +227,40 @@ void PreprocessorBackwardCPU::backward(const GaussianData& g, const Camera& cam,
             &grads.d_raw_positions[i * 3]  // accumulate SH->position gradient
         );
 
-        // Chain 3: d_opacity_2d -> d_raw_opacity (sigmoid backward)
+        // Chain 3: d_opacity_2d -> d_raw_opacity (sigmoid backward + h_conv_scaling)
+        // Forward (matching VK preprocess.comp and the unconditional proper_ewa_scaling
+        // in CUDA forward_common.h dilateCov2D):
+        //   opa_2d = sigma(raw) * h_conv,  h_conv = sqrt(max(0.000025, det_orig / det_dilated))
+        // cache.cov2D stores POST-dilation (a = a_raw+0.3, c = c_raw+0.3, b unchanged).
         float sigma = g.opacities[i];  // already-activated sigmoid value
-        grads.d_raw_opacities[i] = rgrad.d_opacities_2d[i] * sigma * (1.0f - sigma);
+        float a_post = cache.cov2D[i*3];
+        float b_post = cache.cov2D[i*3+1];
+        float c_post = cache.cov2D[i*3+2];
+        float det_dilated_bwd = cache.cov2D_det[i];
+        float a_raw_cov = a_post - 0.3f;
+        float c_raw_cov = c_post - 0.3f;
+        float det_orig_bwd = a_raw_cov * c_raw_cov - b_post * b_post;
+        float h_conv_bwd = 1.0f;
+        float d_det_orig = 0.0f;
+        float d_det_dilated = 0.0f;
+        if (det_dilated_bwd != 0.0f) {
+            float r_bwd = det_orig_bwd / det_dilated_bwd;
+            bool clamped = r_bwd <= 0.000025f;
+            float r_eff = clamped ? 0.000025f : r_bwd;
+            h_conv_bwd = std::sqrt(r_eff);
+            if (!clamped && h_conv_bwd > 0.0f) {
+                // d_h = rgrad.d_opacities_2d[i] * sigma
+                // d_r = d_h * 0.5 / h_conv
+                // d_det_orig    = d_r / det_dilated
+                // d_det_dilated = d_r * (-det_orig / det_dilated^2)
+                float d_h = rgrad.d_opacities_2d[i] * sigma;
+                float d_r = d_h * 0.5f / h_conv_bwd;
+                d_det_orig    = d_r / det_dilated_bwd;
+                d_det_dilated = d_r * (-det_orig_bwd / (det_dilated_bwd * det_dilated_bwd));
+            }
+        }
+        // d_raw_opacity includes the h_conv factor since opa_2d = sigma * h_conv.
+        grads.d_raw_opacities[i] = rgrad.d_opacities_2d[i] * sigma * (1.0f - sigma) * h_conv_bwd;
 
         // ===================================================================
         // Chain 1: d_conics -> d_cov2D -> d_cov3D -> d_M -> d_raw_scales, d_raw_rotations
@@ -304,6 +335,14 @@ void PreprocessorBackwardCPU::backward(const GaussianData& g, const Camera& cam,
         float d_c = dc0 * (-b*b * inv_det2)
                   + dc1 * (a*b * inv_det2)
                   + dc2 * (-a*a * inv_det2);
+
+        // Add h_conv_scaling chain contributions (computed above in Chain 3).
+        //   d_det_orig    / d_a = c_raw = c - 0.3        d_det_dilated / d_a = c (post-dilation)
+        //   d_det_orig    / d_b = -2b                     d_det_dilated / d_b = -2b
+        //   d_det_orig    / d_c = a_raw = a - 0.3        d_det_dilated / d_c = a
+        d_a += d_det_orig * c_raw_cov + d_det_dilated * c_post;
+        d_b += (d_det_orig + d_det_dilated) * (-2.0f * b_post);
+        d_c += d_det_orig * a_raw_cov + d_det_dilated * a_post;
 
         // The +0.3 low-pass filter: a_filtered = a_raw + 0.3, c_filtered = c_raw + 0.3
         // Gradient passes through unchanged (constant offset).
