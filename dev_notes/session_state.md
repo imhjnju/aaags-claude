@@ -23,6 +23,38 @@
 | 4D+E+flush | VK HEAD state machine (front4OneFromMid + blend_one + MID-drain-thru-HEAD + end-flush) | IN PROGRESS | combines plan §6 D/E/F after analysis showed CUDA cascade is single state machine, not layerable |
 | 4G-I | PSNR validation / Maleoon / perf | FUTURE | — |
 
+## Path A — Defensive Config Unification (S10, 2026-04-25)
+
+VK now reads `configs/aaa.json` via `splatting::SplattingSettings` and asserts
+that every JSON value matches the value the VK shaders are hard-coded against.
+Mismatches throw at `RasterizerVulkan` construction; VK refuses configs it has
+not implemented rather than silently rendering with the wrong behaviour.
+
+**Unified (JSON value == VK hard-coded value, asserted):**
+- `sort_settings.sort_mode = HIERARCHICAL` (the only path; cascade rasterizer)
+- `sort_settings.sort_order = PER_TILE_DEPTH_MAXPOS` (matches scatter.comp eval_3D depth-along-ray key)
+- `sort_settings.queue_sizes = {per_pixel:4, tile_2x2:8, tile_4x4:64}` (matches `HEAD_W=4`, `s_mid_depth[16*4*8]`, `TAIL_SLOTS=64`)
+- `culling_settings.{rect_bounding,tight_opacity_bounding,tile_based_culling,hierarchical_4x4_culling} = true` (all baked into preprocess.comp / scatter.comp / rasterize.comp without runtime gates)
+- `load_balancing = true` (VK tile-binner + scatter expand each Gaussian over touched tiles unconditionally)
+- `proper_ewa_scaling = true` (preprocess.comp scales opacity by dilation_factor unconditionally)
+- `new_aabb = true` (compute_aabb_screen path is dead code in VK — see preprocess.comp:1030 comment, gotchas.md)
+
+**Runtime-honoured (no assertion; pipeline reacts to JSON value):**
+- `eval_3D` — drives `spec_eval_3D` specialization constant + `RasterizerVulkan(ctx, eval_3D=…)` plumbing.
+- `near_clipping` — preprocess.comp 2D path gates the `p_view.z<=0.2` cull on this flag (master merge 1b02ca2).
+
+**Still hard-coded (not yet config-driven; would need shader changes to vary):**
+- All four queue-size constants are baked as literals + `shared` array sizes in `rasterize.comp`. Changing them needs spec constants + dynamic shared-mem sizing.
+- Sort mode/order other than HIERARCHICAL/PER_TILE_DEPTH_MAXPOS would require a different rasterize shader entirely (stopthepop's GLOBAL/PER_PIXEL_FULL/PER_PIXEL_KBUFFER paths are not ported).
+
+**Files (added):** `include/splatting_settings.h`, `src/splatting_settings.cpp`, `tests/test_config_loader.cpp`, `tests/test_data/aaa.json` (vendored fallback for worktrees without the AAA submodule).
+
+**Files (modified):** `CMakeLists.txt` (move nlohmann_json fetch to global scope; add splatting_settings.cpp; register test), `include/vulkan/rasterizer_vulkan.h` (new SplattingSettings ctor), `src/vulkan/rasterizer_vulkan.cpp` (impl).
+
+**Tests:** 12 new ConfigLoader tests pass; 4 reference tests still pass (`VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline`, `RasterizerVulkan.Rasterize_TinyFixture`, `CascadeEquivalence.SelfCompare_Cuda_vs_Cuda`, `DumpVkCascadeTrace.Basket_Cam0`); 169 gs3d_tests pass.
+
+**Limitations:** legacy `RasterizerVulkan(ctx, bool eval_3D)` ctor is preserved and bypasses the validator — call sites that have not migrated still rely on VK's hard-coded behaviour matching aaa.json. Migration of train/main entry points to the SplattingSettings ctor is a follow-up.
+
 ## Design Decisions (S10, user-confirmed)
 - **Trace granularity**: 细 — 4-level (TAIL-post-merge, MID-post-merge, HEAD-insert, HEAD-blend).
 - **Input scale**: 中等 — 4 tiles from basket-aaa cam0, pair count 300-2000.

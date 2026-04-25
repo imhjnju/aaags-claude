@@ -39,8 +39,25 @@
 #include <vector>
 
 RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx, bool eval_3D)
-    : ctx_(ctx), eval_3D_(eval_3D) {
-    pass_ = std::make_unique<RasterizePass>(ctx_, eval_3D ? 1u : 0u);
+    : ctx_(ctx), eval_3D_(eval_3D), sort_mode_(3u /* HIERARCHICAL */) {
+    // Legacy ctor: default to HIERARCHICAL for back-compat. Callers that need
+    // GLOBAL must use the SplattingSettings overload below.
+    pass_ = std::make_unique<RasterizePass>(
+        ctx_, eval_3D ? 1u : 0u, /*spec_trace_enabled=*/0u, sort_mode_);
+}
+
+RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
+                                   const splatting::SplattingSettings& s)
+    : ctx_(ctx), eval_3D_(s.eval_3D),
+      sort_mode_(static_cast<uint32_t>(s.sort_settings.sort_mode)) {
+    // Path A: refuse configs the VK shaders have not ported. Throws on
+    // mismatch — no silent fallback to "VK's hard-coded value".
+    splatting::validate_vk_supported(s);
+    // Y1: thread sort_mode through to the rasterize pipeline as a spec
+    // constant. validate_vk_supported() guarantees sort_mode ∈ {GLOBAL=0,
+    // HIERARCHICAL=3}; the shader routes accordingly.
+    pass_ = std::make_unique<RasterizePass>(
+        ctx_, eval_3D_ ? 1u : 0u, /*spec_trace_enabled=*/0u, sort_mode_);
 }
 
 // Out-of-line so unique_ptr<RasterizePass> can see the complete type from

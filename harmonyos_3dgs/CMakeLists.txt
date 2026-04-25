@@ -19,6 +19,18 @@ endif()
 # Ensure consistent floating-point behavior across platforms
 add_compile_options(-ffp-contract=off)
 
+# nlohmann_json is fetched here (not gated on BUILD_TESTS) because gs3d_core
+# uses it for `splatting_settings.cpp` (JSON loader for the CUDA-shared
+# `configs/aaa.json` schema). Linked PRIVATE so it does not leak into
+# downstream targets that only need the header-only struct definitions.
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 add_library(gs3d_core
     src/types.cpp
     src/math_utils.cpp
@@ -42,8 +54,10 @@ add_library(gs3d_core
     src/densification.cpp
     src/train_utils.cpp
     src/camera_utils.cpp
+    src/splatting_settings.cpp
 )
 target_include_directories(gs3d_core PUBLIC include src)
+target_link_libraries(gs3d_core PRIVATE nlohmann_json::nlohmann_json)
 
 if(ENABLE_OPENCL)
     target_compile_definitions(gs3d_core PUBLIC ENABLE_OPENCL=1)
@@ -63,20 +77,13 @@ if(ENABLE_OPENCL)
 endif()
 
 if(BUILD_TESTS)
-    include(FetchContent)
+    # nlohmann_json is fetched globally above; only googletest is test-scoped.
     FetchContent_Declare(
         googletest
         URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
-
-    FetchContent_Declare(
-        nlohmann_json
-        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
-    )
-    FetchContent_MakeAvailable(nlohmann_json)
 
     enable_testing()
 
@@ -295,7 +302,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_vs_cuda_basketball.cpp
                 tests/test_dump_cascade_fixtures.cpp
                 tests/test_dump_vk_cascade_trace.cpp
-                tests/test_cascade_equivalence.cpp)
+                tests/test_cascade_equivalence.cpp
+                tests/test_config_loader.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

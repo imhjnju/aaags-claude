@@ -21,7 +21,8 @@
 
 RasterizePass::RasterizePass(VulkanContext& ctx,
                              uint32_t spec_eval_3D,
-                             uint32_t spec_trace_enabled)
+                             uint32_t spec_trace_enabled,
+                             uint32_t spec_sort_mode)
     : ctx_(ctx), trace_enabled_(spec_trace_enabled != 0u) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
     shader_ = std::make_unique<VulkanShader>(
@@ -32,23 +33,28 @@ RasterizePass::RasterizePass(VulkanContext& ctx,
     // --- 2. Specialization constants ---------------------------------------
     //   constant_id 0 = spec_eval_3D
     //   constant_id 1 = spec_trace_enabled
-    // Both are emitted into the same specialization blob so the driver folds
-    // both branches at pipeline-create time.
+    //   constant_id 2 = spec_sort_mode (Y1 routing)
+    // All three are emitted into the same specialization blob so the driver
+    // folds the branches at pipeline-create time.
     struct SpecBlob {
         uint32_t eval_3D;
         uint32_t trace_enabled;
-    } spec_data{ spec_eval_3D, spec_trace_enabled };
+        uint32_t sort_mode;
+    } spec_data{ spec_eval_3D, spec_trace_enabled, spec_sort_mode };
 
-    VkSpecializationMapEntry spec_entries[2]{};
+    VkSpecializationMapEntry spec_entries[3]{};
     spec_entries[0].constantID = rasterize_spec::EVAL_3D;
     spec_entries[0].offset     = offsetof(SpecBlob, eval_3D);
     spec_entries[0].size       = sizeof(uint32_t);
     spec_entries[1].constantID = rasterize_spec::TRACE_ENABLED;
     spec_entries[1].offset     = offsetof(SpecBlob, trace_enabled);
     spec_entries[1].size       = sizeof(uint32_t);
+    spec_entries[2].constantID = rasterize_spec::SORT_MODE;
+    spec_entries[2].offset     = offsetof(SpecBlob, sort_mode);
+    spec_entries[2].size       = sizeof(uint32_t);
 
     VkSpecializationInfo spec_info{};
-    spec_info.mapEntryCount = 2u;
+    spec_info.mapEntryCount = 3u;
     spec_info.pMapEntries   = spec_entries;
     spec_info.dataSize      = sizeof(SpecBlob);
     spec_info.pData         = &spec_data;

@@ -20,6 +20,7 @@
 #pragma once
 
 #include "rasterizer.h"
+#include "splatting_settings.h"
 #include "vulkan/vk_context.h"
 #include "vulkan/rasterize_pass.h"
 
@@ -33,7 +34,17 @@ class VulkanBuffer;
 
 class RasterizerVulkan : public Rasterizer {
 public:
+    // Legacy ctor — eval_3D bool only. eval_3D=true assumes the canonical
+    // aaa.json settings; the assertions in `splatting::validate_vk_supported`
+    // are not run in this path. New code should prefer the SplattingSettings
+    // overload below so that any drift from aaa.json is caught at construction
+    // time instead of producing silently-wrong renders.
     explicit RasterizerVulkan(VulkanContext& ctx, bool eval_3D = false);
+
+    // Defensive ctor (Path A) — runs `splatting::validate_vk_supported(s)` and
+    // throws std::runtime_error if `s` requests behaviour the VK port has not
+    // implemented. eval_3D is taken from `s.eval_3D`.
+    RasterizerVulkan(VulkanContext& ctx, const splatting::SplattingSettings& s);
     ~RasterizerVulkan() override;
 
     RasterizerVulkan(const RasterizerVulkan&)            = delete;
@@ -133,6 +144,10 @@ public:
 private:
     VulkanContext& ctx_;
     bool eval_3D_ = false;
+    // Y1: spec constant value passed to the rasterize pipeline.
+    //   0 = GLOBAL          (HEAD_W=8 fallback path)
+    //   3 = HIERARCHICAL    (cascade; default for back-compat / legacy ctor)
+    uint32_t sort_mode_ = 3u;
     std::unique_ptr<RasterizePass> pass_;
     // Lazily-constructed trace-enabled pass (spec_trace_enabled=1, eval_3D=1).
     // Only built when rasterize_traced() is first called.

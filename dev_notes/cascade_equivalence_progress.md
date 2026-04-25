@@ -463,3 +463,176 @@ TAIL: 92% reduction. MID: 81% reduction. SelfCompare PASS. Rasterize_TinyFixture
 
 **Files changed**:
 - `harmonyos_3dgs/src/vulkan/shaders/rasterize.comp` — replaced broken `bitonicSort64Subtile` with `batcherSort32` + `mergeSortRegToSmem32_Tail`; added `s_merge_store_d/i` scratch.
+
+---
+
+## TAIL/MID tie-break fix — iteration 5 attempt log (2026-04-25)
+
+**Hypothesis going in** (from prior diagnosis): comparator operators in
+`batcherSort32` and/or `mergeSortRegToSmem32_Tail` diverge from CUDA, causing
+the residual TAIL `gid_mm=1610`, MID `gid_mm=5389`, HEAD_INS/BLEND `gid_mm=1024`.
+
+### Side-by-side comparator audit (all 6 sites)
+
+| Site | CUDA op | VK op | Match? |
+|---|---|---|---|
+| `batcherSort` first compare-swap (`stopthepop_common.cuh:170` / hier_render.cuh:170) | `keys[pos] > keys[pos+stride]` | `d0 > d1` (rasterize.comp:526) | YES |
+| `batcherSort` later compare-swap (line 185) | `keys[pos-stride] > keys[pos]` | `d0 > d1` (line 549) | YES |
+| `mergeSortRegToSmem` s0 search (line 33) | `keys[s0+i] <= key` | `<= key0/1` (lines 593-594) | YES |
+| `mergeSortRegToSmem` s0 reset (line 38) | `keys[0] > key` | `> key0/1` (lines 598-599) | YES |
+| `mergeSortRegToSmem` s1 search (line 53) | `keys[s1+i] < store_key` | `< store_key0/1` (lines 631-632) | YES |
+| `mergeSortRegToSmem` s1 reset (line 58) | `keys[0] >= store_key` | `>= store_key0/1` (lines 636-637) | YES |
+
+**All six comparator operators are bit-exact CUDA mirrors already.** The
+prior diagnosis ("operators diverge") was wrong.
+
+### Structural inspection found (and rejected) one candidate change
+
+VK `batcherSort32` runs the per-stage compare-swap inside `for (uint pp=0;pp<2;++pp)`
+with `r = in_subtile + pp*16` (32 logical lanes). CUDA `batcherSort<32>` is
+called with `halfwarp` (16 lanes ranks 0..15); the Batcher network uses
+exactly 16 comparators per stage. So VK's pp=1 iteration runs 16 *extra*
+compare-swaps not in the CUDA network, with `pos` values that for some
+stages extend past the 32-element inner block (e.g. size=32 stride=16 r=16:
+pos = 32; base+pos+stride = base+48 = past the 32-element [base..base+31]
+sort region). Some of those land in the next subtile's slot 0..15.
+
+**Tested**: removed the `pp` loop, used single iteration with `r=in_subtile`
+(0..15 only). Rebuilt and reran `CascadeEquivalence.Vk_vs_Cuda`.
+
+**Result**: ZERO change in numbers. TAIL gid_mm still 1610, MID 5389,
+HEAD_INS 1024, HEAD_BLEND 1024. Same first-divergence trace.
+Reverted (`git checkout`).
+
+Interpretation: the pp=1 extra writes either land in slots that get
+overwritten by phase 3 of a subsequent step before any read, or land in
+ranges the trace dumper doesn't sample. They don't affect the post-batch
+snapshot. Net: structurally redundant but not the source of the divergence.
+
+### What the residual actually looks like
+
+First TAIL divergence: group 5 slot 26 — CUDA `(0.995546, gid=61908)`,
+VK `(0.995546, gid=258061)`. Same depth bits printed; gids correspond to
+different Gaussians in the input range. The gids 61908 and 258061 come from
+DIFFERENT batch positions in `point_list`. So this is NOT two gaussians at
+the same (depth,position) being tie-break-swapped — it's that VK and CUDA
+have DIFFERENT MULTISETS at this slot. One side dropped a gaussian the
+other kept.
+
+The most likely culprit, already noted in `rasterize.comp:938-949` and in
+the previous "Remaining divergence" subsection above, is the deferred
+**alpha cull** (`max_contrib_gaussian_frustum_3D<true,3,3>` over the 3×3
+subtile rect + z frustum, CUDA hier_render.cuh:882-906). VK's traced path
+skips this cull entirely, while CUDA applies it. Whenever CUDA culls a
+gaussian VK keeps, the multiset at that subtile shifts by one slot from
+that index onward — producing exactly this "same depth, different gid"
+signature at drain-boundary slots.
+
+### Final 4-level numbers
+
+| Layer       | gid_mm | d_mm | a_mm | Δ vs S10 baseline |
+|-------------|--------|------|------|-------------------|
+| TAIL        | 1610   | 2192 | 0    | 0 (no change)     |
+| MID         | 5389   | 4099 | 0    | 0 (no change)     |
+| HEAD_INS    | 1024   | 0    | 0    | 0 (no change)     |
+| HEAD_BLEND  | 1024   | 0    | 0    | 0 (no change)     |
+
+### Regression status
+
+- `VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline` PASS
+- `RasterizerVulkan.Rasterize_TinyFixture` PASS
+- `CascadeEquivalence.SelfCompare_Cuda_vs_Cuda` PASS
+
+### Conclusion / next step
+
+**The tie-break in TAIL/MID is not the bug.** Comparators already mirror
+CUDA exactly. The residual `gid_mm` is *multiset divergence*, driven by the
+deferred 3×3 alpha-cull in the VK fill path, not by sort-order ambiguity.
+
+Recommend redirecting Milestone K to **port `max_contrib_gaussian_frustum_3D<true,3,3>`**
+into the VK trace fill (rasterize.comp:938-949), then re-run the harness.
+Expected: TAIL/MID gid_mm drop sharply once the multiset matches; HEAD step
+counts will then converge as a downstream consequence.
+
+DO NOT attempt further comparator-only fixes — there is no operator left to
+flip. Subagent diagnosis that pre-seeded this iteration was incorrect.
+
+---
+
+## FP-rounding + secondary-key fix attempt log (2026-04-25)
+
+**Hypothesis going in (data-supported):** tile 680 / subtile 5 / snap 0 /
+slots 13–14 showed a ±2 ULP depth flip between CUDA and VK on the same
+two Gaussians (gid 61908 / 258061). Plan: try (a) `precise` reciprocal-
+then-multiply to mirror CUDA `z * __frcp_rn(w)`, then (b) a gid secondary
+sort key.
+
+**Edits — `harmonyos_3dgs/src/vulkan/shaders/rasterize.comp`:**
+
+- Fix (a): five depth-formula sites (lines ~325, ~503, ~877, ~960, ~1216)
+  changed from `z_ndc / w_ndc` to `precise float inv_w = 1.0 / w_ndc; z_ndc * inv_w`.
+  Reference: CUDA `glm::dot(g2s_mat[2], max_pos) * __frcp_rn(glm::dot(g2s_mat[3], max_pos))`
+  in `hierarchical_render.cuh:538, 647, 883`.
+- Fix (b): `batcherSort32` (both compare-swap sites) and
+  `mergeSortRegToSmem32_Tail` (both binary-search loops + their boundary
+  conditionals) now break ties on equal depths by comparing gid (lower gid
+  sorts first; total order). Phase-1 search switched from CUDA's `<=`
+  (existing-equal-wins) to strict-`<` plus gid-`<`; phase-2 boundary uses
+  `>=` with gid-`>=`. Inner sort at line ~882 (`priv_depth_fb` insertion
+  sort, separate path) was not modified — it never feeds the cascade
+  comparator.
+
+**Numbers (`gs3d_vk_tests --gtest_filter="DumpVkCascadeTrace.Basket_Cam0:CascadeEquivalence.Vk_vs_Cuda"`):**
+
+| State          | TAIL gid_mm | TAIL d_mm | MID gid_mm | HEAD_INS gid_mm | HEAD_BLEND gid_mm |
+|----------------|-------------|-----------|------------|-----------------|-------------------|
+| Baseline       | 1610        | 2192      | 5389       | 1024            | 1024              |
+| After (a)      | 1604        | 2192      | 5412       | 1024            | 1024              |
+| After (a)+(b)  | 1609        | 2192      | 5420       | 1024            | 1024              |
+
+First-divergence point unchanged across all three states:
+`TAIL group 5 slot 26: A(0.995546,61908) B(0.995546,258061)` — printed
+depths are bit-equal at fp32 print precision yet the orderings differ,
+which is consistent with a sub-ULP rounding difference being shadowed by
+some other multiset bug.
+
+**Regression suite (post `(a)+(b)`):**
+
+- `VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline` — PASS (PSNR 54.838 dB,
+  unchanged from 54.84 baseline within rounding)
+- `RasterizerVulkan.Rasterize_TinyFixture` — PASS
+- `CascadeEquivalence.SelfCompare_Cuda_vs_Cuda` — PASS
+
+**Assessment.** Both fixes are net-neutral on the actual divergence count
+(±5 to ±31 noise on a 5000-slot multiset). Neither closes the gap. This
+is the predicted failure mode the seed prompt warned about: CUDA's
+implicit lane-order tiebreak does NOT align with a gid tiebreak, so even
+after `precise` brings most depths into agreement (TAIL gid_mm dropped 6
+on (a) alone), Fix (b)'s gid-tiebreak shuffles a comparable number of
+already-matching ties out of order.
+
+**The earlier conclusion in this doc still stands:** the residual
+divergence is *multiset divergence* driven by the deferred 3×3 alpha-cull
+in the VK fill path (rasterize.comp:938-949 region), not pure FP rounding
+or comparator ambiguity. Two Gaussians can share a fill slot in CUDA but
+not in VK (or vice-versa) because alpha-cull semantics differ — once the
+input multisets diverge, no comparator/rounding tweak can recover.
+
+**Tegra Thor `precise` honored?** No way to confirm without SPIR-V
+disassembly; the fact that Fix (a) moved `gid_mm` by 6/+23 (rather than
+0) suggests the qualifier did affect at least *some* dot-product
+roundings. But the persistent "depths print equal yet orderings flip"
+signature implies the dominant source of disagreement is upstream of the
+sort — i.e., the alpha-cull-driven multiset mismatch — not the
+reciprocal.
+
+**Next.** Revert (a) and (b)? The PSNR regression test passes either way,
+so neither change is harmful. However, Fix (b) is a divergence from
+CUDA's documented sort semantics (lane-order ties) — keeping it long-term
+risks confusing future readers. Recommend keeping (a) (semantic improvement
+toward CUDA, no regression) and reverting (b) (comparator divergence with
+no benefit). Final disposition: defer to the parent agent — both diffs
+are localized to `rasterize.comp` and trivially reversible.
+
+End of FP-rounding + secondary-key fix attempt log.
+

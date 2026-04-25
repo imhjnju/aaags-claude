@@ -70,14 +70,19 @@ public:
         VkBuffer head_blend_cursor; // SSBO uint [K*256]             (30)
     };
 
-    /// Construct a pass with both specialization constants fixed at build-time.
+    /// Construct a pass with the three specialization constants fixed at
+    /// build-time.
     /// `spec_eval_3D`       : 0 = 2D conic path, 1 = eval_3D k-buffer path.
     /// `spec_trace_enabled` : 0 = trace OFF (14-binding DSL), 1 = trace ON
     ///                        (31-binding DSL; caller must also supply
     ///                        TraceBuffers via bind_trace_buffers()).
+    /// `spec_sort_mode`     : Y1 — CUDA SortMode enum routing.
+    ///                        0 = GLOBAL (HEAD_W=8 fallback path)
+    ///                        3 = HIERARCHICAL (cascade; default for back-compat)
     explicit RasterizePass(VulkanContext& ctx,
                            uint32_t spec_eval_3D = 0u,
-                           uint32_t spec_trace_enabled = 0u);
+                           uint32_t spec_trace_enabled = 0u,
+                           uint32_t spec_sort_mode = 3u);
     ~RasterizePass() = default;
 
     RasterizePass(const RasterizePass&)            = delete;

@@ -102,6 +102,14 @@ layout(constant_id = 0) const uint spec_eval_3D = 0u;
 // CUDA gold (see dev_notes/phase4_vk_cascade_port_plan.md §5).
 layout(constant_id = 1) const uint spec_trace_enabled = 0u;
 
+// Specialization constant: CUDA SortMode enum (Y1 routing).
+//   0 = GLOBAL          → use existing HEAD_W=8 sub-tile-sort path
+//   3 = HIERARCHICAL    → use cascade (TAIL/MID/HEAD); falls back to HEAD_W=8
+//                          when spec_trace_enabled == 0u to preserve master's
+//                          54.3 dB PSNR baseline (commit af39d04).
+// default 3 preserves pre-Y1 behavior for callers that don't set it.
+layout(constant_id = 2) const uint spec_sort_mode = 3u;
+
 // Per-run trace metadata (UBO, 32 B). `K` is the number of selected tiles.
 // `num_tiles` matches push-constant num_tiles_x * num_tiles_y — kept in the
 // UBO so the shader does not have to multiply push-constants.
@@ -853,9 +861,11 @@ void main() {
         // (in_subtile == 0u) builds an ascending-depth permutation of the
         // batch, indexed at the sub-tile centre. Pixels within the sub-tile
         // then walk `sub_order_fb[sub_idx]` instead of raw input order.
-        // Only runs when spec_trace_enabled == 0u; cascade path uses its own
-        // TAIL/MID machinery below and ignores sub_order_fb.
-        if (spec_trace_enabled == 0u) {
+        // Runs when spec_sort_mode == GLOBAL (Y1) OR spec_trace_enabled == 0u
+        // (HIERARCHICAL non-trace fallback). Cascade path uses its own
+        // TAIL/MID machinery below (gated by spec_trace_enabled == 1u) and
+        // ignores sub_order_fb.
+        if (spec_sort_mode == 0u || spec_trace_enabled == 0u) {
             if (local_idx < uint(NUM_SUBTILES_FB)) {
                 s_tail_count[local_idx] = 0u;  // overlay: reused as sub_count_fb
             }
@@ -1407,8 +1417,9 @@ void main() {
         // Non-traced fallback: master pre-cascade per-pixel walk over
         // `sub_order_fb` (sub-tile-sorted permutation). Wider HEAD k-buffer
         // (FB_HEAD_W=8) reproduces master's 54.3 dB PSNR baseline. Uses local
-        // fb_kbuf_* state, disjoint from cascade head_*.
-        if (spec_trace_enabled == 0u && !pixel_done) {
+        // fb_kbuf_* state, disjoint from cascade head_*. Y1: also runs when
+        // spec_sort_mode == GLOBAL (the FB path IS the GLOBAL path).
+        if ((spec_sort_mode == 0u || spec_trace_enabled == 0u) && !pixel_done) {
             int tsz = int(s_tail_count[sub_idx]);  // overlay: sub_count_fb
             float fpx = float(pixel_x);
             float fpy = float(pixel_y);
@@ -1866,7 +1877,8 @@ void main() {
     // Non-trace fallback flush: drain remaining fb_kbuf entries.
     // Mirrors master rasterize.comp lines 423-440. Early-out on T < T_MIN
     // (before blending the entry that would trip it) — matches master.
-    if (spec_trace_enabled == 0u && !pixel_done) {
+    // Y1: also runs under spec_sort_mode == GLOBAL.
+    if ((spec_sort_mode == 0u || spec_trace_enabled == 0u) && !pixel_done) {
         for (int fi = 0; fi < FB_HEAD_W; fi++) {
             if (fb_kbuf_size <= 0) break;
             float a0 = fb_kbuf_alpha[0];

@@ -173,6 +173,13 @@ static_assert(sizeof(RasterEval3DUBO) == 96, "RasterEval3DUBO must be 96 bytes (
 namespace rasterize_spec {
 constexpr uint32_t EVAL_3D       = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
 constexpr uint32_t TRACE_ENABLED = 1;  // 1 = emit cascade trace (Phase 4 VK port)
+constexpr uint32_t SORT_MODE     = 2;  // CUDA SortMode enum (Y1 routing — see below)
+
+// Sort-mode values that the Y1 routing currently understands. Other CUDA
+// SortMode values (PER_PIXEL_FULL=1, PER_PIXEL_KBUFFER=2) are NOT implemented
+// in the VK shader and validate_vk_supported() rejects them at config load.
+constexpr uint32_t SORT_MODE_GLOBAL       = 0u;  // existing HEAD_W=8 sub-tile-sort path
+constexpr uint32_t SORT_MODE_HIERARCHICAL = 3u;  // 3-stage cascade (TAIL/MID/HEAD)
 }  // namespace rasterize_spec
 
 // --- rasterize.comp CASCADE TRACE bindings (Phase 4 / Milestone A) -----------
