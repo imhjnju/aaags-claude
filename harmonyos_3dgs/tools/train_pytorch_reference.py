@@ -103,11 +103,26 @@ def forward_render_pytorch(raw_pos, raw_sc, raw_rot, raw_sh, raw_op,
     focal_y_val = Mvp[1, 1].item() * H * 0.5
 
     tz = p_view[:, 2]
+    # Clamp tx/tz, ty/tz to ±1.3 * tan_fov before computing J (CUDA EWA splatting trick).
+    # CUDA reference: cuda_rasterizer/forward_common.h:81-86 —
+    #   const float limx = 1.3f * tan_fovx;  const float limy = 1.3f * tan_fovy;
+    #   t.x = min(limx, max(-limx, t.x/t.z)) * t.z;  t.y = min(limy, ...)*t.z;
+    # Vulkan equivalent: src/vulkan/shaders/preprocess.comp:746-752.
+    # focal_x = W/(2*tan_fovx)  ⇒  tan_fovx = W/(2*focal_x). Inverts the focal_x_val
+    # convention used directly above so the J before/after the clamp matches CUDA.
+    tan_fovx = W / (2.0 * focal_x_val)
+    tan_fovy = H / (2.0 * focal_y_val)
+    limx = 1.3 * tan_fovx
+    limy = 1.3 * tan_fovy
+    txtz = p_view[:, 0] / tz
+    tytz = p_view[:, 1] / tz
+    tx_clamped = torch.clamp(txtz, min=-limx, max=limx) * tz
+    ty_clamped = torch.clamp(tytz, min=-limy, max=limy) * tz
     J = torch.zeros(N, 2, 3, device=device)
     J[:, 0, 0] = focal_x_val / tz
-    J[:, 0, 2] = -focal_x_val * p_view[:, 0] / (tz * tz)
+    J[:, 0, 2] = -focal_x_val * tx_clamped / (tz * tz)
     J[:, 1, 1] = focal_y_val / tz
-    J[:, 1, 2] = -focal_y_val * p_view[:, 1] / (tz * tz)
+    J[:, 1, 2] = -focal_y_val * ty_clamped / (tz * tz)
 
     # W matrix (upper-left 3x3 of view matrix) — same Mt as used for p_view
     W_mat = Mt[:3, :3]  # [3, 3]
@@ -127,11 +142,14 @@ def forward_render_pytorch(raw_pos, raw_sc, raw_rot, raw_sh, raw_op,
     # Visibility mask
     visible = (p_view[:, 2] > 0.2) & (det > 0)
 
-    # Conics (inverse 2D cov)
-    det_safe = det.clamp(min=1e-10)
-    conic_a = cov2D[:, 1, 1] / det_safe
-    conic_b = -cov2D[:, 0, 1] / det_safe
-    conic_c = cov2D[:, 0, 0] / det_safe
+    # Conics (inverse 2D cov).
+    # CUDA reference: cuda_rasterizer/forward_common.h:137 — `float det_inv = 1.f / det;`
+    # No clamp; visibility mask above (`det > 0`) already gates non-positive dets.
+    # Vulkan equivalent: src/vulkan/shaders/preprocess.comp:1148-1159 — `if (det == 0.0) return; det_inv = 1.0 / det;`
+    # Previously this used `det.clamp(min=1e-10)`, which diverged from CUDA/VK in det ∈ (0, 1e-10).
+    conic_a = cov2D[:, 1, 1] / det
+    conic_b = -cov2D[:, 0, 1] / det
+    conic_c = cov2D[:, 0, 0] / det
 
     # Sort by depth
     depths = p_view[:, 2].clone()
