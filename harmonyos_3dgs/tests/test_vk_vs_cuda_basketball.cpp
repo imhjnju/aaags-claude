@@ -23,6 +23,8 @@
 
 #include <gtest/gtest.h>
 
+#include "test_data_paths.h"
+
 #include "camera_utils.h"
 #include "image_io.h"
 #include "ply_loader.h"
@@ -59,8 +61,10 @@ constexpr float kBaselinePSNR = 54.3f;
 constexpr int kW = 720;
 constexpr int kH = 960;
 
-const std::string kPlyPath =
-    "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/vulkan_3d/basket-aaa.ply";
+// Resolved at first use via test_data::find_basket_aaa_ply() — searches the
+// current worktree, the master root, and known sibling worktrees so the test
+// works regardless of which worktree the developer has the .ply file in.
+// (The 100 MB file can't be git-tracked.)
 const std::string kCamPath =
     "/home/robota/Downloads/basketball/_sp0_dump_output/cameras.json";
 const std::string kGoldenPath =
@@ -145,8 +149,10 @@ void write_diff_heatmap(const std::vector<float>& vk,
 }  // namespace
 
 TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
-    if (!std::filesystem::exists(kPlyPath)) {
-        GTEST_SKIP() << "basket-aaa.ply not available at " << kPlyPath;
+    std::string kPlyPath;
+    if (!test_data::resolve_basket_aaa_ply(kPlyPath)) {
+        GTEST_SKIP() << "basket-aaa.ply not found in any known location "
+                        "(set $BASKET_AAA_PLY to override)";
     }
     if (!std::filesystem::exists(kCamPath)) {
         GTEST_SKIP() << "cameras.json not available at " << kCamPath;
@@ -299,12 +305,14 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
 // always SUCCEED() after printing so ctest stays green; this is a data
 // gathering harness, not a gate.
 TEST(VkVsCudaBasketball, Cam0_TableSubset) {
+    // Subset artifacts are produced by tools/extract_gaussians_by_roi.py
+    // + tools/render_single.py and live under tools/out/ of the current worktree.
+    // Use REPO_ROOT_DIR so the test follows the developer between worktrees
+    // (was hardcoded to white-table, breaking other worktrees).
     const std::string kSubsetPlyPath =
-        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/white-table/"
-        "tools/out/basket-aaa-table.ply";
+        std::string(REPO_ROOT_DIR) + "/tools/out/basket-aaa-table.ply";
     const std::string kSubsetGoldenPath =
-        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/white-table/"
-        "tools/out/basket-aaa-table_cuda.raw";
+        std::string(REPO_ROOT_DIR) + "/tools/out/basket-aaa-table_cuda.raw";
 
     // ROI: bottom-left 160x240 window in image space.
     constexpr struct { int x_min, y_min, x_max, y_max; } kRoi{0, 720, 160, 960};
@@ -518,8 +526,10 @@ TEST(VkVsCudaBasketball, Cam0_TableSubset) {
 // vk_n_contrib_cam0.raw (int32 little-endian, kW*kH elements) next to
 // vk_image.raw in CMAKE_BINARY_DIR so it can be diffed against CUDA later.
 TEST(VkVsCudaBasketball, Cam0_NContribDump) {
-    if (!std::filesystem::exists(kPlyPath)) {
-        GTEST_SKIP() << "basket-aaa.ply not available at " << kPlyPath;
+    std::string kPlyPath;
+    if (!test_data::resolve_basket_aaa_ply(kPlyPath)) {
+        GTEST_SKIP() << "basket-aaa.ply not found in any known location "
+                        "(set $BASKET_AAA_PLY to override)";
     }
     if (!std::filesystem::exists(kCamPath)) {
         GTEST_SKIP() << "cameras.json not available at " << kCamPath;

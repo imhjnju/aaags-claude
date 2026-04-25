@@ -59,11 +59,34 @@ def camera_from_json_entry(entry, device="cuda"):
     )
 
 
+def _find_basket_aaa_ply():
+    """Mirror tests/test_data_paths.h::find_basket_aaa_ply for the tooling side.
+    Search env var, current worktree, master root, and known sibling worktrees.
+    Returns "" if none exist (caller should fall back to argparse explicit --ply).
+    """
+    env = os.environ.get("BASKET_AAA_PLY", "")
+    if env and os.path.exists(env):
+        return env
+    candidates = [
+        os.path.join(_WORKTREE_ROOT, "basket-aaa.ply"),
+        "/home/robota/h00813233/Graph/aaags-claude/basket-aaa.ply",
+        "/home/robota/h00813233/Graph/AAA-Gaussians/basket-aaa.ply",
+        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/vulkan_3d/basket-aaa.ply",
+        "/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/training/basket-aaa.ply",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return ""
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cam_id", type=int, default=0)
     p.add_argument("--ply", type=str,
-                   default="/home/robota/h00813233/Graph/aaags-claude/.claude/worktrees/vulkan_3d/basket-aaa.ply")
+                   default=_find_basket_aaa_ply(),
+                   help="Path to basket-aaa.ply. If omitted, searches "
+                        "$BASKET_AAA_PLY / current worktree / master / known sibling worktrees.")
     p.add_argument("--cameras", type=str,
                    default="/home/robota/Downloads/basketball/_sp0_dump_output/cameras.json")
     p.add_argument("--config", type=str,

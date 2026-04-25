@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "test_data_paths.h"
 #include "camera_utils.h"
 #include "ply_loader.h"
 #include "renderer.h"
@@ -48,16 +49,13 @@ static double computePSNR(const float* a, const float* b, size_t count,
 
 TEST(VkVsCpuRender, FullFramePSNR) {
     // --- Skip conditions ---
-    const std::string ply_path =
-        std::string(REPO_ROOT_DIR) + "/basket-aaa.ply";
+    std::string ply_path;
+    if (!test_data::resolve_basket_aaa_ply(ply_path)) {
+        GTEST_SKIP() << "basket-aaa.ply not found in any known location "
+                        "(set $BASKET_AAA_PLY to override)";
+    }
     const std::string cam_path =
         std::string(REPO_ROOT_DIR) + "/harmonyos_3dgs/cameras.json";
-
-    {
-        std::ifstream f(ply_path);
-        if (!f.good())
-            GTEST_SKIP() << "basket-aaa.ply not found at " << ply_path;
-    }
     {
         std::ifstream f(cam_path);
         if (!f.good())

@@ -89,8 +89,7 @@ if(BUILD_TESTS)
         tests/test_tile_binner.cpp
         tests/test_sorter.cpp
         tests/test_rasterizer.cpp
-        tests/test_rasterizer_gpu.cpp
-        tests/test_preprocessor_gpu.cpp
+        # OpenCL-only tests are conditionally appended below.
         tests/test_renderer_e2e.cpp
         tests/test_train_types.cpp
         tests/test_forward_cache.cpp
@@ -101,9 +100,7 @@ if(BUILD_TESTS)
         tests/test_trainer_e2e.cpp
         tests/test_train_pipeline.cpp
         tests/test_train_loop.cpp
-        tests/test_rasterizer_backward_gpu.cpp
-        tests/test_preprocessor_backward_gpu.cpp
-        tests/test_trainer_gpu.cpp
+        # OpenCL-only tests are conditionally appended below.
         tests/test_density_controller.cpp
         tests/test_npy_reader.cpp
         tests/test_compare.cpp
@@ -113,6 +110,15 @@ if(BUILD_TESTS)
         tests/test_dssim.cpp
         tests/test_training_gap_sp6.cpp
     )
+    if(ENABLE_OPENCL)
+        target_sources(gs3d_tests PRIVATE
+            tests/test_rasterizer_gpu.cpp
+            tests/test_preprocessor_gpu.cpp
+            tests/test_rasterizer_backward_gpu.cpp
+            tests/test_preprocessor_backward_gpu.cpp
+            tests/test_trainer_gpu.cpp
+        )
+    endif()
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
     target_compile_definitions(gs3d_tests PRIVATE
