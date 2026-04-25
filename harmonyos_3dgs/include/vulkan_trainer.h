@@ -39,6 +39,24 @@ public:
                int target_W,
                int target_H);
 
+    // Run forward (preprocess + bin + sort + rasterize) and L1+DSSIM loss
+    // computation only. No backward, no Adam, no densification, no
+    // position-noise injection. Used by VK-vs-CUDA parity harnesses on
+    // eval_3D=true paths (where the backward pass is not yet supported and
+    // would throw). Does NOT advance step_count_.
+    //
+    // On success, the same accessors that step() populates are valid:
+    //   rendered_image(), captured_*() (when intermediate capture is
+    //   enabled), and last_loss().
+    //
+    // Returns the scalar L1 + lambda_dssim*(1-SSIM) loss (the value step()
+    // would have at its loss-computation point).
+    float forward_only(const Camera& cam,
+                       const RenderConfig& cfg,
+                       const float* target_image,   // [3*H*W] CHW channel-first
+                       int target_W,
+                       int target_H);
+
     int step_count() const { return step_count_; }
     float last_loss() const { return last_loss_; }
     int active_sh_degree() const { return active_sh_degree_; }
@@ -87,6 +105,24 @@ private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
     // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
     void reallocate_for_n(int new_N);
+
+    // Shared forward+loss path used by both step() and forward_only().
+    // Runs (alloc reset, activate, preprocess, bin, sort, rasterize,
+    // optional intermediate capture, combined loss). Updates last_loss_,
+    // last_bin_R_, last_bin_N_, image_, dL_dpixels_. Does NOT touch
+    // backward / Adam / densification / step_count_.
+    //
+    // Out-params reference FrameAllocator memory and are valid until the
+    // next alloc_.reset() (i.e. until the next call to step()/forward_only()).
+    // The backward path inside step() reads them in-place.
+    float run_forward_and_loss(const Camera& cam,
+                               const RenderConfig& cfg,
+                               const float* target,
+                               int W,
+                               int H,
+                               PreprocessOutput& out_pre,
+                               BinningOutput& out_bin,
+                               ForwardCache& out_cache);
     // Inject covariance-scaled Gaussian noise into positions of near-dead Gaussians.
     // Called after GPU Adam download. Matches train.py:141-148.
     void inject_position_noise(float pos_lr);

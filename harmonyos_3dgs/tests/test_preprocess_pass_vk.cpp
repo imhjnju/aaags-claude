@@ -41,6 +41,7 @@ std::string tiny_cam0_dir() {
 // must outlive the dispatch, so we hold the raw bytes in std::vector for
 // the duration of the test (std::vector data is heap-allocated and stable).
 std::vector<float> npy_to_f32_vec(const NpyArray& a) {
+    assert_dtype(a, NpyDtype::float32);
     std::vector<float> v(a.numel());
     std::memcpy(v.data(),
                 a.raw.data(),
@@ -144,7 +145,11 @@ TEST(PreprocessPass, MatchesCUDAGolden_Tiny) {
         << "Vulkan init failed — no compute-capable device?";
 
     FrameAllocator alloc(32u * 1024u * 1024u);   // 32 MB arena
-    PreprocessorVulkan pp(ctx);
+    // Golden NPYs were dumped from the CUDA reference WITHOUT proper_ewa
+    // (rect_bounding/tight_opacity_bounding off). Opt out of the new
+    // production default (proper_ewa=true) so VK matches the CUDA path
+    // that produced the golden tiles_touched / conic_opacity values.
+    PreprocessorVulkan pp(ctx, /*eval_3D=*/false, /*proper_ewa=*/false);
     PreprocessOutput out = pp.process(g, cam, cfg, alloc);
 
     // --- Load golden outputs -----------------------------------------------

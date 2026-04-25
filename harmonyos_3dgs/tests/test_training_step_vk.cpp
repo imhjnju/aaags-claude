@@ -50,6 +50,7 @@ std::string tiny_cam0_dir() {
 }
 
 std::vector<float> npy_to_f32_vec(const NpyArray& a) {
+    assert_dtype(a, NpyDtype::float32);
     std::vector<float> v(a.numel());
     std::memcpy(v.data(), a.raw.data(), a.numel() * sizeof(float));
     return v;

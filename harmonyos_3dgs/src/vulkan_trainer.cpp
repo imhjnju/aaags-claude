@@ -9,6 +9,79 @@
 #include <random>
 #include <stdexcept>
 #include <numeric>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// SH DC/REST de/interleave helpers
+//
+// Storage layout convention (matches Python `raw_sh.reshape(N, max_coeffs*3)`,
+// see tools/dump_tiny_reference.py:100): the unified raw_sh_coeffs_ buffer is
+// `[N, K, 3]` flat — per-Gaussian blocks of K*3 floats with channel innermost.
+// The DC of Gaussian i lives at index `i*K*3 + 0..2`; band-1 at `i*K*3 + 3..11`.
+//
+// The Adam optimizer splits these into two GPU buffers with different LRs:
+//   group 1 (DC):   sz=N*3,         lr=2.5e-3
+//   group 2 (REST): sz=N*(K-1)*3,   lr=1.25e-4
+//
+// Per the 3DGS reference convention (gaussian_renderer:scene/gaussian_model.py
+// `features_dc` [N,1,3] and `features_rest` [N,K-1,3] are SEPARATE tensors
+// registered as separate optimizer groups), the DC GPU buffer must hold
+// "DC of all N Gaussians, contiguous" — NOT the first N*3 floats of the
+// interleaved buffer. The previous code took the first N*3 floats verbatim,
+// which only happens to be all-DC when K==1; for K=16 it picks up G[0]'s
+// full 48 floats and G[1]'s first 12 floats, leaving G[2..N-1] DCs in the
+// REST buffer (wrong LR). Evidence: TempDiag3StepSHCompare showed G[2,DC,*]
+// receiving lr=1.25e-4 instead of lr=2.5e-3 — diff -2.375e-3 = -(2.5e-3-1.25e-4)
+// per channel per step.
+//
+// Reference: Python autograd uses ONE group for raw_sh with lr=2.5e-3
+// (tools/dump_tiny_reference.py:281); the original 3DGS PyTorch trainer uses
+// TWO groups with the (DC, REST) split using separate features_dc/features_rest
+// tensors (no interleave) with lrs 2.5e-3 / 1.25e-4.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Gather DC slices (k=0) of all N Gaussians from interleaved [N, K, 3] -> [N, 3].
+inline void sh_gather_dc(const float* src_interleaved, int N, int K, float* dst_dc) {
+    for (int i = 0; i < N; ++i) {
+        const float* s = src_interleaved + static_cast<size_t>(i) * K * 3;
+        float* d = dst_dc + static_cast<size_t>(i) * 3;
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+    }
+}
+
+// Gather REST slices (k=1..K-1) from interleaved [N, K, 3] -> [N, K-1, 3].
+inline void sh_gather_rest(const float* src_interleaved, int N, int K, float* dst_rest) {
+    if (K <= 1) return;
+    const size_t rest_stride = static_cast<size_t>(K - 1) * 3;
+    for (int i = 0; i < N; ++i) {
+        const float* s = src_interleaved + static_cast<size_t>(i) * K * 3 + 3;  // skip DC
+        float* d = dst_rest + static_cast<size_t>(i) * rest_stride;
+        std::memcpy(d, s, rest_stride * sizeof(float));
+    }
+}
+
+// Scatter DC [N, 3] back into interleaved [N, K, 3] (writes only k=0 slot).
+inline void sh_scatter_dc(const float* src_dc, int N, int K, float* dst_interleaved) {
+    for (int i = 0; i < N; ++i) {
+        const float* s = src_dc + static_cast<size_t>(i) * 3;
+        float* d = dst_interleaved + static_cast<size_t>(i) * K * 3;
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+    }
+}
+
+// Scatter REST [N, K-1, 3] back into interleaved [N, K, 3] (writes k=1..K-1).
+inline void sh_scatter_rest(const float* src_rest, int N, int K, float* dst_interleaved) {
+    if (K <= 1) return;
+    const size_t rest_stride = static_cast<size_t>(K - 1) * 3;
+    for (int i = 0; i < N; ++i) {
+        const float* s = src_rest + static_cast<size_t>(i) * rest_stride;
+        float* d = dst_interleaved + static_cast<size_t>(i) * K * 3 + 3;
+        std::memcpy(d, s, rest_stride * sizeof(float));
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -33,7 +106,7 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     , sorter_(ctx)
     , rasterizer_(ctx, /*eval_3D=*/tcfg.eval_3D, /*disable_subtile_resort=*/tcfg.parity_mode)
     , rasterizer_bwd_(ctx)
-    , preprocessor_bwd_(ctx)
+    , preprocessor_bwd_(ctx, tcfg.proper_ewa)
 {
     // 1. Copy raw parameters into owned vectors.
     raw_positions_.assign(init_raw.raw_positions, init_raw.raw_positions + N_ * 3);
@@ -117,12 +190,23 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
 
     raw_param_gpu_bufs_[1] = std::make_unique<VulkanBuffer>(
         ctx_, sz_sh_dc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    raw_param_gpu_bufs_[1]->upload(raw_sh_coeffs_.data(), sz_sh_dc);
+    {
+        // Gather DC of all N Gaussians into a contiguous [N,3] scratch before upload.
+        std::vector<float> sh_dc_scratch(static_cast<size_t>(N_) * 3);
+        sh_gather_dc(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_dc_scratch.data());
+        raw_param_gpu_bufs_[1]->upload(sh_dc_scratch.data(), sz_sh_dc);
+    }
 
     raw_param_gpu_bufs_[2] = std::make_unique<VulkanBuffer>(
         ctx_, sz_sh_rest, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    raw_param_gpu_bufs_[2]->upload(
-        raw_sh_coeffs_.data() + static_cast<size_t>(N_) * 3, sz_sh_rest);
+    if (max_coeffs_ > 1) {
+        // Gather REST (k=1..K-1) of all N Gaussians into [N, K-1, 3] scratch.
+        std::vector<float> sh_rest_scratch(
+            static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3);
+        sh_gather_rest(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_rest_scratch.data());
+        raw_param_gpu_bufs_[2]->upload(sh_rest_scratch.data(),
+            static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3 * sizeof(float));
+    }
 
     raw_param_gpu_bufs_[3] = std::make_unique<VulkanBuffer>(
         ctx_, sz_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -221,11 +305,18 @@ void VulkanTrainer::reset_for_oracle(const RawGaussianParams& new_raw)
     const size_t sz_N  = static_cast<size_t>(N_) * sizeof(float);
 
     raw_param_gpu_bufs_[0]->upload(raw_positions_.data(), sz_N3);    // positions
-    raw_param_gpu_bufs_[1]->upload(raw_sh_coeffs_.data(), sz_N3);    // sh DC (first N*3)
+    {
+        // SH DC: gather k=0 from interleaved [N, K, 3] (see sh_gather_dc note above).
+        std::vector<float> sh_dc_scratch(static_cast<size_t>(N_) * 3);
+        sh_gather_dc(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_dc_scratch.data());
+        raw_param_gpu_bufs_[1]->upload(sh_dc_scratch.data(), sz_N3);
+    }
     if (max_coeffs_ > 1) {
         const size_t sz_rest = static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3 * sizeof(float);
-        raw_param_gpu_bufs_[2]->upload(raw_sh_coeffs_.data() + static_cast<size_t>(N_) * 3,
-                                       sz_rest);                      // sh rest
+        std::vector<float> sh_rest_scratch(
+            static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3);
+        sh_gather_rest(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_rest_scratch.data());
+        raw_param_gpu_bufs_[2]->upload(sh_rest_scratch.data(), sz_rest);
     }
     raw_param_gpu_bufs_[3]->upload(raw_opacities_.data(), sz_N);     // opacities
     raw_param_gpu_bufs_[4]->upload(raw_scales_.data(), sz_N3);       // scales
@@ -241,14 +332,22 @@ void VulkanTrainer::reset_for_oracle(const RawGaussianParams& new_raw)
 }
 
 // ---------------------------------------------------------------------------
-// step
+// run_forward_and_loss — shared forward+loss prefix used by step() and
+// forward_only(). Resets the frame arena, activates params, runs preprocess →
+// bin → sort → rasterize, optionally captures intermediates, then computes the
+// combined L1 + DSSIM loss + dL/dpixel into last_loss_ / dL_dpixels_.
+//
+// Does NOT touch backward/Adam/densification/step_count_. Returns last_loss_.
 // ---------------------------------------------------------------------------
 
-float VulkanTrainer::step(const Camera& cam,
-                          const RenderConfig& cfg,
-                          const float* target,
-                          int W,
-                          int H)
+float VulkanTrainer::run_forward_and_loss(const Camera& cam,
+                                          const RenderConfig& cfg,
+                                          const float* target,
+                                          int W,
+                                          int H,
+                                          PreprocessOutput& out_pre,
+                                          BinningOutput& out_bin,
+                                          ForwardCache& out_cache)
 {
     alloc_.reset();
     // Grow CPU arena to hold binner+sorter R-pair CPU arrays (R × 32 bytes)
@@ -271,34 +370,34 @@ float VulkanTrainer::step(const Camera& cam,
     // cov3D, p_view, p_hom_w, cov2D, cov2D_det are allocated inside
     // PreprocessorVulkan::download_cache().
     const int HW_pixels = H * W;
-    ForwardCache cache{};
-    cache.T_final  = alloc_.allocate_array<float>(static_cast<size_t>(HW_pixels));
-    cache.n_contrib = alloc_.allocate_array<int>  (static_cast<size_t>(HW_pixels));
-    std::memset(cache.T_final,  0, static_cast<size_t>(HW_pixels) * sizeof(float));
-    std::memset(cache.n_contrib, 0, static_cast<size_t>(HW_pixels) * sizeof(int));
+    out_cache = ForwardCache{};
+    out_cache.T_final   = alloc_.allocate_array<float>(static_cast<size_t>(HW_pixels));
+    out_cache.n_contrib = alloc_.allocate_array<int>  (static_cast<size_t>(HW_pixels));
+    std::memset(out_cache.T_final,   0, static_cast<size_t>(HW_pixels) * sizeof(float));
+    std::memset(out_cache.n_contrib, 0, static_cast<size_t>(HW_pixels) * sizeof(int));
 
     // Build active config: override sh_degree with the scheduled value.
     RenderConfig active_cfg = cfg;
     active_cfg.sh_degree = active_sh_degree_;
 
     // 1. Forward preprocess (populates cache: cov3D, p_view, p_hom_w, cov2D, cov2D_det)
-    PreprocessOutput pre = preprocessor_.process(g_, cam, active_cfg, alloc_, &cache);
-    preprocessor_.download_cache(N_, cache, alloc_);
-    cache.pre = &pre;
+    out_pre = preprocessor_.process(g_, cam, active_cfg, alloc_, &out_cache);
+    preprocessor_.download_cache(N_, out_cache, alloc_);
+    out_cache.pre = &out_pre;
 
     // 2. Tile binning
-    BinningOutput bin = binner_.bin(pre, N_, cam, active_cfg, alloc_);
-    cache.bin = &bin;
+    out_bin = binner_.bin(out_pre, N_, cam, active_cfg, alloc_);
+    out_cache.bin = &out_bin;
     // Record actual R for next step's arena estimate.
-    last_bin_R_ = static_cast<size_t>(bin.total_pairs);
+    last_bin_R_ = static_cast<size_t>(out_bin.total_pairs);
     last_bin_N_ = static_cast<size_t>(N_);
 
     // 3. Sort
-    sorter_.sort(bin, alloc_);
+    sorter_.sort(out_bin, alloc_);
 
     // 4. Rasterize (populates cache.T_final and cache.n_contrib since they are non-null)
-    rasterizer_.rasterize(pre, bin, cam, active_cfg, image_.data(),
-                          /*depth=*/nullptr, &cache, &alloc_);
+    rasterizer_.rasterize(out_pre, out_bin, cam, active_cfg, image_.data(),
+                          /*depth=*/nullptr, &out_cache, &alloc_);
 
     // 4b. Optional intermediate capture — for VK-vs-CUDA parity tests only.
     //     All source pointers (pre.*, bin.*, cache.T_final/n_contrib) reference
@@ -308,48 +407,48 @@ float VulkanTrainer::step(const Camera& cam,
     if (capture_intermediates_) {
         const size_t n = static_cast<size_t>(N_);
         const size_t HW = static_cast<size_t>(HW_pixels);
-        const size_t R  = static_cast<size_t>(bin.total_pairs);
-        const size_t NT = static_cast<size_t>(bin.num_tiles);
+        const size_t R  = static_cast<size_t>(out_bin.total_pairs);
+        const size_t NT = static_cast<size_t>(out_bin.num_tiles);
 
-        captured_means2D_.assign(pre.means2D, pre.means2D + n * 2);
+        captured_means2D_.assign(out_pre.means2D, out_pre.means2D + n * 2);
         // Pack (a, b, c, opacity) per Gaussian into [N*4] — match CUDA layout.
         captured_conic_opacity_.resize(n * 4);
         for (size_t i = 0; i < n; ++i) {
-            captured_conic_opacity_[i * 4 + 0] = pre.conics[i * 3 + 0];
-            captured_conic_opacity_[i * 4 + 1] = pre.conics[i * 3 + 1];
-            captured_conic_opacity_[i * 4 + 2] = pre.conics[i * 3 + 2];
-            captured_conic_opacity_[i * 4 + 3] = pre.opacities_2d[i];
+            captured_conic_opacity_[i * 4 + 0] = out_pre.conics[i * 3 + 0];
+            captured_conic_opacity_[i * 4 + 1] = out_pre.conics[i * 3 + 1];
+            captured_conic_opacity_[i * 4 + 2] = out_pre.conics[i * 3 + 2];
+            captured_conic_opacity_[i * 4 + 3] = out_pre.opacities_2d[i];
         }
-        captured_rgb_.assign(pre.rgb, pre.rgb + n * 3);
-        captured_radii_.assign(pre.radii, pre.radii + n);
-        captured_tiles_touched_.assign(pre.tiles_touched, pre.tiles_touched + n);
+        captured_rgb_.assign(out_pre.rgb, out_pre.rgb + n * 3);
+        captured_radii_.assign(out_pre.radii, out_pre.radii + n);
+        captured_tiles_touched_.assign(out_pre.tiles_touched, out_pre.tiles_touched + n);
 
-        if (bin.values_sorted && R > 0) {
+        if (out_bin.values_sorted && R > 0) {
             captured_sorted_gaussian_ids_.resize(R);
             for (size_t i = 0; i < R; ++i) {
                 captured_sorted_gaussian_ids_[i] =
-                    static_cast<int>(bin.values_sorted[i]);
+                    static_cast<int>(out_bin.values_sorted[i]);
             }
         } else {
             captured_sorted_gaussian_ids_.clear();
         }
 
-        if (bin.tile_ranges && NT > 0) {
+        if (out_bin.tile_ranges && NT > 0) {
             captured_tile_offsets_.resize(NT * 2);
             for (size_t i = 0; i < NT * 2; ++i) {
-                captured_tile_offsets_[i] = static_cast<int>(bin.tile_ranges[i]);
+                captured_tile_offsets_[i] = static_cast<int>(out_bin.tile_ranges[i]);
             }
         } else {
             captured_tile_offsets_.clear();
         }
 
-        if (cache.T_final) {
-            captured_T_final_.assign(cache.T_final, cache.T_final + HW);
+        if (out_cache.T_final) {
+            captured_T_final_.assign(out_cache.T_final, out_cache.T_final + HW);
         } else {
             captured_T_final_.clear();
         }
-        if (cache.n_contrib) {
-            captured_n_contrib_.assign(cache.n_contrib, cache.n_contrib + HW);
+        if (out_cache.n_contrib) {
+            captured_n_contrib_.assign(out_cache.n_contrib, out_cache.n_contrib + HW);
         } else {
             captured_n_contrib_.clear();
         }
@@ -359,6 +458,32 @@ float VulkanTrainer::step(const Camera& cam,
     //    lambda_dssim=0 disables the O(W*H*WINDOW^2) SSIM computation (use for large images).
     last_loss_ = compute_combined_loss_gradient(
         image_.data(), target, dL_dpixels_.data(), W, H, tcfg_.lambda_dssim);
+
+    return last_loss_;
+}
+
+// ---------------------------------------------------------------------------
+// step
+// ---------------------------------------------------------------------------
+
+float VulkanTrainer::step(const Camera& cam,
+                          const RenderConfig& cfg,
+                          const float* target,
+                          int W,
+                          int H)
+{
+    // Steps 1-5: forward + loss. Out-params alias FrameAllocator memory which
+    // remains valid until the next alloc_.reset() — the backward path below
+    // reads them in-place.
+    PreprocessOutput pre{};
+    BinningOutput    bin{};
+    ForwardCache     cache{};
+    run_forward_and_loss(cam, cfg, target, W, H, pre, bin, cache);
+
+    // Re-derive active_cfg locally (run_forward_and_loss applies the same
+    // sh_degree override but the result is needed for the backward record).
+    RenderConfig active_cfg = cfg;
+    active_cfg.sh_degree = active_sh_degree_;
 
     // 6+7. Rasterize backward + preprocess backward chained into one CB.
     //      rasterize_bwd writes dL_d* to GPU; preprocess_bwd reads them directly.
@@ -441,10 +566,21 @@ float VulkanTrainer::step(const Camera& cam,
     //    are uploaded to separate buffers to match the separate raw param GPU bufs.
     grad_positions_gpu_->upload(grads.d_raw_positions,
                                 static_cast<size_t>(N_) * 3 * sizeof(float));
-    grad_sh_dc_gpu_->upload(grads.d_raw_sh_coeffs,
-                            static_cast<size_t>(N_) * 3 * sizeof(float));
+    {
+        // Same DC/REST gather as raw params: gradient layout matches raw_sh
+        // layout [N, K, 3] (preprocess_backward.comp:600-602 writes `d_sh[i*K*3+0..2]`
+        // for DC). Without this gather, group 1 (lr=2.5e-3) would receive G[0]'s
+        // 48 gradient floats and G[1]'s first 12 — wrong indices.
+        std::vector<float> dsh_dc_scratch(static_cast<size_t>(N_) * 3);
+        sh_gather_dc(grads.d_raw_sh_coeffs, N_, max_coeffs_, dsh_dc_scratch.data());
+        grad_sh_dc_gpu_->upload(dsh_dc_scratch.data(),
+                                static_cast<size_t>(N_) * 3 * sizeof(float));
+    }
     if (max_coeffs_ > 1) {
-        grad_sh_rest_gpu_->upload(grads.d_raw_sh_coeffs + static_cast<size_t>(N_) * 3,
+        std::vector<float> dsh_rest_scratch(
+            static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3);
+        sh_gather_rest(grads.d_raw_sh_coeffs, N_, max_coeffs_, dsh_rest_scratch.data());
+        grad_sh_rest_gpu_->upload(dsh_rest_scratch.data(),
                                   static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3 * sizeof(float));
     }
     grad_opacities_gpu_->upload(grads.d_raw_opacities,
@@ -503,12 +639,21 @@ float VulkanTrainer::step(const Camera& cam,
     //     so activate_params() on the next step sees the Adam-updated values.
     raw_param_gpu_bufs_[0]->download(raw_positions_.data(),
                                      static_cast<size_t>(N_) * 3 * sizeof(float));
-    // SH: download DC block to [0..N*3) and rest block to [N*3..end) of raw_sh_coeffs_.
-    raw_param_gpu_bufs_[1]->download(raw_sh_coeffs_.data(),
-                                     static_cast<size_t>(N_) * 3 * sizeof(float));
+    // SH: download DC [N,3] and REST [N,K-1,3] from their separate GPU buffers,
+    // then SCATTER back into the interleaved [N, K, 3] raw_sh_coeffs_ layout.
+    // Inverse of the gather done at upload (see sh_gather_dc note above).
+    {
+        std::vector<float> sh_dc_scratch(static_cast<size_t>(N_) * 3);
+        raw_param_gpu_bufs_[1]->download(sh_dc_scratch.data(),
+                                         static_cast<size_t>(N_) * 3 * sizeof(float));
+        sh_scatter_dc(sh_dc_scratch.data(), N_, max_coeffs_, raw_sh_coeffs_.data());
+    }
     if (max_coeffs_ > 1) {
-        raw_param_gpu_bufs_[2]->download(raw_sh_coeffs_.data() + static_cast<size_t>(N_) * 3,
+        std::vector<float> sh_rest_scratch(
+            static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3);
+        raw_param_gpu_bufs_[2]->download(sh_rest_scratch.data(),
                                          static_cast<size_t>(N_) * (max_coeffs_ - 1) * 3 * sizeof(float));
+        sh_scatter_rest(sh_rest_scratch.data(), N_, max_coeffs_, raw_sh_coeffs_.data());
     }
     raw_param_gpu_bufs_[3]->download(raw_opacities_.data(),
                                      static_cast<size_t>(N_) * sizeof(float));
@@ -582,6 +727,27 @@ float VulkanTrainer::step(const Camera& cam,
     }
 
     return last_loss_;
+}
+
+// ---------------------------------------------------------------------------
+// forward_only — forward + loss only, no backward / Adam / densification
+// ---------------------------------------------------------------------------
+// Used by VK-vs-CUDA parity harnesses on eval_3D=true paths where
+// RasterizerBackwardVulkan currently throws. The same accessors that step()
+// populates are valid after this call (rendered_image(), captured_*(),
+// last_loss()). Does NOT advance step_count_ — call sites that need parity
+// runs to be repeatable can compare against a fixed CUDA golden.
+
+float VulkanTrainer::forward_only(const Camera& cam,
+                                  const RenderConfig& cfg,
+                                  const float* target,
+                                  int W,
+                                  int H)
+{
+    PreprocessOutput pre{};
+    BinningOutput    bin{};
+    ForwardCache     cache{};
+    return run_forward_and_loss(cam, cfg, target, W, H, pre, bin, cache);
 }
 
 // ---------------------------------------------------------------------------
@@ -692,16 +858,23 @@ void VulkanTrainer::reallocate_for_n(int new_N)
 
     raw_param_gpu_bufs_[1] = std::make_unique<VulkanBuffer>(
         ctx_, sz_sh_dc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    if (N_ > 0)
-        raw_param_gpu_bufs_[1]->upload(raw_sh_coeffs_.data(),
+    if (N_ > 0) {
+        // SH DC gather: see helper note at top of file.
+        std::vector<float> sh_dc_scratch(static_cast<size_t>(N_) * 3);
+        sh_gather_dc(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_dc_scratch.data());
+        raw_param_gpu_bufs_[1]->upload(sh_dc_scratch.data(),
                                        static_cast<size_t>(N_) * 3 * sizeof(float));
+    }
 
     raw_param_gpu_bufs_[2] = std::make_unique<VulkanBuffer>(
         ctx_, sz_sh_rest, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    if (N_ > 0 && max_coeffs_ > 1)
-        raw_param_gpu_bufs_[2]->upload(
-            raw_sh_coeffs_.data() + static_cast<size_t>(N_) * 3,
+    if (N_ > 0 && max_coeffs_ > 1) {
+        std::vector<float> sh_rest_scratch(
+            static_cast<size_t>(N_) * rest_coeffs * 3);
+        sh_gather_rest(raw_sh_coeffs_.data(), N_, max_coeffs_, sh_rest_scratch.data());
+        raw_param_gpu_bufs_[2]->upload(sh_rest_scratch.data(),
             static_cast<size_t>(N_) * rest_coeffs * 3 * sizeof(float));
+    }
 
     raw_param_gpu_bufs_[3] = std::make_unique<VulkanBuffer>(
         ctx_, sz_N, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);

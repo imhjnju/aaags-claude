@@ -154,8 +154,9 @@ TEST(Basketball, Training2000Steps)
     }
 
     // --- Load reference image ---
+    // TEST_DATA_DIR = <project>/tests; go up one level to reach <project>/tools/
     const std::string ref_img_path =
-        std::string(TEST_DATA_DIR) + "/../../tools/basket0_ref_cam0.png";
+        std::string(TEST_DATA_DIR) + "/../tools/basket0_ref_cam0.png";
     ASSERT_TRUE(std::filesystem::exists(ref_img_path))
         << "Reference image not found: " << ref_img_path;
 

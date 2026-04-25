@@ -52,11 +52,13 @@ public:
         VkBuffer mean_offset;        // WO float[N*3]   (binding 21, eval_3D only)
     };
 
-    /// @param spec_training 1=training (skip SH RGB clamp), 0=inference (clamp)
-    /// @param spec_eval_3D  always 0 in SP-2 (2D anti-aliasing path)
+    /// @param spec_training   1=training (skip SH RGB clamp), 0=inference (clamp)
+    /// @param spec_eval_3D    1=eval_3D path, 0=2D path
+    /// @param spec_proper_ewa 1=AAA proper_ewa_scaling+tight_opacity_bounding+rect_bounding
     PreprocessPass(VulkanContext& ctx,
                    uint32_t spec_training,
-                   uint32_t spec_eval_3D);
+                   uint32_t spec_eval_3D,
+                   uint32_t spec_proper_ewa = 0u);
 
     ~PreprocessPass() = default;
 

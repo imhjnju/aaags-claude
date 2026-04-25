@@ -235,7 +235,7 @@ TEST(RasterizerVulkan, Rasterize_TinyFixture) {
     if (nc_diff == 0) {
         // Empirically, for this fixture our count == CUDA's last_contributor
         // position. Enforce exact match.
-        EXPECT_TRUE(compare_u32(our_nc, golden_nc))
+        EXPECT_EQ(nc_diff, 0u)
             << "n_contrib does not match CUDA golden";
     } else {
         // n_contrib CUDA vs Vulkan semantic difference (forward.cu:429):

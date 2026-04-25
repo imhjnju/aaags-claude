@@ -31,11 +31,12 @@
 #include <stdexcept>
 #include <vector>
 
-PreprocessorVulkan::PreprocessorVulkan(VulkanContext& ctx, bool eval_3D)
-    : ctx_(ctx), eval_3D_(eval_3D) {
+PreprocessorVulkan::PreprocessorVulkan(VulkanContext& ctx, bool eval_3D, bool proper_ewa)
+    : ctx_(ctx), eval_3D_(eval_3D), proper_ewa_(proper_ewa) {
     pass_ = std::make_unique<PreprocessPass>(ctx_,
                                              /*spec_training=*/1u,
-                                             /*spec_eval_3D=*/eval_3D ? 1u : 0u);
+                                             /*spec_eval_3D=*/eval_3D ? 1u : 0u,
+                                             /*spec_proper_ewa=*/proper_ewa ? 1u : 0u);
 }
 
 // Out-of-line destructor so std::unique_ptr<PreprocessPass> can see the
@@ -54,6 +55,12 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     if (cfg.antialiasing)
         throw std::runtime_error(
             "PreprocessorVulkan: antialiasing flag not supported");
+
+    if (g.count <= 0) {
+        PreprocessOutput out{};
+        out.eval_3D = eval_3D_;
+        return out;
+    }
 
     const int N = g.count;
     const int M = g.max_coeffs;  // (sh_degree+1)^2

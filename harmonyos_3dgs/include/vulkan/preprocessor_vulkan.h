@@ -34,7 +34,8 @@ class VulkanBuffer;
 
 class PreprocessorVulkan : public Preprocessor {
 public:
-    explicit PreprocessorVulkan(VulkanContext& ctx, bool eval_3D = false);
+    explicit PreprocessorVulkan(VulkanContext& ctx, bool eval_3D = false,
+                                bool proper_ewa = true);
     // Defined out-of-line in preprocessor_vulkan.cpp because
     // std::unique_ptr<PreprocessPass> requires PreprocessPass to be complete
     // at the destruction point.
@@ -83,6 +84,7 @@ public:
 private:
     VulkanContext& ctx_;
     bool eval_3D_ = false;
+    bool proper_ewa_ = false;
     std::unique_ptr<PreprocessPass> pass_;
 
     // Layer-1 per-call ForwardCache output buffers.

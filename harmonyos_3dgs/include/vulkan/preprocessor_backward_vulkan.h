@@ -25,7 +25,17 @@
 
 class PreprocessorBackwardVulkan {
 public:
-    explicit PreprocessorBackwardVulkan(VulkanContext& ctx);
+    /// @param proper_ewa  Must match the value passed to the forward
+    /// PreprocessorVulkan / PreprocessorCPU. Gates the h_conv_scaling chain
+    /// rule in the backward shader (mirrors CUDA backward.cu:215).
+    /// Default true: legacy regression tests (PreprocessorBackwardVulkan.*) pair
+    /// this class with PreprocessorCPU forward, which applies h_conv
+    /// UNCONDITIONALLY — so the default mirrors CPU's "always-on" behavior.
+    /// Callers that drive forward with proper_ewa=false (e.g. VulkanTrainer
+    /// with VkTrainingConfig::proper_ewa=false) MUST pass false explicitly to
+    /// gate the h_conv chain rule off.
+    explicit PreprocessorBackwardVulkan(VulkanContext& ctx,
+                                        bool proper_ewa = true);
     ~PreprocessorBackwardVulkan();
 
     PreprocessorBackwardVulkan(const PreprocessorBackwardVulkan&)            = delete;

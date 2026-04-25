@@ -34,9 +34,11 @@
 #include <stdexcept>
 #include <vector>
 
-PreprocessorBackwardVulkan::PreprocessorBackwardVulkan(VulkanContext& ctx)
+PreprocessorBackwardVulkan::PreprocessorBackwardVulkan(VulkanContext& ctx,
+                                                       bool proper_ewa)
     : ctx_(ctx) {
-    pass_ = std::make_unique<PreprocessBackwardPass>(ctx_);
+    pass_ = std::make_unique<PreprocessBackwardPass>(
+        ctx_, proper_ewa ? 1u : 0u);
 }
 
 PreprocessorBackwardVulkan::~PreprocessorBackwardVulkan() = default;

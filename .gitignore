@@ -18,3 +18,17 @@ dev_notes/ground_truth/**/*.ply
 # committed; .npy/.npz produced at test-prep time.
 harmonyos_3dgs/tests/golden/basketball/cuda_ref/**/*.npy
 harmonyos_3dgs/tests/golden/basketball/cuda_ref/**/*.npz
+
+# CMake build artifacts and runtime dumps
+harmonyos_3dgs/build/
+# broken symlink leftover from earlier worktrees
+harmonyos_3dgs/golden
+harmonyos_3dgs/trained.ply
+harmonyos_3dgs/vk_float.raw
+harmonyos_3dgs/tools/__pycache__/
+harmonyos_3dgs/train/
+train/
+# Test output dumps written under tests/golden/tiny/ at runtime (binary raw)
+harmonyos_3dgs/tests/golden/tiny/step000001/cam0000/vk_eval3d_image.raw
+# Symlink created at runtime to bridge tests/test_data -> tests/golden
+harmonyos_3dgs/tests/test_data/golden/tiny

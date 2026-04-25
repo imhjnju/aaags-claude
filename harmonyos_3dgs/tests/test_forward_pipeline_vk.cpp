@@ -63,6 +63,7 @@ std::string tiny_cam0_dir() {
 }
 
 std::vector<float> npy_to_f32_vec(const NpyArray& a) {
+    assert_dtype(a, NpyDtype::float32);
     std::vector<float> v(a.numel());
     std::memcpy(v.data(), a.raw.data(), a.numel() * sizeof(float));
     return v;
@@ -419,8 +420,8 @@ TEST(ForwardPipeline, FullChain_TinyFixture_Eval3D) {
         if (R_ours == 0u) {
             // All Gaussians culled by eval_3D — output is just background.
             std::cerr << "[ForwardPipeline eval_3D] All Gaussians culled "
-                      << "(R_ours=0). Test is vacuous — passing.\n";
-            return;
+                      << "(R_ours=0). Test is vacuous.\n";
+            GTEST_SKIP() << "R_ours == 0: all Gaussians culled";
         }
         sorter.sort(bin, alloc);
         raster.rasterize(pre, bin, cam, cfg, sync_out.data());
@@ -528,7 +529,7 @@ TEST(ForwardPipeline, FullChain_TinyFixture_Eval3D) {
 
     // Dump Vulkan eval_3D image as raw f32 for offline analysis.
     {
-        const std::string dump_path = root + "/vk_eval3d_image.raw";
+        const std::string dump_path = "/tmp/vk_eval3d_image.raw";
         FILE* fp = fopen(dump_path.c_str(), "wb");
         if (fp) {
             fwrite(rec_out.data(), sizeof(float), rec_out.size(), fp);
