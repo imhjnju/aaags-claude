@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from scene import Scene, GaussianModel
 from gaussian_renderer import render
+from diff_gaussian_rasterization import ExtendedSettings
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.loss_utils import l1_loss
 
@@ -44,7 +45,7 @@ def main():
         "--iterations", str(args.iterations),
         "--sh_degree", str(args.sh_degree),
         "--resolution", str(args.resolution),
-        "--eval", "--depths", "",
+        "--eval",
     ]
     full_parser = argparse.ArgumentParser()
     mp = ModelParams(full_parser, sentinel=True)
@@ -60,7 +61,7 @@ def main():
         opt.densify_from_iter = args.iterations + 1
         opt.densify_until_iter = 0
 
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
@@ -79,7 +80,7 @@ def main():
         viewpoint_idx = torch.randint(0, len(train_cams), (1,)).item()
         viewpoint_cam = train_cams[viewpoint_idx]
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=ExtendedSettings())
         image = render_pkg["render"]
         gt = viewpoint_cam.original_image.cuda()
         loss = l1_loss(image, gt)
@@ -97,7 +98,27 @@ def main():
             print(f"  iter {iteration}: loss={loss.item():.6f} view={viewpoint_idx}",
                   file=sys.stderr)
 
-    print(f"Done. Final loss={loss.item():.6f}", file=sys.stderr)
+    # Save trained model
+    output_dir = os.path.join(args.output, "point_cloud", f"iteration_{args.iterations}")
+    os.makedirs(output_dir, exist_ok=True)
+    gaussians.save_ply(os.path.join(output_dir, "point_cloud.ply"))
+
+    # Render from first camera and compute PSNR
+    import math
+    eval_cam = train_cams[0]
+    render_pkg = render(eval_cam, gaussians, pipe, bg, splat_args=ExtendedSettings())
+    rendered = render_pkg["render"].detach().clamp(0, 1)
+    gt_eval = eval_cam.original_image.cuda().clamp(0, 1)
+    mse = torch.mean((rendered - gt_eval) ** 2).item()
+    psnr = -10.0 * math.log10(mse) if mse > 0 else float('inf')
+    print(f"\n# PSNR (cam0, iter {args.iterations}): {psnr:.2f} dB", file=sys.stderr)
+
+    # Save rendered image as numpy
+    render_np = rendered.permute(1, 2, 0).cpu().numpy()
+    np.save(os.path.join(args.output, "final_render.npy"), render_np)
+    np.save(os.path.join(args.output, "gt_cam0.npy"), gt_eval.permute(1, 2, 0).cpu().numpy())
+
+    print(f"Done. Final loss={loss.item():.6f}, PSNR={psnr:.2f}dB", file=sys.stderr)
 
 
 if __name__ == "__main__":
