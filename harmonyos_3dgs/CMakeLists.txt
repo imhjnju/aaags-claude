@@ -296,7 +296,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_vs_py_reference.cpp
                 tests/test_vk_vs_cpu_render.cpp
                 tests/test_vk_vs_cuda_basketball.cpp
-                tests/test_vk_vs_cuda_first_loss.cpp)
+                tests/test_vk_vs_cuda_first_loss.cpp
+                tests/test_vk_vs_cuda_10step.cpp   # TEMP DIAGNOSTIC — basketball VK-vs-CUDA 10-step parity
+                tests/test_vk_vs_cuda_100step.cpp) # TEMP DIAGNOSTIC — basketball VK-vs-CUDA 100-step parity
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

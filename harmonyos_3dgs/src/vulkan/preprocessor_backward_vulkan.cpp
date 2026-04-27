@@ -43,6 +43,53 @@ PreprocessorBackwardVulkan::PreprocessorBackwardVulkan(VulkanContext& ctx,
 
 PreprocessorBackwardVulkan::~PreprocessorBackwardVulkan() = default;
 
+void PreprocessorBackwardVulkan::clear_grad_buffers(VkCommandBuffer cmd) {
+    // Clear all gradient output buffers to prevent accumulation of stale data.
+    // Note: Currently unused - backward_record_into already clears via CPU upload.
+    // vkCmdFillBuffer is efficient: GPU fills the buffer with a constant value.
+    // Must use a pipeline barrier after to ensure fills complete before shaders read.
+
+    VkBufferMemoryBarrier barriers[7];
+    uint32_t num_barriers = 0;
+
+    auto add_barrier = [&](VulkanBuffer* buf) {
+        VkBufferMemoryBarrier& b = barriers[num_barriers++];
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf->handle();
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+    };
+
+    // Fill all gradient buffers with zeros
+    // Note: This is called before backward_record_into, so we check pointer validity
+    // instead of buf_N_ (which is set by prepare_for_n called from backward_record_into).
+    if (dm3d_buf_ && dsh_buf_ && dsc_buf_ && drot_buf_ && d_raw_opa_buf_) {
+        vkCmdFillBuffer(cmd, dm3d_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, dsh_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, dsc_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, drot_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, d_raw_opa_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
+
+        add_barrier(dm3d_buf_.get());
+        add_barrier(dsh_buf_.get());
+        add_barrier(dsc_buf_.get());
+        add_barrier(drot_buf_.get());
+        add_barrier(d_raw_opa_buf_.get());
+    }
+
+    // Barrier to ensure fills complete before shaders write to these buffers
+    if (num_barriers > 0) {
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, num_barriers, barriers, 0, nullptr);
+    }
+}
+
 void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
     if (N <= buf_N_ && K <= buf_K_) return;
 

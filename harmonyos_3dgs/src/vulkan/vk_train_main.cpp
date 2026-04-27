@@ -504,6 +504,12 @@ int main(int argc, char** argv) {
     VkTrainingConfig tcfg{};
     tcfg.max_steps = args.iterations;
     tcfg.densify_from_step = 0;
+    tcfg.lambda_dssim = 0.0f;     // L1-only (match CUDA reference for parity)
+    tcfg.opacity_reg = 0.0f;      // Disable regularization (CUDA has none)
+    tcfg.scale_reg = 0.0f;        // Disable regularization (CUDA has none)
+    tcfg.pos_lr_final = 1.6e-4f;  // Disable LR decay (CUDA uses constant LR)
+    tcfg.sh_degree_warmup = 0;    // Disable SH warmup (CUDA uses degree 3 from start)
+    tcfg.noise_lr = 0.0f;         // Disable position noise (CUDA has no such feature)
 
     // Build training views
     std::vector<TrainView> views;

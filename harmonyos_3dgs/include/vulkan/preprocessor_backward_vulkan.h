@@ -84,6 +84,11 @@ public:
     void download_grads(int num_gaussians, int max_coeffs,
                         GradientOutput& grads, FrameAllocator& alloc);
 
+    /// Clear all gradient output buffers to zero before backward pass.
+    /// Critical for correctness: backward shaders only write to active Gaussians,
+    /// so stale data from previous steps would accumulate without clearing.
+    void clear_grad_buffers(VkCommandBuffer cmd);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<PreprocessBackwardPass> pass_;
