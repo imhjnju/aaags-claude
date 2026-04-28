@@ -22,6 +22,7 @@
 #include "vulkan/preprocess_backward_pass.h"
 
 #include <memory>
+#include <vector>
 
 class PreprocessorBackwardVulkan {
 public:
@@ -89,6 +90,15 @@ public:
     /// so stale data from previous steps would accumulate without clearing.
     void clear_grad_buffers(VkCommandBuffer cmd);
 
+    void enable_debug_capture(bool enable) { debug_capture_enabled_ = enable; }
+    void download_debug_buffers(int num_gaussians,
+                                std::vector<float>& d_fabc,
+                                std::vector<float>& d_cov3D,
+                                std::vector<float>& d_M,
+                                std::vector<float>& d_scale,
+                                std::vector<float>& d_R,
+                                std::vector<float>& d_qn) const;
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<PreprocessBackwardPass> pass_;
@@ -123,6 +133,14 @@ private:
     std::unique_ptr<VulkanBuffer> drot_buf_;       // d_rotations [N*4] f32
     std::unique_ptr<VulkanBuffer> d_raw_opa_buf_;  // d_raw_opacities [N] f32
     std::unique_ptr<VulkanBuffer> ubo_buf_;        // PreprocessBackwardUBO (192B)
+
+    bool debug_capture_enabled_ = false;
+    std::unique_ptr<VulkanBuffer> dbg_d_fabc_buf_;   // [N*3] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_cov3D_buf_;  // [N*6] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_M_buf_;      // [N*9] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_scale_buf_;  // [N*3] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_R_buf_;      // [N*9] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_qn_buf_;     // [N*4] f32
 
     void prepare_for_n(int N, int max_coeffs);
 };

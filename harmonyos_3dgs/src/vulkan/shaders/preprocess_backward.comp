@@ -61,6 +61,12 @@ layout(std430, set = 0, binding = 19) readonly  buffer BufPViewCacheIn    { floa
 layout(std430, set = 0, binding = 20) readonly  buffer BufCov2DCacheIn    { float cov2D_cache_in[];     };
 layout(std430, set = 0, binding = 21) readonly  buffer BufCov2DDetCacheIn { float cov2D_det_cache_in[]; };
 layout(std430, set = 0, binding = 22) readonly  buffer BufPHomWCacheIn    { float p_hom_w_cache_in[];   };
+layout(std430, set = 0, binding = 23) writeonly buffer BufDbgDFabc         { float dbg_d_fabc[];         };
+layout(std430, set = 0, binding = 24) writeonly buffer BufDbgDCov3D        { float dbg_d_cov3D[];        };
+layout(std430, set = 0, binding = 25) writeonly buffer BufDbgDM            { float dbg_d_M[];            };
+layout(std430, set = 0, binding = 26) writeonly buffer BufDbgDScale        { float dbg_d_scale[];        };
+layout(std430, set = 0, binding = 27) writeonly buffer BufDbgDR            { float dbg_d_R[];            };
+layout(std430, set = 0, binding = 28) writeonly buffer BufDbgDQn           { float dbg_d_qn[];           };
 
 // ---- UBO (std140, binding 16) ----------------------------------------------
 layout(std140, set = 0, binding = 16) uniform PreprocessBwdUBO {
@@ -79,8 +85,27 @@ layout(std140, set = 0, binding = 16) uniform PreprocessBwdUBO {
     uint     training;        // 1 = training (no clamp upper)
     uint     cam_width;       // pixel width  (offset 180)
     uint     cam_height;      // pixel height (offset 184)
-    uint     _pad2;
+    uint     debug_capture;
 } ubo;
+
+void write_debug_zero(uint i, uint base3, uint base4) {
+    if (ubo.debug_capture == 0u) return;
+    dbg_d_fabc[base3 + 0u] = 0.0;
+    dbg_d_fabc[base3 + 1u] = 0.0;
+    dbg_d_fabc[base3 + 2u] = 0.0;
+    for (uint k = 0u; k < 6u; ++k) dbg_d_cov3D[i * 6u + k] = 0.0;
+    for (uint k = 0u; k < 9u; ++k) {
+        dbg_d_M[i * 9u + k] = 0.0;
+        dbg_d_R[i * 9u + k] = 0.0;
+    }
+    dbg_d_scale[base3 + 0u] = 0.0;
+    dbg_d_scale[base3 + 1u] = 0.0;
+    dbg_d_scale[base3 + 2u] = 0.0;
+    dbg_d_qn[base4 + 0u] = 0.0;
+    dbg_d_qn[base4 + 1u] = 0.0;
+    dbg_d_qn[base4 + 2u] = 0.0;
+    dbg_d_qn[base4 + 3u] = 0.0;
+}
 
 // ---- SH constants ----------------------------------------------------------
 const float SH_C0 = 0.28209479177387814;
@@ -147,6 +172,7 @@ void main() {
         d_rotations[base4 + 2u] = 0.0;
         d_rotations[base4 + 3u] = 0.0;
         d_raw_opacities[i] = 0.0;
+        write_debug_zero(i, base3, base4);
         return;
     }
 
@@ -251,6 +277,7 @@ void main() {
         d_rotations[base4 + 2u] = 0.0;
         d_rotations[base4 + 3u] = 0.0;
         d_raw_opacities[i] = 0.0;
+        write_debug_zero(i, base3, base4);
         return;
     }
 
@@ -532,6 +559,24 @@ void main() {
     d_rotations[base4 + 1u] = (d_qn_x - qx * dot_dqn_qn) * inv_len;
     d_rotations[base4 + 2u] = (d_qn_y - qy * dot_dqn_qn) * inv_len;
     d_rotations[base4 + 3u] = (d_qn_z - qz * dot_dqn_qn) * inv_len;
+
+    if (ubo.debug_capture != 0u) {
+        dbg_d_fabc[base3 + 0u] = d_fa;
+        dbg_d_fabc[base3 + 1u] = d_fb;
+        dbg_d_fabc[base3 + 2u] = d_fc;
+        for (uint k = 0u; k < 6u; ++k) dbg_d_cov3D[i * 6u + k] = d_cov3D[k];
+        for (uint k = 0u; k < 9u; ++k) {
+            dbg_d_M[i * 9u + k] = d_M[k];
+            dbg_d_R[i * 9u + k] = d_R[k];
+        }
+        dbg_d_scale[base3 + 0u] = d_scale0;
+        dbg_d_scale[base3 + 1u] = d_scale1;
+        dbg_d_scale[base3 + 2u] = d_scale2;
+        dbg_d_qn[base4 + 0u] = d_qn_r;
+        dbg_d_qn[base4 + 1u] = d_qn_x;
+        dbg_d_qn[base4 + 2u] = d_qn_y;
+        dbg_d_qn[base4 + 3u] = d_qn_z;
+    }
 
     // =========================================================================
     // Part C: d_rgb -> d_sh (SH backward)

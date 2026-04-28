@@ -21,6 +21,7 @@
 #include "vulkan/rasterize_backward_pass.h"
 
 #include <memory>
+#include <vector>
 
 class RasterizerBackwardVulkan {
 public:
@@ -62,6 +63,12 @@ public:
     VkBuffer dL_dconics_buf()  const { return dlcon_buf_ ? dlcon_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dopacity_buf() const { return dlopa_buf_ ? dlopa_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dcolors_buf()  const { return dlcol_buf_ ? dlcol_buf_->handle() : VK_NULL_HANDLE; }
+
+    void download_outputs(int num_gaussians,
+                          std::vector<float>& d_means2D,
+                          std::vector<float>& d_conics,
+                          std::vector<float>& d_opacity,
+                          std::vector<float>& d_rgb) const;
 
     /// Record backward pass into cmd (no submit, no download).
     /// Uploads inputs to persistent GPU buffers, calls pass_->record().

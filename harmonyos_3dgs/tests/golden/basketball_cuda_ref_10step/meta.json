@@ -1,0 +1,52 @@
+{
+  "marker": "TEMP DIAGNOSTIC \u2014 basketball VK-vs-CUDA 10-step parity",
+  "ply": "/home/robota/Downloads/basketball/sparse/0/points3D.ply",
+  "gt_image": "/home/robota/Downloads/basketball/images/78899858295079.jpg",
+  "N": 2892,
+  "W": 720,
+  "H": 960,
+  "sh_degree": 3,
+  "max_coeffs": 16,
+  "init_raw_scale": -3.506557897319982,
+  "init_raw_opacity": -2.197224577336219,
+  "C0": 0.28209479177387814,
+  "rotation_init": "identity quaternion (w,x,y,z) = (1,0,0,0)",
+  "lr": {
+    "pos": 0.00016,
+    "sh_dc": 0.0025,
+    "sh_rest": 0.000125,
+    "op": 0.05,
+    "sca": 0.005,
+    "rot": 0.001
+  },
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "eps": 1e-15,
+  "proper_ewa_scaling": false,
+  "eval_3D": false,
+  "lambda_dssim": 0.0,
+  "background": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "loss": "L1(rendered, gt).mean() over CHW pixels",
+  "sh_degree_active_per_step": "all steps = sh_degree when sh_degree_warmup=0",
+  "view_matrix_source": "test_e2e_basketball.cpp:290-305 (column-major W2C)",
+  "viewproj_source": "test_e2e_basketball.cpp:314-329 (column-major full_proj)",
+  "losses": [
+    0.5717757940292358,
+    0.5712934732437134,
+    0.57079017162323,
+    0.5702685117721558,
+    0.5697243809700012,
+    0.5691590905189514,
+    0.5685675144195557,
+    0.5679510235786438,
+    0.5673073530197144,
+    0.5666342377662659
+  ],
+  "total_seconds": 0.4401535987854004
+}

@@ -52,6 +52,8 @@ public:
     // Zero all m/v moment buffers for all groups (for oracle testing).
     void zero_moments();
 
+    void download_moments(int idx, std::vector<float>& out_m, std::vector<float>& out_v) const;
+
     // Dispatch one Adam step for group `idx` synchronously (submit+wait).
     // params_buf: GPU buffer of grp.n floats — updated in-place.
     // grad_buf:   GPU buffer of grp.n floats — gradient (read-only).

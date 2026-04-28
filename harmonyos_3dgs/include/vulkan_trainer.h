@@ -85,6 +85,10 @@ public:
     const std::vector<float>& captured_grad_sh()         const { return captured_grad_sh_; }
     const std::vector<float>& captured_grad_opacities()  const { return captured_grad_opacities_; }
 
+    void enable_adam_capture(bool on) { capture_adam_ = on; }
+    const std::vector<std::vector<float>>& captured_adam_m() const { return captured_adam_m_; }
+    const std::vector<std::vector<float>>& captured_adam_v() const { return captured_adam_v_; }
+
     // Intermediate forward-pass capture — for VK-vs-CUDA parity tests only.
     // When enabled, step() copies per-Gaussian and per-tile forward-pass
     // intermediates into CPU-side std::vector fields after the rasterize pass
@@ -100,6 +104,18 @@ public:
     const std::vector<int>&      captured_tile_offsets()        const { return captured_tile_offsets_; }
     const std::vector<float>&    captured_T_final()             const { return captured_T_final_; }
     const std::vector<int>&      captured_n_contrib()           const { return captured_n_contrib_; }
+
+    void enable_backward_diagnostic_capture(bool enable);
+    const std::vector<float>& captured_bwd_d_means2D() const { return captured_bwd_d_means2D_; }
+    const std::vector<float>& captured_bwd_d_conics()  const { return captured_bwd_d_conics_; }
+    const std::vector<float>& captured_bwd_d_opacity() const { return captured_bwd_d_opacity_; }
+    const std::vector<float>& captured_bwd_d_rgb()     const { return captured_bwd_d_rgb_; }
+    const std::vector<float>& captured_bwd_d_fabc()    const { return captured_bwd_d_fabc_; }
+    const std::vector<float>& captured_bwd_d_cov3D()   const { return captured_bwd_d_cov3D_; }
+    const std::vector<float>& captured_bwd_d_M()       const { return captured_bwd_d_M_; }
+    const std::vector<float>& captured_bwd_d_scale()   const { return captured_bwd_d_scale_; }
+    const std::vector<float>& captured_bwd_d_R()       const { return captured_bwd_d_R_; }
+    const std::vector<float>& captured_bwd_d_qn()      const { return captured_bwd_d_qn_; }
 
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
@@ -192,6 +208,10 @@ private:
     std::vector<float>         captured_grad_sh_;          // [N*max_coeffs*3]
     std::vector<float>         captured_grad_opacities_;   // [N]
 
+    bool                       capture_adam_ = false;
+    std::vector<std::vector<float>> captured_adam_m_;      // six Adam groups
+    std::vector<std::vector<float>> captured_adam_v_;      // six Adam groups
+
     // Intermediate forward-pass capture. All fields remain empty unless
     // capture_intermediates_ is enabled; vectors are populated inside step()
     // after rasterize and before backward.
@@ -205,6 +225,18 @@ private:
     std::vector<int>           captured_tile_offsets_;         // [num_tiles*2] (start, end) flat
     std::vector<float>         captured_T_final_;              // [H*W]
     std::vector<int>           captured_n_contrib_;            // [H*W]
+
+    bool                       capture_backward_diagnostics_ = false;
+    std::vector<float>         captured_bwd_d_means2D_;        // [N*2]
+    std::vector<float>         captured_bwd_d_conics_;         // [N*3]
+    std::vector<float>         captured_bwd_d_opacity_;        // [N]
+    std::vector<float>         captured_bwd_d_rgb_;            // [N*3]
+    std::vector<float>         captured_bwd_d_fabc_;           // [N*3]
+    std::vector<float>         captured_bwd_d_cov3D_;          // [N*6]
+    std::vector<float>         captured_bwd_d_M_;              // [N*9]
+    std::vector<float>         captured_bwd_d_scale_;          // [N*3]
+    std::vector<float>         captured_bwd_d_R_;              // [N*9]
+    std::vector<float>         captured_bwd_d_qn_;             // [N*4]
 
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;

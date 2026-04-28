@@ -100,7 +100,7 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     , alloc_(64u * 1024u * 1024u)
     , vulkan_adam_(ctx_, 0.9f, 0.999f, 1e-15f)
     , tcfg_(tcfg)
-    , active_sh_degree_(0)
+    , active_sh_degree_(tcfg.sh_degree_warmup > 0 ? 0 : tcfg.sh_degree_max)
     , preprocessor_(ctx, /*eval_3D=*/tcfg.eval_3D, tcfg.proper_ewa)
     , binner_(ctx)
     , sorter_(ctx)
@@ -241,6 +241,23 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
 
     // 9. Initialize accumulated gradient norms (for densification).
     grad_means2D_accum_.assign(static_cast<size_t>(N_), 0.0f);
+}
+
+void VulkanTrainer::enable_backward_diagnostic_capture(bool enable) {
+    capture_backward_diagnostics_ = enable;
+    preprocessor_bwd_.enable_debug_capture(enable);
+    if (!enable) {
+        captured_bwd_d_means2D_.clear();
+        captured_bwd_d_conics_.clear();
+        captured_bwd_d_opacity_.clear();
+        captured_bwd_d_rgb_.clear();
+        captured_bwd_d_fabc_.clear();
+        captured_bwd_d_cov3D_.clear();
+        captured_bwd_d_M_.clear();
+        captured_bwd_d_scale_.clear();
+        captured_bwd_d_R_.clear();
+        captured_bwd_d_qn_.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +527,20 @@ float VulkanTrainer::step(const Camera& cam,
         ctx_.submitAndWait(bwd_cmd);
         ctx_.freePrimary(bwd_cmd);
     }
+    if (capture_backward_diagnostics_) {
+        rasterizer_bwd_.download_outputs(N_,
+            captured_bwd_d_means2D_,
+            captured_bwd_d_conics_,
+            captured_bwd_d_opacity_,
+            captured_bwd_d_rgb_);
+        preprocessor_bwd_.download_debug_buffers(N_,
+            captured_bwd_d_fabc_,
+            captured_bwd_d_cov3D_,
+            captured_bwd_d_M_,
+            captured_bwd_d_scale_,
+            captured_bwd_d_R_,
+            captured_bwd_d_qn_);
+    }
     preprocessor_bwd_.download_grads(N_, max_coeffs_, grads, alloc_);
 
     // SP-6 T2: Regularization gradient injection.
@@ -633,6 +664,14 @@ float VulkanTrainer::step(const Camera& cam,
         vkEndCommandBuffer(adam_cmd);
         ctx_.submitAndWait(adam_cmd);
         ctx_.freePrimary(adam_cmd);
+    }
+
+    if (capture_adam_) {
+        captured_adam_m_.resize(6);
+        captured_adam_v_.resize(6);
+        for (int i = 0; i < 6; ++i) {
+            vulkan_adam_.download_moments(i, captured_adam_m_[i], captured_adam_v_[i]);
+        }
     }
 
     // 10. Download updated raw params from GPU back to CPU vectors,

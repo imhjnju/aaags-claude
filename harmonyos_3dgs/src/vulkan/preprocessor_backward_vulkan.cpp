@@ -100,6 +100,7 @@ void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
     const VkDeviceSize sz_N4 = static_cast<VkDeviceSize>(N_new) * 4u * sizeof(float);
     const VkDeviceSize sz_N2 = static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float);
     const VkDeviceSize sz_N6 = static_cast<VkDeviceSize>(N_new) * 6u * sizeof(float);
+    const VkDeviceSize sz_N9 = static_cast<VkDeviceSize>(N_new) * 9u * sizeof(float);
     const VkDeviceSize sz_N  = static_cast<VkDeviceSize>(N_new) * sizeof(float);
     const VkDeviceSize sz_Ni = static_cast<VkDeviceSize>(N_new) * sizeof(int32_t);
     const VkDeviceSize sz_sh = static_cast<VkDeviceSize>(N_new) * static_cast<VkDeviceSize>(K_new) * 3u * sizeof(float);
@@ -129,6 +130,12 @@ void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
     ubo_buf_       = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    dbg_d_fabc_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dbg_d_cov3D_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N6, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dbg_d_M_buf_     = std::make_unique<VulkanBuffer>(ctx_, sz_N9, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dbg_d_scale_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dbg_d_R_buf_     = std::make_unique<VulkanBuffer>(ctx_, sz_N9, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dbg_d_qn_buf_    = std::make_unique<VulkanBuffer>(ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     buf_N_ = N_new; buf_K_ = K_new;
 }
@@ -258,6 +265,7 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     ubo.training        = cfg.training ? 1u : 0u;
     ubo.cam_width       = static_cast<uint32_t>(cam.width);
     ubo.cam_height      = static_cast<uint32_t>(cam.height);
+    ubo.debug_capture   = debug_capture_enabled_ ? 1u : 0u;
     ubo_buf_->upload(&ubo, sizeof(ubo));
 
     // --- Bind and dispatch --------------------------------------------------
@@ -284,6 +292,12 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     pb.cov2D_cache_in     = cov2d_in_buf_ ->handle();
     pb.cov2D_det_cache_in = c2ddet_in_buf_->handle();
     pb.p_hom_w_cache_in   = phomw_in_buf_ ->handle();
+    pb.debug_d_fabc       = dbg_d_fabc_buf_ ->handle();
+    pb.debug_d_cov3D      = dbg_d_cov3D_buf_->handle();
+    pb.debug_d_M          = dbg_d_M_buf_    ->handle();
+    pb.debug_d_scale      = dbg_d_scale_buf_->handle();
+    pb.debug_d_R          = dbg_d_R_buf_    ->handle();
+    pb.debug_d_qn         = dbg_d_qn_buf_   ->handle();
 
     pass_->bind_buffers(pb, ubo_buf_->handle());
     pass_->dispatch_sync(static_cast<uint32_t>(N));
@@ -411,6 +425,7 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     ubo.training        = cfg.training ? 1u : 0u;
     ubo.cam_width       = static_cast<uint32_t>(cam.width);
     ubo.cam_height      = static_cast<uint32_t>(cam.height);
+    ubo.debug_capture   = debug_capture_enabled_ ? 1u : 0u;
     ubo_buf_->upload(&ubo, sizeof(ubo));
 
     // --- Bind and record into cmd ------------------------------------------
@@ -439,6 +454,12 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     pb.cov2D_cache_in     = cov2d_in_buf_ ->handle();
     pb.cov2D_det_cache_in = c2ddet_in_buf_->handle();
     pb.p_hom_w_cache_in   = phomw_in_buf_ ->handle();
+    pb.debug_d_fabc       = dbg_d_fabc_buf_ ->handle();
+    pb.debug_d_cov3D      = dbg_d_cov3D_buf_->handle();
+    pb.debug_d_M          = dbg_d_M_buf_    ->handle();
+    pb.debug_d_scale      = dbg_d_scale_buf_->handle();
+    pb.debug_d_R          = dbg_d_R_buf_    ->handle();
+    pb.debug_d_qn         = dbg_d_qn_buf_   ->handle();
 
     pass_->bind_buffers(pb, ubo_buf_->handle());
     pass_->record(cmd, static_cast<uint32_t>(N));
@@ -464,4 +485,29 @@ void PreprocessorBackwardVulkan::download_grads(int N, int K,
                             static_cast<std::size_t>(bytes_d_rot));
     d_raw_opa_buf_->download(grads.d_raw_opacities,
                              static_cast<std::size_t>(bytes_N_float));
+}
+
+void PreprocessorBackwardVulkan::download_debug_buffers(
+    int N,
+    std::vector<float>& d_fabc,
+    std::vector<float>& d_cov3D,
+    std::vector<float>& d_M,
+    std::vector<float>& d_scale,
+    std::vector<float>& d_R,
+    std::vector<float>& d_qn) const
+{
+    d_fabc.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    d_cov3D.assign(static_cast<std::size_t>(N) * 6u, 0.0f);
+    d_M.assign(static_cast<std::size_t>(N) * 9u, 0.0f);
+    d_scale.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    d_R.assign(static_cast<std::size_t>(N) * 9u, 0.0f);
+    d_qn.assign(static_cast<std::size_t>(N) * 4u, 0.0f);
+    if (N == 0 || !dbg_d_fabc_buf_) return;
+
+    dbg_d_fabc_buf_ ->download(d_fabc.data(),  d_fabc.size()  * sizeof(float));
+    dbg_d_cov3D_buf_->download(d_cov3D.data(), d_cov3D.size() * sizeof(float));
+    dbg_d_M_buf_    ->download(d_M.data(),     d_M.size()     * sizeof(float));
+    dbg_d_scale_buf_->download(d_scale.data(), d_scale.size() * sizeof(float));
+    dbg_d_R_buf_    ->download(d_R.data(),     d_R.size()     * sizeof(float));
+    dbg_d_qn_buf_   ->download(d_qn.data(),    d_qn.size()    * sizeof(float));
 }

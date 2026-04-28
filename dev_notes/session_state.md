@@ -1,13 +1,15 @@
 # Session State
 
-## Current Phase (S11 — 2026-04-25)
-L2 backward-parity work: per-step bit-exactness drive. Phase A (proper_ewa default) + Phase C.0 (Gate_P1_Means2D closure) + D.deep (SH Adam-group bug) all closed today. Test infrastructure tightened with permanent regression sentinels. L1b VK↔CUDA forward at **54.84 dB / 5.16 dB to 60 dB target** (legacy 42.8 dB number was pre-S10 near-plane cull fix; stale).
+## Current Phase (S12 — 2026-04-28)
+Independent-train VK↔CUDA parity investigation. Config mismatches were aligned in `d96b889`; this session fixed fair-path mismatches in `VulkanTrainer`/`vk_train_main.cpp`: SH warmup `0` now means full SH from step 1, CLI projection matches `camera_utils.cpp`/CUDA, `model.free()` happens after trainer construction, and `gs3d_vk_render` now supports strict `--eval_3d 0|1` so fair renders use the same `eval_3D=false` mode as training. Focused **10-step** and **100-step** parity tests pass with Adam m/v checks. Precise 100-step backward-chain diagnostics now show the first causal trajectory split at step 1 in rotation: CUDA's actual `rasterize_gaussians_backward_dump` returns ~1e-11 `d_rotations` for identity-quaternion + isotropic-scale Gaussians, while VK cancels to exactly zero; with Adam `eps=1e-15`, that sub-ULP residual becomes ~1e-3 raw-rotation updates immediately. This is CUDA/VK numerical cancellation amplified by Adam, not a proven Vulkan chain-rule bug. A follow-up source audit confirmed CUDA's diagnostic second forward has identical step-1 color/radii/L1-gradient to the autograd forward, but repeated CUDA `backward_dump` calls produce different ~3e-12 rotation residuals from the same buffers/grad; the exact step-1 rotation residual is nondeterministic sub-ULP CUDA noise. Remaining work: run a paired control that neutralizes near-zero rotation gradients or uses a non-degenerate init before attempting any math fix.
 
-## Test Counts (post-commits, 2026-04-25)
-- VK suite: **75 PASS / 8 SKIP / 1 FAIL** (84 total)
-- Only failure: `Step1GradientAndLoss.gpos` per-element max rel_diff 1.89e-4 (sub-ULP abs 1.5e-9, atomicAdd noise) — documented `TODO(deterministic-backward)`
-- 8 skipped: 7 unimplemented `VkVsCudaFirstLoss.Gate_P2..P7, Gate_L1` + `OraclePerStepComparison` (1000-step golden missing)
-- CPU suite: 169/16/0
+## Test Counts (2026-04-28 current)
+- Build: `cmake --build harmonyos_3dgs/build --target gs3d_vk_tests gs3d_vk_train gs3d_vk_render` OK; latest rebuild of `gs3d_vk_render` OK after adding `--eval_3d`.
+- Focused tests: `VkVsCudaBasketball10Step.PerStepParity` PASS; `VkVsCudaBasketball100Step.PerStepParity` PASS (Adam m/v, npy size checks, and backward-chain diagnostics).
+- Latest 100-step diagnostic rerun after switching CUDA `diag_pre_d_scale/qn` to actual kernel outputs and regenerating goldens: `VK 0.383322 / CUDA 0.383523`, abs `2.01e-4`; step1 `d_qn/g_rot` first split is `VK=0` vs CUDA ~`1e-11`, which Adam turns into `p_rot` rel `6.37e-4` on step1. Source audit: CUDA diagnostic second forward is byte-identical at step1 (`color/radii/L1 grad` all equal), but repeated `backward_dump` calls vary at the same ~1e-11 scale, so exact step1 rotation values are cancellation/noise, not a stable signal.
+- Render CLI smoke: default reports `eval_3D=ON`, `--eval_3d 0` reports `eval_3D=OFF`, invalid values fail; `compare_vk_cuda_fair.py` passes `--eval_3d 0`.
+- Full CTest baseline after latest diagnostics: **273/273 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, 567.66s; expected inventory remains 24 .cpp files).
+- Hook/gate health: `.claude/hooks` and `.claude/gates` missing in this worktree, so hook syntax/test-audit gate could not be verified; external +2 reviews were run via subagents for m/v timing, group layout, conic convention, pass wiring, and rotation-normalization handling.
 
 ## Parity Ladder (L1-L5)
 | Level | Meaning | Status |
@@ -15,9 +17,9 @@ L2 backward-parity work: per-step bit-exactness drive. Phase A (proper_ewa defau
 | L1a | CPU↔VK same-ply forward | ✅ 99.15 dB (Phase A close) |
 | L1b | VK↔CUDA same-ply forward (basketball cam0) | **54.84 dB** (5.16 dB to 60 dB target). Gate_I1-I4 + P1 PASS; P2-P7 SKIP |
 | L2 | Backward gradient parity | ✅ All 5 groups bit-exact at L2 norm + sub-1e-4 per-element except gpos atomic noise |
-| L3 | Post-Adam param parity | ✅ All groups (after SH layout bug fix) |
-| L4 | 100-step trajectory | ✅ Bounded sub-1e-3 rel_diff with new sentinels |
-| L5 | Independent-train final-eval | 🔜 Test does not yet exist (Phase E) |
+| L3 | Post-Adam param parity | ✅ All groups (after SH layout bug fix); basketball 10/100-step now also captures Adam m/v |
+| L4 | 100-step trajectory | IN PROGRESS — loss aligned, but scale/rotation gradient+moment drift grows over 100 steps |
+| L5 | Independent-train final-eval | IN PROGRESS — camera-loader bug fixed; next rerun true 1000/2000 after scale/rotation drift is triaged |
 
 ## Milestones
 | Milestone | Status | Sessions | Summary |
@@ -58,7 +60,13 @@ L2 backward-parity work: per-step bit-exactness drive. Phase A (proper_ewa defau
 
 ## Latest Sessions
 
-### S11 — 2026-04-25 (current) — Phase A + C.0 + D.deep SH layout closure
+### S12 — 2026-04-28 (current) — fair-path alignment + rotation-drift triage
+- Fixed fair-path mismatches: `VulkanTrainer` honors `sh_degree_warmup=0` from the first forward pass, `vk_train_main.cpp` projection now matches CUDA/`camera_utils.cpp`, and `model.free()` no longer precedes trainer construction. Updated 10/100-step CUDA dumpers to use full SH for all steps and regenerated goldens.
+- Verification: focused build OK; `VkVsCudaBasketball10Step.PerStepParity` PASS; `VkVsCudaBasketball100Step.PerStepParity` PASS. Fair 10-step comparison is now aligned (`VK vs CUDA 43.14 dB`), while fair 200-step still diverges (`CUDA 14.65 dB`, `VK 11.73 dB`).
+- Investigated remaining scale/rotation drift. The conic off-diagonal convention is paired (`rasterize_backward.comp` full `d_conics[1]` with preprocess full-parameter chain) and must not be changed alone. Scalarizing `preprocess_backward.comp` `W/J/T/Vrk/VT` ruled out a GLSL `mat3` layout bug as the primary cause: step100 drift changed only marginally (`g_sca≈4.43e-1`, `g_rot≈7.49e-1`).
+- Added exact 100-step backward-chain diagnostics. Important correction: CUDA `diag_pre_d_qn` must use `_C.rasterize_gaussians_backward_dump`'s returned `d_rotations`; the earlier NumPy reconstruction hid CUDA's step-1 sub-ULP residual by producing exact zero. With actual kernel outputs, the first causal split is step1 `d_qn/g_rot`: VK exactly zero vs CUDA ~`1e-11`, which Adam `eps=1e-15` converts into ~`1e-3` raw-rotation updates. Treat this as numerical-cancellation amplification, not a proven Vulkan math bug; next experiment should neutralize the near-zero rotation-gradient cusp before chasing scale-chain drift.
+
+### S11 — 2026-04-25 — Phase A + C.0 + D.deep SH layout closure
 - **Phase A — proper_ewa default flip**: `PreprocessorVulkan` ctor default flipped from `false` → `true`. Production paths (CPU↔VK comparison, render) take AAA path; parity-harness tests opt out explicitly. Result: `VkVsCpuRender.FullFramePSNR` 28.75 → **99.15 dB** (CPU↔VK closed).
 - **C.0 — Gate_P1_Means2D closure**: gated `opacity_3d *= dilation_factor` on `spec_proper_ewa` in `preprocess.comp` to match CUDA `forward.cu:157`. Wired `test_vk_vs_cuda_basketball.cpp` 3 sites with `proper_ewa=true` (matches its golden's actual generation config). Test logic: mask CUDA `tan(±π/2-ε)` degenerate fallback (`|m2d|>1e5`) + relative tolerance `max(1e-2 px, 1e-3·|cuda|)`. Result: `Gate_P1_Means2D` FAIL (8790 bad) → **PASS (0 bad)**.
 - **D.deep — SH Adam-group layout bug**: 3-step trajectory analysis revealed deterministic 469% rel_diff on G[2] post-Adam SH (NOT atomicAdd noise — fully reproducible across runs). Root cause: `vulkan_trainer.cpp` was `memcpy`-splitting the unified `[N,K,3]` interleaved CPU buffer by float-index between DC `[N,3]` and REST `[N,K-1,3]` GPU groups. With K=16, first N\*3=60 floats are NOT all DCs (they're G[0]'s entire 48 SH + G[1]'s first 4); G[2..N-1]'s DCs landed in REST with **wrong lr (1/20 of correct)**. Fix: `sh_gather_dc/rest` + `sh_scatter_dc/rest` helpers + 5 call sites (ctor, reset_for_oracle, step gradient upload, step post-Adam download, reallocate_for_n). Verification: 3-step SH max-elem rel_diff **469% → 0.015%** (~3000× tighter); step-2 loss rel_diff **1.10e-3 → 5.5e-7** (2000× tighter); 10-step trajectory all groups bounded < 1e-3.

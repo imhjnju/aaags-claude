@@ -103,6 +103,18 @@ void VulkanAdam::zero_moments()
     }
 }
 
+void VulkanAdam::download_moments(int idx, std::vector<float>& out_m, std::vector<float>& out_v) const
+{
+    const Group& grp = groups_.at(static_cast<std::size_t>(idx));
+    out_m.resize(grp.n);
+    out_v.resize(grp.n);
+    if (grp.n == 0) return;
+
+    const size_t n_bytes = static_cast<size_t>(grp.n) * sizeof(float);
+    grp.m_buf->download(out_m.data(), n_bytes);
+    grp.v_buf->download(out_v.data(), n_bytes);
+}
+
 void VulkanAdam::step_group(int idx,
                              VkBuffer params_buf,
                              VkBuffer grad_buf,

@@ -266,6 +266,25 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                          static_cast<std::size_t>(bytes_dL_col));
 }
 
+void RasterizerBackwardVulkan::download_outputs(
+    int N,
+    std::vector<float>& d_means2D,
+    std::vector<float>& d_conics,
+    std::vector<float>& d_opacity,
+    std::vector<float>& d_rgb) const
+{
+    d_means2D.assign(static_cast<std::size_t>(N) * 2u, 0.0f);
+    d_conics.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    d_opacity.assign(static_cast<std::size_t>(N), 0.0f);
+    d_rgb.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    if (N == 0 || !dlm2d_buf_) return;
+
+    dlm2d_buf_->download(d_means2D.data(), d_means2D.size() * sizeof(float));
+    dlcon_buf_->download(d_conics.data(),  d_conics.size()  * sizeof(float));
+    dlopa_buf_->download(d_opacity.data(), d_opacity.size() * sizeof(float));
+    dlcol_buf_->download(d_rgb.data(),     d_rgb.size()     * sizeof(float));
+}
+
 void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                      const PreprocessOutput& pre,
                                                      const BinningOutput& bin,

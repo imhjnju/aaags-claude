@@ -163,13 +163,13 @@ static void buildLookAt(const float eye[3], const float center[3], const float u
 
 static void buildPerspective(float tan_fovx, float tan_fovy, float znear, float zfar,
                               float proj[16]) {
-    // Column-major OpenGL projection matching Python's getProjectionMatrix.
+    // Matches camera_utils.cpp and AAA-Gaussians getProjectionMatrix().
     memset(proj, 0, 16 * sizeof(float));
     proj[0]  = 1.0f / tan_fovx;
     proj[5]  = 1.0f / tan_fovy;
-    proj[10] = (zfar + znear) / (zfar - znear);
+    proj[10] = zfar / (zfar - znear);
     proj[11] = 1.0f;
-    proj[14] = -(2.0f * zfar * znear) / (zfar - znear);
+    proj[14] = -(zfar * znear) / (zfar - znear);
 }
 
 static void mat4Mul(const float A[16], const float B[16], float out[16]) {
@@ -351,20 +351,15 @@ static std::vector<CameraWithImage> loadCamerasJson(const char* json_path) {
             rot_start = obj.find(']', rot_start) + 1;
         }
 
-        // T_w2c = -R_w2c * cam_pos.  R from cameras.json is R_w2c.
         float t[3] = {
-            -(R[0][0]*entry.cam.cam_pos[0] + R[0][1]*entry.cam.cam_pos[1] + R[0][2]*entry.cam.cam_pos[2]),
-            -(R[1][0]*entry.cam.cam_pos[0] + R[1][1]*entry.cam.cam_pos[1] + R[1][2]*entry.cam.cam_pos[2]),
-            -(R[2][0]*entry.cam.cam_pos[0] + R[2][1]*entry.cam.cam_pos[1] + R[2][2]*entry.cam.cam_pos[2])
+            -(R[0][0]*entry.cam.cam_pos[0] + R[1][0]*entry.cam.cam_pos[1] + R[2][0]*entry.cam.cam_pos[2]),
+            -(R[0][1]*entry.cam.cam_pos[0] + R[1][1]*entry.cam.cam_pos[1] + R[2][1]*entry.cam.cam_pos[2]),
+            -(R[0][2]*entry.cam.cam_pos[0] + R[1][2]*entry.cam.cam_pos[1] + R[2][2]*entry.cam.cam_pos[2])
         };
 
-        // Column-major viewmatrix matching CUDA's w2v = |R_w2c  T_w2c|.
-        // cameras.json R = R_w2c.  CUDA loadMatrix4x3 gives math matrix = w2v
-        // (R_w2c upper-left).  Storing columns of R as column-major columns
-        // reproduces R directly in the math matrix.
-        entry.cam.view_matrix[0]=R[0][0]; entry.cam.view_matrix[1]=R[1][0]; entry.cam.view_matrix[2]=R[2][0]; entry.cam.view_matrix[3]=0;
-        entry.cam.view_matrix[4]=R[0][1]; entry.cam.view_matrix[5]=R[1][1]; entry.cam.view_matrix[6]=R[2][1]; entry.cam.view_matrix[7]=0;
-        entry.cam.view_matrix[8]=R[0][2]; entry.cam.view_matrix[9]=R[1][2]; entry.cam.view_matrix[10]=R[2][2]; entry.cam.view_matrix[11]=0;
+        entry.cam.view_matrix[0]=R[0][0]; entry.cam.view_matrix[1]=R[0][1]; entry.cam.view_matrix[2]=R[0][2]; entry.cam.view_matrix[3]=0;
+        entry.cam.view_matrix[4]=R[1][0]; entry.cam.view_matrix[5]=R[1][1]; entry.cam.view_matrix[6]=R[1][2]; entry.cam.view_matrix[7]=0;
+        entry.cam.view_matrix[8]=R[2][0]; entry.cam.view_matrix[9]=R[2][1]; entry.cam.view_matrix[10]=R[2][2]; entry.cam.view_matrix[11]=0;
         entry.cam.view_matrix[12]=t[0]; entry.cam.view_matrix[13]=t[1]; entry.cam.view_matrix[14]=t[2]; entry.cam.view_matrix[15]=1;
 
         float proj[16];
@@ -603,11 +598,10 @@ int main(int argc, char** argv) {
         views.push_back(std::move(tv));
     }
 
-    model.free();
-
     if (views.empty()) {
         printf("Error: no training views with GT images available\n");
         freeRawParams(raw);
+        model.free();
         return 1;
     }
 
@@ -617,6 +611,7 @@ int main(int argc, char** argv) {
 
     // Raw data is now owned by the trainer internally; free our copy
     freeRawParams(raw);
+    model.free();
 
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> view_dist(0, (int)views.size() - 1);

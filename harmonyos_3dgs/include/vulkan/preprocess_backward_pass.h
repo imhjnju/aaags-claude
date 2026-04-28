@@ -59,6 +59,12 @@ public:
         VkBuffer cov2D_cache_in;      // RO float[N*3]  (fa, fb, fc) dilated cov2D from forward
         VkBuffer cov2D_det_cache_in;  // RO float[N]    det = fa*fc - fb*fb from forward
         VkBuffer p_hom_w_cache_in;    // RO float[N]    p_hom.w from forward (inv_w for Part D)
+        VkBuffer debug_d_fabc;        // WO float[N*3]
+        VkBuffer debug_d_cov3D;       // WO float[N*6]
+        VkBuffer debug_d_M;           // WO float[N*9]
+        VkBuffer debug_d_scale;       // WO float[N*3]
+        VkBuffer debug_d_R;           // WO float[N*9]
+        VkBuffer debug_d_qn;          // WO float[N*4]
     };
 
     /// @param spec_proper_ewa  Specialization constant gating the h_conv_scaling

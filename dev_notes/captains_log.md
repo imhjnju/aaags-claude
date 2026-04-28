@@ -1,5 +1,13 @@
 # Captain's Log
 
+## Session 12 — 2026-04-28 — Fair-path alignment + rotation-drift triage
+
+Closed the fair-path setup bugs that made the CLI comparison worse than the focused harness: full SH is now active from step 1 when `sh_degree_warmup=0`, the CLI projection matrix matches CUDA/`camera_utils.cpp`, and `vk_train_main.cpp` no longer frees model storage before constructing the trainer. Regenerated 10/100-step CUDA goldens and verified focused 10-step and 100-step VK↔CUDA tests pass.
+
+Key results: fair 10-step is now aligned (`VK vs CUDA 43.14 dB`), but fair 200-step still diverges. Found and fixed a reporting bug: CUDA final render used `eval_3D=false`, while `gs3d_vk_render` hardcoded `eval_3D=true`. Added strict `--eval_3d 0|1` to `gs3d_vk_render` and updated `compare_vk_cuda_fair.py` to pass `--eval_3d 0`. Re-rendering the existing 200-step isotropic model with VK2D gives `CUDA vs GT 14.65 dB`, `VK2D vs GT 11.33 dB`, `VK2D vs CUDA 14.68 dB` — still a real training gap, though the old render-mode mismatch affected the reported numbers.
+
+Negative results: the conic off-diagonal convention is paired and unsafe to change alone. A scalarized `preprocess_backward.comp` `W/J/T/Vrk/VT` experiment was reviewed and tested, but it only moved 100-step drift marginally, so it was reverted. The 100-step chain diagnostics then exposed the first causal split: CUDA's actual backward kernel returns ~1e-11 rotation residuals at step 1 for identity-quaternion + isotropic-scale Gaussians, while VK cancels to exact zero; Adam `eps=1e-15` turns that into ~1e-3 raw-rotation updates immediately. This is numerical-cancellation amplification, not yet a Vulkan chain-rule bug. Next work should run a paired control that neutralizes near-zero rotation gradients or uses a non-degenerate init before changing shader math.
+
 ## Session 11 — 2026-04-25 — Phase A + C.0 + D.deep SH layout closure
 
 Long, multi-arc session. Started after S10's master merge. Closed three major items: Phase A (CPU↔VK 99 dB via proper_ewa default flip), C.0 (Gate_P1_Means2D PASS via dilation gating + test wiring + masking + relative tolerance), and D.deep (the SH Adam-group layout bug — the most important find of the day). Plus latent-bug alignment in Python reference, full test sensitivity tightening with permanent sentinels, and ~3000× tighter parity verified to 10 steps.
