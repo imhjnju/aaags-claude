@@ -63,6 +63,7 @@ Independent-train VK↔CUDA parity investigation on `scan1` (camera 0, 1600×120
 - Targeted scan1 camera 0 at 1600×1200 with 28,747 Gaussians and measured VK↔CUDA independent-training drift at 10/200/1000 steps.
 - Root cause: 2D `n_contrib` had count-based semantics in VK/CPU, but CUDA stores the 1-based position of the last candidate that actually blended. Fixed Vulkan forward/backward and CPU 2D reference to use the same replay-boundary contract.
 - Verification: `RasterizerBackwardVulkan.MatchesCPU_TinyFixture` PASS and full CTest **273/273 PASS**. scan1 VK↔CUDA final-render PSNR improved to **107.14 dB / 49.82 dB / 27.77 dB** at 10/200/1000 steps. Full record: `dev_notes/scan1_n_contrib_parity_s13.md`.
+- Eval_3D smoke: `gs3d_vk_train --eval_3d 1` now exists. scan1 eval_3D 10-step runs complete, but render is all black even after adding `filter_3D`; preprocess has nonzero tiles, while rasterizer writes `n_contrib=0` everywhere. Next blocker is eval_3D rasterize contribution logic.
 
 ### S12 — 2026-04-28 — fair-path alignment + rotation-drift triage
 - Fixed fair-path mismatches: `VulkanTrainer` honors `sh_degree_warmup=0` from the first forward pass, `vk_train_main.cpp` projection now matches CUDA/`camera_utils.cpp`, and `model.free()` no longer precedes trainer construction. Updated 10/100-step CUDA dumpers to use full SH for all steps and regenerated goldens.

@@ -99,3 +99,20 @@ Do not chase another shader formula change until a controlled same-state experim
 1. Start both implementations from an identical post-step1 state and compare step2 forward/backward.
 2. Use a non-degenerate initialization to avoid near-zero/identity-quaternion sensitivity.
 3. Run `eval_3D=true` training/rendering separately and record it as a new mode, not as evidence against the fixed 2D replay-boundary result.
+
+## Follow-up: eval_3D Training/Rendering Smoke
+
+Added `--eval_3d 0|1` support to `gs3d_vk_train` to match the existing render CLI flag. A 10-step scan1 eval_3D run was launched.
+
+First attempt used `/tmp/scan1_init_3dgs.ply`, which lacks the AAA `filter_3D` PLY property. Vulkan eval_3D rendered all black and loss stayed at `0.665102` for all 10 steps.
+
+Generated `/tmp/scan1_init_3dgs_filter3d.ply` by appending raw `filter_3D = min_valid_depth / max_focal * sqrt(0.3)` from scan1 camera 0. The generated field had 26,377 nonzero values, max `0.0016296807`. Re-running eval_3D still rendered all black and loss stayed unchanged.
+
+Diagnostic dump with the filtered PLY showed preprocess was not fully empty: `tiles_touched` had 25,213 nonzero Gaussians (max 99). However rasterization produced `n_contrib` all zero, `T_final` all 1, and `rendered_image` all zero. Therefore the current eval_3D blocker is in the eval_3D rasterize contribution path, not only missing `filter_3D`.
+
+Eval_3D smoke artifacts:
+
+- Missing-filter run: `/tmp/scan1_vk_eval3d_10_20260428_172824/`
+- Filtered-Ply run: `/tmp/scan1_vk_eval3d_filter_10_20260428_173438/`
+- Filtered init PLY: `/tmp/scan1_init_3dgs_filter3d.ply`
+- Eval_3D diagnostic dump: `/tmp/scan1_vk_eval3d_dump/`

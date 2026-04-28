@@ -10,6 +10,8 @@ Impact on scan1: VK↔CUDA final-render PSNR improved **90.91→107.14 dB at 10 
 
 Remaining drift appears numerically amplified rather than a newly localized formula bug: step1 forward/position/opacity/scale/rotation gradients are exact, SH gradients differ only at atomic accumulation scale (`l2_rel≈6.2e-4`, max `≈1.9e-7`), and step2 render is still close (`l2_rel≈4.3e-5`, max `≈3.9e-6`). Adam with `eps=1e-15` turns near-zero step2 gradients into finite raw-parameter deltas, so the next controlled experiment should start both implementations from an identical post-step1 state or use a non-degenerate init before chasing more shader math.
 
+Follow-up eval_3D smoke: added `--eval_3d 0|1` to `gs3d_vk_train` and ran scan1 10-step eval_3D training/rendering. The original init PLY lacked `filter_3D`; after appending AAA-style `filter_3D`, preprocess produced nonzero `tiles_touched` for 25,213 Gaussians, but eval_3D rasterization still produced `n_contrib=0` everywhere and an all-black render. The next eval_3D blocker is therefore in the eval_3D rasterize contribution path, not just missing `filter_3D`.
+
 ## Session 12 — 2026-04-28 — Fair-path alignment + rotation-drift triage
 
 Closed the fair-path setup bugs that made the CLI comparison worse than the focused harness: full SH is now active from step 1 when `sh_degree_warmup=0`, the CLI projection matrix matches CUDA/`camera_utils.cpp`, and `vk_train_main.cpp` no longer frees model storage before constructing the trainer. Regenerated 10/100-step CUDA goldens and verified focused 10-step and 100-step VK↔CUDA tests pass.

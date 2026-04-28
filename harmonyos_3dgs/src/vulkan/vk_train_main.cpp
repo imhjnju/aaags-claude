@@ -398,6 +398,7 @@ struct TrainArgs {
     int sh_degree = -1;
     int save_every = 0;
     int log_every = 100;
+    bool eval_3D = false;
 };
 
 static TrainArgs parseArgs(int argc, char** argv) {
@@ -422,6 +423,10 @@ static TrainArgs parseArgs(int argc, char** argv) {
         else if (match("--sh_degree")) args.sh_degree = atoi(argv[++i]);
         else if (match("--save_every")) args.save_every = atoi(argv[++i]);
         else if (match("--log_every")) args.log_every = atoi(argv[++i]);
+        else if (match("--eval_3d")) {
+            int v = atoi(argv[++i]);
+            args.eval_3D = (v != 0);
+        }
     }
     return args;
 }
@@ -447,6 +452,7 @@ static void printUsage(const char* prog) {
     printf("  --sh_degree <0-3>     SH degree override (default: from PLY)\n");
     printf("  --save_every <N>      Checkpoint interval (default: end only)\n");
     printf("  --log_every <N>       Print loss interval (default: 100)\n");
+    printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +499,7 @@ int main(int argc, char** argv) {
     cfg.bg_color[0] = cfg.bg_color[1] = cfg.bg_color[2] = 0;
     cfg.scale_modifier = 1.0f;
     cfg.training = true;
+    cfg.eval_3D = args.eval_3D;
     cfg.sh_degree = (args.sh_degree >= 0) ? args.sh_degree : raw.sh_degree;
 
     // Vulkan training config
