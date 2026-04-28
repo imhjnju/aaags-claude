@@ -53,6 +53,7 @@ void RasterizerCPU::rasterize(const PreprocessOutput& pre, const BinningOutput& 
                     float C[3] = {0, 0, 0};
                     float inv_depth = 0.0f;
                     int contrib_count = 0;
+                    int last_contrib_pos = 0;
 
                     if (is_debug)
                         printf("=== DEBUG PIXEL (%d,%d) tile(%d,%d) range[%u..%u) (%u gaussians) eval_3D=%d ===\n",
@@ -135,7 +136,9 @@ void RasterizerCPU::rasterize(const PreprocessOutput& pre, const BinningOutput& 
                         }
                     } else {
                     // === Standard 2D path ===
+                    int contributor_pos = 0;
                     for (uint32_t j = range_start; j < range_end; j++) {
+                        contributor_pos++;
                         uint32_t idx = bin.values_sorted[j];
 
                         float dx = pre.means2D[idx*2] - (float)px;
@@ -173,6 +176,7 @@ void RasterizerCPU::rasterize(const PreprocessOutput& pre, const BinningOutput& 
 
                         T = test_T;
                         contrib_count++;
+                        last_contrib_pos = contributor_pos;
                     }
                     } // end else (2D path)
 
@@ -189,7 +193,7 @@ void RasterizerCPU::rasterize(const PreprocessOutput& pre, const BinningOutput& 
                     // Save per-pixel cache for backward pass
                     if (cache) {
                         cache->T_final[pix]   = T;
-                        cache->n_contrib[pix] = contrib_count;
+                        cache->n_contrib[pix] = pre.eval_3D ? contrib_count : last_contrib_pos;
                     }
 
                     const int HW = cam.width * cam.height;

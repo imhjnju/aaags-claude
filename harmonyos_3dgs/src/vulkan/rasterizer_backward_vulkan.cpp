@@ -192,7 +192,7 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                      static_cast<std::size_t>(bytes_colors));
     tf_buf_ ->upload(cache.T_final,
                      static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; we reinterpret as uint32 (same width, counts < 2^31).
+    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
     nc_buf_ ->upload(cache.n_contrib,
                      static_cast<std::size_t>(bytes_ncontrib));
     dlpix_buf_->upload(dL_dpixels,
@@ -377,7 +377,7 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                      static_cast<std::size_t>(bytes_colors));
     tf_buf_ ->upload(cache.T_final,
                      static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; we reinterpret as uint32 (same width, counts < 2^31).
+    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
     nc_buf_ ->upload(cache.n_contrib,
                      static_cast<std::size_t>(bytes_ncontrib));
     dlpix_buf_->upload(dL_dpixels,

@@ -32,19 +32,22 @@ void RasterizerBackwardCPU::backward(const PreprocessOutput& pre, const BinningO
                 for (int px = px_min_x; px < px_max_x; px++) {
                     int pix = py * cam.width + px;
                     const int HW = cam.width * cam.height;
-                    int n_contrib = cache.n_contrib[pix];
-                    if (n_contrib == 0) continue;
+                    int last_contrib = cache.n_contrib[pix];
+                    if (last_contrib == 0) continue;
 
                     float T_final = cache.T_final[pix];
                     float d_C[3] = { d_image[0*HW + pix], d_image[1*HW + pix], d_image[2*HW + pix] };
 
                     // --- Forward replay to collect contributors ---
                     std::vector<ContribInfo> contribs;
-                    contribs.reserve(n_contrib);
+                    contribs.reserve(last_contrib);
                     {
                         float T = 1.0f;
-                        int count = 0;
+                        int candidate_pos = 0;
                         for (uint32_t j = range_start; j < range_end; j++) {
+                            candidate_pos++;
+                            if (candidate_pos > last_contrib) break;
+
                             uint32_t idx = bin.values_sorted[j];
 
                             float dx = pre.means2D[idx*2]   - (float)px;
@@ -63,7 +66,6 @@ void RasterizerBackwardCPU::backward(const PreprocessOutput& pre, const BinningO
 
                             contribs.push_back({idx, alpha});
                             T = test_T;
-                            count++;
                         }
                     }
 

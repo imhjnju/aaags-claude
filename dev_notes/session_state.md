@@ -1,15 +1,14 @@
 # Session State
 
-## Current Phase (S12 — 2026-04-28)
-Independent-train VK↔CUDA parity investigation. Config mismatches were aligned in `d96b889`; this session fixed fair-path mismatches in `VulkanTrainer`/`vk_train_main.cpp`: SH warmup `0` now means full SH from step 1, CLI projection matches `camera_utils.cpp`/CUDA, `model.free()` happens after trainer construction, and `gs3d_vk_render` now supports strict `--eval_3d 0|1` so fair renders use the same `eval_3D=false` mode as training. Focused **10-step** and **100-step** parity tests pass with Adam m/v checks. Precise 100-step backward-chain diagnostics now show the first causal trajectory split at step 1 in rotation: CUDA's actual `rasterize_gaussians_backward_dump` returns ~1e-11 `d_rotations` for identity-quaternion + isotropic-scale Gaussians, while VK cancels to exactly zero; with Adam `eps=1e-15`, that sub-ULP residual becomes ~1e-3 raw-rotation updates immediately. This is CUDA/VK numerical cancellation amplified by Adam, not a proven Vulkan chain-rule bug. A follow-up source audit confirmed CUDA's diagnostic second forward has identical step-1 color/radii/L1-gradient to the autograd forward, but repeated CUDA `backward_dump` calls produce different ~3e-12 rotation residuals from the same buffers/grad; the exact step-1 rotation residual is nondeterministic sub-ULP CUDA noise. Remaining work: run a paired control that neutralizes near-zero rotation gradients or uses a non-degenerate init before attempting any math fix.
+## Current Phase (S13 — 2026-04-28)
+Independent-train VK↔CUDA parity investigation on `scan1` (camera 0, 1600×1200, 28,747 Gaussians). The stable porting issue found this session was `n_contrib` semantics in the 2D rasterizer/backward path: CUDA stores the 1-based position of the last candidate that actually blended, not the count of blended Gaussians. Vulkan forward/backward and the CPU 2D reference are now aligned to that replay boundary. This reduced scan1 VK↔CUDA final-render drift from **90.91→107.14 dB at 10 steps**, **22.42→49.82 dB at 200 steps**, and **8.24→27.77 dB at 1000 steps**. Stepdump after the fix shows step1 forward/position/opacity/scale/rotation gradients match exactly; only SH gradients retain tiny atomic-order differences (`l2_rel≈6.2e-4`, max `≈1.9e-7`). Step2 render remains very close (`l2_rel≈4.3e-5`, max `≈3.9e-6`), but Adam with `eps=1e-15` amplifies near-zero new gradients into finite parameter deltas, explaining the remaining long-run drift as numerical sensitivity unless a later controlled same-state experiment proves another deterministic porting bug.
 
 ## Test Counts (2026-04-28 current)
-- Build: `cmake --build harmonyos_3dgs/build --target gs3d_vk_tests gs3d_vk_train gs3d_vk_render` OK; latest rebuild of `gs3d_vk_render` OK after adding `--eval_3d`.
-- Focused tests: `VkVsCudaBasketball10Step.PerStepParity` PASS; `VkVsCudaBasketball100Step.PerStepParity` PASS (Adam m/v, npy size checks, and backward-chain diagnostics).
-- Latest 100-step diagnostic rerun after switching CUDA `diag_pre_d_scale/qn` to actual kernel outputs and regenerating goldens: `VK 0.383322 / CUDA 0.383523`, abs `2.01e-4`; step1 `d_qn/g_rot` first split is `VK=0` vs CUDA ~`1e-11`, which Adam turns into `p_rot` rel `6.37e-4` on step1. Source audit: CUDA diagnostic second forward is byte-identical at step1 (`color/radii/L1 grad` all equal), but repeated `backward_dump` calls vary at the same ~1e-11 scale, so exact step1 rotation values are cancellation/noise, not a stable signal.
-- Render CLI smoke: default reports `eval_3D=ON`, `--eval_3d 0` reports `eval_3D=OFF`, invalid values fail; `compare_vk_cuda_fair.py` passes `--eval_3d 0`.
-- Full CTest baseline after latest diagnostics: **273/273 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, 567.66s; expected inventory remains 24 .cpp files).
-- Hook/gate health: `.claude/hooks` and `.claude/gates` missing in this worktree, so hook syntax/test-audit gate could not be verified; external +2 reviews were run via subagents for m/v timing, group layout, conic convention, pass wiring, and rotation-normalization handling.
+- Build: `cmake -S harmonyos_3dgs -B harmonyos_3dgs/build -DBUILD_TESTS=ON && cmake --build harmonyos_3dgs/build` OK after `dssim.cpp`, rasterizer shader, and CPU reference updates.
+- Full CTest baseline after n_contrib fix: **273/273 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, 36.35s; expected inventory remains 24 .cpp files).
+- Focused affected test: `RasterizerBackwardVulkan.MatchesCPU_TinyFixture` PASS after CPU 2D `n_contrib` replay-boundary alignment.
+- scan1 fixed comparison reports: 10-step VK↔CUDA PSNR **107.136986 dB**, 200-step **49.822707 dB**, 1000-step **27.773822 dB**.
+- Hook/gate health: `.claude/gates/research.md` was missing in this worktree; research was still performed via spec read + code search before modifying rasterizer/backward code.
 
 ## Parity Ladder (L1-L5)
 | Level | Meaning | Status |
@@ -60,7 +59,12 @@ Independent-train VK↔CUDA parity investigation. Config mismatches were aligned
 
 ## Latest Sessions
 
-### S12 — 2026-04-28 (current) — fair-path alignment + rotation-drift triage
+### S13 — 2026-04-28 (current) — scan1 n_contrib replay-boundary fix
+- Targeted scan1 camera 0 at 1600×1200 with 28,747 Gaussians and measured VK↔CUDA independent-training drift at 10/200/1000 steps.
+- Root cause: 2D `n_contrib` had count-based semantics in VK/CPU, but CUDA stores the 1-based position of the last candidate that actually blended. Fixed Vulkan forward/backward and CPU 2D reference to use the same replay-boundary contract.
+- Verification: `RasterizerBackwardVulkan.MatchesCPU_TinyFixture` PASS and full CTest **273/273 PASS**. scan1 VK↔CUDA final-render PSNR improved to **107.14 dB / 49.82 dB / 27.77 dB** at 10/200/1000 steps. Full record: `dev_notes/scan1_n_contrib_parity_s13.md`.
+
+### S12 — 2026-04-28 — fair-path alignment + rotation-drift triage
 - Fixed fair-path mismatches: `VulkanTrainer` honors `sh_degree_warmup=0` from the first forward pass, `vk_train_main.cpp` projection now matches CUDA/`camera_utils.cpp`, and `model.free()` no longer precedes trainer construction. Updated 10/100-step CUDA dumpers to use full SH for all steps and regenerated goldens.
 - Verification: focused build OK; `VkVsCudaBasketball10Step.PerStepParity` PASS; `VkVsCudaBasketball100Step.PerStepParity` PASS. Fair 10-step comparison is now aligned (`VK vs CUDA 43.14 dB`), while fair 200-step still diverges (`CUDA 14.65 dB`, `VK 11.73 dB`).
 - Investigated remaining scale/rotation drift. The conic off-diagonal convention is paired (`rasterize_backward.comp` full `d_conics[1]` with preprocess full-parameter chain) and must not be changed alone. Scalarizing `preprocess_backward.comp` `W/J/T/Vrk/VT` ruled out a GLSL `mat3` layout bug as the primary cause: step100 drift changed only marginally (`g_sca≈4.43e-1`, `g_rot≈7.49e-1`).

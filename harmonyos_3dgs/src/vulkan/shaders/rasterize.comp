@@ -23,9 +23,9 @@
 //       float power = -0.5f*(con_o.x*d.x*d.x + con_o.z*d.y*d.y)
 //                     - con_o.y*d.x*d.y;
 //   - power > 0 skip     : Gaussian evaluated behind its own peak — skip.
-//   - n_contrib          : count of Gaussians actually blended into C
-//                          (those passing both alpha >= 1/255 AND test_T >= T_MIN).
-//                          The Gaussian that first trips T < T_MIN is NOT counted.
+//   - n_contrib (2D path): CUDA-style 1-based position of the last Gaussian
+//                          that actually blended in the tile traversal. Gaussians
+//                          skipped by power/alpha still advance the position.
 //   - output layout      : CHW. out_image[ch*H*W + y*W + x]  (channel-first, matches CUDA/PyTorch).
 //   - background         : final color = C_accum + T_final * bg_color (always
 //                          applied, even when bg is zero).
@@ -209,6 +209,7 @@ void main() {
     float T = 1.0;
     vec3  C = vec3(0.0);
     uint  n = 0u;
+    uint  contributor_pos = 0u;
     // Pixels outside the image still participate in cooperative loads/barriers
     // but contribute nothing; treat them as already-done for the blending loop.
     bool pixel_done = !valid_pixel;
@@ -484,6 +485,7 @@ void main() {
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
         if (!pixel_done) {
             for (uint k = 0u; k < batch_size; ++k) {
+                contributor_pos += 1u;
                 float dx = float(pixel_x) - s_mean_x[k];
                 float dy = float(pixel_y) - s_mean_y[k];
                 float power = -0.5 * (s_conic_a[k] * dx * dx
@@ -505,7 +507,7 @@ void main() {
                 C.g += s_rgb_g[k] * alpha * T;
                 C.b += s_rgb_b[k] * alpha * T;
                 T = test_T;
-                n += 1u;
+                n = contributor_pos;
             }
         }
         barrier();

@@ -109,7 +109,14 @@ int main(int argc, char** argv) {
 
     // 7. Save
     const char* out_path = "output_vk.ppm";
-    writePPM(out_path, image.data(), W, H);
+    std::vector<float> image_hwc(static_cast<size_t>(W) * H * 3);
+    const int HW = W * H;
+    for (int px = 0; px < HW; ++px) {
+        for (int c = 0; c < 3; ++c) {
+            image_hwc[px * 3 + c] = image[c * HW + px];
+        }
+    }
+    writePPM(out_path, image_hwc.data(), W, H);
     std::printf("Saved → %s\n", out_path);
 
     // Dump raw float32 for precision comparison with CUDA golden.

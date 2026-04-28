@@ -103,6 +103,10 @@ float compute_combined_loss_gradient(
     }
     loss_l1 *= scale_l1;
 
+    if (lambda_dssim == 0.0f) {
+        return loss_l1;
+    }
+
     // --- SSIM part ---
     // Analytical sliding-window gradient.
     //

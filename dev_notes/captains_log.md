@@ -1,5 +1,15 @@
 # Captain's Log
 
+## Session 13 — 2026-04-28 — scan1 n_contrib replay-boundary fix
+
+Switched the parity target to `/home/robota/h00813233/Graph/datasets/scan1` camera 0 and measured VK↔CUDA independent-training drift at 10/200/1000 steps. Initial render was bit-identical/all-black; the first real split was step1 SH gradient drift. Forward buffers showed `T_final` matched, but `n_contrib` did not: CUDA records the 1-based candidate position of the last Gaussian that blended, whereas Vulkan/CPU were using blended-count semantics.
+
+Fixed the 2D path by making `rasterize.comp` store the CUDA-style last-contributor position and making `rasterize_backward.comp` replay only candidates up to that position. Synchronized the CPU 2D rasterizer/backward reference and the Vulkan backward fixture comment so regression tests assert the same contract. Validation: affected test `RasterizerBackwardVulkan.MatchesCPU_TinyFixture` passed, then full CTest passed **273/273**.
+
+Impact on scan1: VK↔CUDA final-render PSNR improved **90.91→107.14 dB at 10 steps**, **22.42→49.82 dB at 200 steps**, and **8.24→27.77 dB at 1000 steps**. The 1000-step final numbers after the fix were CUDA-vs-GT 19.753679 dB, VK-vs-GT 19.868585 dB, VK-vs-CUDA 27.773822 dB, render max_abs 0.6992977, mean_abs 0.0225525.
+
+Remaining drift appears numerically amplified rather than a newly localized formula bug: step1 forward/position/opacity/scale/rotation gradients are exact, SH gradients differ only at atomic accumulation scale (`l2_rel≈6.2e-4`, max `≈1.9e-7`), and step2 render is still close (`l2_rel≈4.3e-5`, max `≈3.9e-6`). Adam with `eps=1e-15` turns near-zero step2 gradients into finite raw-parameter deltas, so the next controlled experiment should start both implementations from an identical post-step1 state or use a non-degenerate init before chasing more shader math.
+
 ## Session 12 — 2026-04-28 — Fair-path alignment + rotation-drift triage
 
 Closed the fair-path setup bugs that made the CLI comparison worse than the focused harness: full SH is now active from step 1 when `sh_degree_warmup=0`, the CLI projection matrix matches CUDA/`camera_utils.cpp`, and `vk_train_main.cpp` no longer frees model storage before constructing the trainer. Regenerated 10/100-step CUDA goldens and verified focused 10-step and 100-step VK↔CUDA tests pass.

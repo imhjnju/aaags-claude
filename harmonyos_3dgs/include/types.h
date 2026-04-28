@@ -100,7 +100,7 @@ struct BinningOutput {
 // Cached intermediate values from the forward pass, needed for backward.
 struct ForwardCache {
     float* T_final;       // [H*W] per-pixel final transmittance
-    int*   n_contrib;     // [H*W] per-pixel contributing Gaussian count
+    int*   n_contrib;     // [H*W] per-pixel last contributing candidate position
     float* cov2D;         // [N*3] filtered 2D covariance
     float* cov2D_det;     // [N] determinant of filtered cov2D
     float* cov3D;         // [N*6] 3D covariance upper triangle
