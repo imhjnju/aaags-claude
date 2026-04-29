@@ -103,16 +103,92 @@ void VulkanAdam::zero_moments()
     }
 }
 
+void VulkanAdam::extend_group(int group_idx, uint32_t added_floats)
+{
+    if (added_floats == 0) return;
+    auto& g = groups_.at(static_cast<std::size_t>(group_idx));
+    const uint32_t old_n = g.n;
+    const uint32_t new_n = old_n + added_floats;
+
+    std::vector<float> m_cpu(new_n, 0.0f);
+    std::vector<float> v_cpu(new_n, 0.0f);
+    if (old_n > 0) {
+        g.m_buf->download(m_cpu.data(), static_cast<std::size_t>(old_n) * sizeof(float));
+        g.v_buf->download(v_cpu.data(), static_cast<std::size_t>(old_n) * sizeof(float));
+    }
+
+    const std::size_t new_bytes = static_cast<std::size_t>(new_n) * sizeof(float);
+    g.m_buf = std::make_unique<VulkanBuffer>(ctx_, new_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    g.v_buf = std::make_unique<VulkanBuffer>(ctx_, new_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    g.m_buf->upload(m_cpu.data(), new_bytes);
+    g.v_buf->upload(v_cpu.data(), new_bytes);
+    g.n = new_n;
+}
+
+void VulkanAdam::shrink_group(int group_idx, uint32_t new_n)
+{
+    auto& g = groups_.at(static_cast<std::size_t>(group_idx));
+    if (new_n == g.n) return;
+
+    const std::size_t keep_bytes = static_cast<std::size_t>(new_n) * sizeof(float);
+    std::vector<float> m_cpu(new_n, 0.0f);
+    std::vector<float> v_cpu(new_n, 0.0f);
+    if (new_n > 0 && g.n > 0) {
+        g.m_buf->download(m_cpu.data(), keep_bytes);
+        g.v_buf->download(v_cpu.data(), keep_bytes);
+    }
+
+    const std::size_t alloc_bytes = std::max(keep_bytes, static_cast<std::size_t>(4));
+    g.m_buf = std::make_unique<VulkanBuffer>(ctx_, alloc_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    g.v_buf = std::make_unique<VulkanBuffer>(ctx_, alloc_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (new_n > 0) {
+        g.m_buf->upload(m_cpu.data(), keep_bytes);
+        g.v_buf->upload(v_cpu.data(), keep_bytes);
+    }
+    g.n = new_n;
+}
+
+void VulkanAdam::zero_moment_floats(int group_idx,
+                                    const std::vector<uint32_t>& float_indices)
+{
+    if (float_indices.empty()) return;
+    auto& g = groups_.at(static_cast<std::size_t>(group_idx));
+    if (g.n == 0) return;
+
+    const std::size_t total_bytes = static_cast<std::size_t>(g.n) * sizeof(float);
+    std::vector<float> m_cpu(g.n, 0.0f);
+    std::vector<float> v_cpu(g.n, 0.0f);
+    g.m_buf->download(m_cpu.data(), total_bytes);
+    g.v_buf->download(v_cpu.data(), total_bytes);
+
+    for (uint32_t fi : float_indices) {
+        if (fi < g.n) {
+            m_cpu[fi] = 0.0f;
+            v_cpu[fi] = 0.0f;
+        }
+    }
+
+    g.m_buf->upload(m_cpu.data(), total_bytes);
+    g.v_buf->upload(v_cpu.data(), total_bytes);
+}
+
 void VulkanAdam::download_moments(int idx, std::vector<float>& out_m, std::vector<float>& out_v) const
 {
-    const Group& grp = groups_.at(static_cast<std::size_t>(idx));
-    out_m.resize(grp.n);
-    out_v.resize(grp.n);
+    download_group_moments(idx, out_m, out_v);
+}
+
+void VulkanAdam::download_group_moments(int group_idx,
+                                        std::vector<float>& m_out,
+                                        std::vector<float>& v_out) const
+{
+    const Group& grp = groups_.at(static_cast<std::size_t>(group_idx));
+    m_out.resize(grp.n);
+    v_out.resize(grp.n);
     if (grp.n == 0) return;
 
     const size_t n_bytes = static_cast<size_t>(grp.n) * sizeof(float);
-    grp.m_buf->download(out_m.data(), n_bytes);
-    grp.v_buf->download(out_v.data(), n_bytes);
+    grp.m_buf->download(m_out.data(), n_bytes);
+    grp.v_buf->download(v_out.data(), n_bytes);
 }
 
 void VulkanAdam::step_group(int idx,

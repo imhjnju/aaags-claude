@@ -40,6 +40,8 @@ add_library(gs3d_core
     src/cpu_adam.cpp
     src/dssim.cpp
     src/densification.cpp
+    src/relocation.cpp
+    src/mcmc_densification.cpp
     src/train_utils.cpp
     src/camera_utils.cpp
 )
@@ -112,6 +114,9 @@ if(BUILD_TESTS)
         tests/test_cpu_adam.cpp
         tests/test_dssim.cpp
         tests/test_training_gap_sp6.cpp
+        tests/test_relocation.cpp
+        tests/test_mcmc_densification.cpp
+        tests/test_mcmc_cuda_golden.cpp
     )
     target_link_libraries(gs3d_tests gs3d_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_include_directories(gs3d_tests PRIVATE tests)
@@ -204,8 +209,12 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
         gs3d_compile_glsl(rasterize_backward _spv_rasterize_backward)
         gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
+        gs3d_compile_glsl(rasterize_backward_eval3d _spv_rasterize_backward_eval3d)
+        gs3d_embed_spirv(rasterize_backward_eval3d _hdr_rasterize_backward_eval3d)
         gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
         gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
+        gs3d_compile_glsl(preprocess_backward_eval3d _spv_preprocess_backward_eval3d)
+        gs3d_embed_spirv(preprocess_backward_eval3d _hdr_preprocess_backward_eval3d)
         gs3d_compile_glsl(adam_step _spv_adam_step)
         gs3d_embed_spirv(adam_step _hdr_adam_step)
         add_custom_target(gs3d_vulkan_shaders
@@ -219,7 +228,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_tile_range} ${_hdr_tile_range}
                     ${_spv_rasterize} ${_hdr_rasterize}
                     ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
+                    ${_spv_rasterize_backward_eval3d} ${_hdr_rasterize_backward_eval3d}
                     ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
+                    ${_spv_preprocess_backward_eval3d} ${_hdr_preprocess_backward_eval3d}
                     ${_spv_adam_step} ${_hdr_adam_step})
 
         add_library(gs3d_vk_core STATIC
@@ -239,8 +250,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/rasterize_pass.cpp
             src/vulkan/rasterizer_vulkan.cpp
             src/vulkan/rasterize_backward_pass.cpp
+            src/vulkan/rasterize_backward_eval3d_pass.cpp
             src/vulkan/rasterizer_backward_vulkan.cpp
             src/vulkan/preprocess_backward_pass.cpp
+            src/vulkan/preprocess_backward_eval3d_pass.cpp
             src/vulkan/preprocessor_backward_vulkan.cpp
             src/vulkan/vulkan_adam.cpp
             src/vulkan_trainer.cpp)
@@ -249,6 +262,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
         # produced into ${_vk_shader_dir}.
         target_include_directories(gs3d_vk_core PRIVATE ${_vk_shader_dir})
+        if(BUILD_TESTS)
+            target_compile_definitions(gs3d_vk_core PRIVATE GS3D_TESTING=1)
+        endif()
         # gs3d_vk_core depends on gs3d_core for CPU helpers (math_utils, types).
         # PreprocessorVulkan::process() uses invertMatrix4x4 from math_utils.cpp.
         target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan gs3d_core)
@@ -292,6 +308,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_training_step_vk.cpp
                 tests/test_vulkan_adam.cpp
                 tests/test_densification.cpp
+                tests/test_mcmc_trainer_integration.cpp
                 tests/test_e2e_basketball.cpp
                 tests/test_vk_vs_py_reference.cpp
                 tests/test_vk_vs_cpu_render.cpp
@@ -312,6 +329,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             # CMAKE_BINARY_DIR is needed by test_vk_vs_cuda_basketball.cpp to
             # write the diff heatmap PPM next to the build artifacts.
             target_compile_definitions(gs3d_vk_tests PRIVATE
+                GS3D_TESTING=1
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}"
                 TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"

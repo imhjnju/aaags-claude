@@ -27,6 +27,7 @@ struct RasterGradOutput {
     float* d_conics;        // [N*3]
     float* d_rgb;           // [N*3]
     float* d_opacities_2d;  // [N]
+    float* d_gauss2screen;  // [N*16] eval_3D only
 
     void allocate_and_zero(FrameAllocator& alloc, int N);
 };
@@ -181,6 +182,8 @@ struct VkTrainingConfig {
     int   densify_until_step    = 15000;
     int   densify_interval      = 100;
     float densify_percent_dense = 0.01f;
+    int   cap_max               = 0;     // >0 enables AAA-Gaussians MCMC densification
+    int   opacity_reset_interval = 3000;
 
     // SP-6: regularization loss coefficients (match Python reference defaults)
     float opacity_reg        = 0.01f;   // weight on mean(|sigmoid(raw_opacity)|)
@@ -196,19 +199,14 @@ struct VkTrainingConfig {
     bool  proper_ewa         = false;
 
     // Enable eval_3D path in the forward preprocessor + rasterizer.
-    // NOTE: CUDA training defaults to eval_3D=true, but the VK backward pass
-    // currently throws when eval_3D=true ("eval_3D is not supported" in
-    // RasterizerBackwardVulkan). Default kept at false to preserve the
-    // pre-plumbed behaviour of existing VulkanTrainer tests; parity harnesses
-    // must set this true explicitly (forward-only path). When true,
-    // `parity_mode` controls whether the VK rasterizer's sub-tile re-sort
-    // (which diverges from CUDA sort_mode=0) is bypassed.
+    // eval_3D backward is currently validated only with parity_mode=true, where
+    // rasterize.comp bypasses the Vulkan sub-tile re-sort and replays CUDA-style
+    // per-tile sorted candidates. VulkanTrainer::step rejects eval_3D training
+    // without parity_mode until the default HEAD/sub-tile replay is implemented.
     bool  eval_3D            = false;
 
     // Parity mode — disables the per-4x4 sub-tile re-sort inside rasterize.comp's
-    // eval_3D path so the Vulkan rasterizer's behaviour matches CUDA sort_mode=0
-    // (simple per-tile depth-ordered alpha blending with HEAD-only insertion
-    // sort). Costs about 2.3 dB of eval_3D rendering PSNR on its own, but
-    // required to bit-match the CUDA first-loss golden. Default false.
+    // eval_3D path so the Vulkan rasterizer's behaviour matches CUDA sort_mode=0.
+    // Required for eval_3D backward training today. Default false.
     bool  parity_mode        = false;
 };

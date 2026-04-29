@@ -2,6 +2,7 @@
 #include "vulkan/vk_pipeline.h"
 #include "dssim.h"
 #include "train_utils.h"
+#include "mcmc_densification.h"
 
 #include <algorithm>
 #include <cmath>
@@ -81,6 +82,38 @@ inline void sh_scatter_rest(const float* src_rest, int N, int K, float* dst_inte
     }
 }
 
+void zero_mcmc_adam_state(VulkanAdam& adam,
+                          int max_coeffs,
+                          const mcmc::DensifyResult& result) {
+    std::vector<int> reset_indices = result.modified_source_indices;
+    reset_indices.insert(reset_indices.end(),
+                         result.replaced_destination_indices.begin(),
+                         result.replaced_destination_indices.end());
+    std::sort(reset_indices.begin(), reset_indices.end());
+    reset_indices.erase(std::unique(reset_indices.begin(), reset_indices.end()),
+                        reset_indices.end());
+    if (reset_indices.empty()) return;
+
+    const int rest_coeffs = std::max(max_coeffs - 1, 0);
+    const int strides[6] = {3, 3, rest_coeffs * 3, 1, 3, 4};
+    for (int group = 0; group < 6; ++group) {
+        if (strides[group] == 0) continue;
+        std::vector<uint32_t> float_indices;
+        float_indices.reserve(reset_indices.size() * static_cast<size_t>(strides[group]));
+        for (int gi : reset_indices) {
+            for (int k = 0; k < strides[group]; ++k) {
+                float_indices.push_back(static_cast<uint32_t>(gi * strides[group] + k));
+            }
+        }
+        adam.zero_moment_floats(group, float_indices);
+    }
+}
+
+inline float logit_clamped(float p) {
+    p = std::max(1e-6f, std::min(1.0f - 1e-6f, p));
+    return std::log(p / (1.0f - p));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -131,6 +164,11 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     act_rotations_.resize(static_cast<size_t>(N_) * 4);
     act_opacities_.resize(static_cast<size_t>(N_));
     act_sh_coeffs_.resize(static_cast<size_t>(N_) * max_coeffs_ * 3);
+    if (init_g.filter_3D) {
+        act_filter_3D_.assign(init_g.filter_3D, init_g.filter_3D + static_cast<size_t>(N_));
+    } else {
+        act_filter_3D_.assign(static_cast<size_t>(N_), 0.0f);
+    }
 
     // 4. Set up GaussianData non-owning view.
     g_.count      = N_;
@@ -141,7 +179,7 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     g_.rotations  = act_rotations_.data();
     g_.opacities  = act_opacities_.data();
     g_.sh_coeffs  = act_sh_coeffs_.data();
-    g_.filter_3D  = nullptr;   // not used in training path
+    g_.filter_3D  = act_filter_3D_.data();
 
     // 5. Register 6 parameter groups with VulkanAdam.
     //    lr values match Python reference training.py defaults.
@@ -251,6 +289,7 @@ void VulkanTrainer::enable_backward_diagnostic_capture(bool enable) {
         captured_bwd_d_conics_.clear();
         captured_bwd_d_opacity_.clear();
         captured_bwd_d_rgb_.clear();
+        captured_bwd_d_gauss2screen_.clear();
         captured_bwd_d_fabc_.clear();
         captured_bwd_d_cov3D_.clear();
         captured_bwd_d_M_.clear();
@@ -348,6 +387,36 @@ void VulkanTrainer::reset_for_oracle(const RawGaussianParams& new_raw)
     activate_params();
 }
 
+#ifdef GS3D_TESTING
+mcmc::DensifyResult VulkanTrainer::apply_mcmc_densification_for_test(
+    float opacity_thresh,
+    int cap_max,
+    const mcmc::DensifySamplePlan& plan)
+{
+    OwnedRawParams raw_owned;
+    raw_owned.sh_degree = raw_view_.sh_degree;
+    raw_owned.max_coeffs = max_coeffs_;
+    raw_owned.from_raw(raw_view_);
+
+    const int old_N = N_;
+    mcmc::DensifyResult result = mcmc::densify_with_samples(
+        raw_owned, opacity_thresh, cap_max, plan);
+
+    N_ = result.final_count;
+    raw_positions_.assign(raw_owned.positions.begin(), raw_owned.positions.end());
+    raw_scales_.assign(raw_owned.scales.begin(), raw_owned.scales.end());
+    raw_rotations_.assign(raw_owned.rotations.begin(), raw_owned.rotations.end());
+    raw_sh_coeffs_.assign(raw_owned.sh_coeffs.begin(), raw_owned.sh_coeffs.end());
+    raw_opacities_.assign(raw_owned.opacities.begin(), raw_owned.opacities.end());
+
+    reallocate_for_n(N_, old_N);
+    zero_mcmc_adam_state(vulkan_adam_, max_coeffs_, result);
+    grad_means2D_accum_.resize(static_cast<size_t>(N_), 0.0f);
+    activate_params();
+    return result;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // run_forward_and_loss — shared forward+loss prefix used by step() and
 // forward_only(). Resets the frame arena, activates params, runs preprocess →
@@ -396,6 +465,7 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     // Build active config: override sh_degree with the scheduled value.
     RenderConfig active_cfg = cfg;
     active_cfg.sh_degree = active_sh_degree_;
+    active_cfg.eval_3D_parity_mode = tcfg_.eval_3D && tcfg_.parity_mode;
 
     // 1. Forward preprocess (populates cache: cov3D, p_view, p_hom_w, cov2D, cov2D_det)
     out_pre = preprocessor_.process(g_, cam, active_cfg, alloc_, &out_cache);
@@ -489,6 +559,15 @@ float VulkanTrainer::step(const Camera& cam,
                           int W,
                           int H)
 {
+    if (tcfg_.eval_3D && !tcfg_.parity_mode) {
+        throw std::runtime_error(
+            "VulkanTrainer::step: eval_3D training currently requires parity_mode=true");
+    }
+    if (tcfg_.eval_3D && tcfg_.cap_max > 0) {
+        throw std::runtime_error(
+            "VulkanTrainer::step: eval_3D MCMC densification requires filter_3D propagation support");
+    }
+
     // Steps 1-5: forward + loss. Out-params alias FrameAllocator memory which
     // remains valid until the next alloc_.reset() — the backward path below
     // reads them in-place.
@@ -501,6 +580,7 @@ float VulkanTrainer::step(const Camera& cam,
     // sh_degree override but the result is needed for the backward record).
     RenderConfig active_cfg = cfg;
     active_cfg.sh_degree = active_sh_degree_;
+    active_cfg.eval_3D_parity_mode = tcfg_.eval_3D && tcfg_.parity_mode;
 
     // 6+7. Rasterize backward + preprocess backward chained into one CB.
     //      rasterize_bwd writes dL_d* to GPU; preprocess_bwd reads them directly.
@@ -514,14 +594,15 @@ float VulkanTrainer::step(const Camera& cam,
         vkBeginCommandBuffer(bwd_cmd, &bi);
 
         rasterizer_bwd_.backward_record_into(bwd_cmd, pre, bin, N_, cam, active_cfg,
-                                              cache, dL_dpixels_.data());
+                                              cache, dL_dpixels_.data(), image_.data());
         insert_compute_barrier(bwd_cmd);
         preprocessor_bwd_.backward_record_into(bwd_cmd, g_, N_, cam, active_cfg, cache,
             rasterizer_bwd_.dL_dconics_buf(),
             rasterizer_bwd_.dL_dopacity_buf(),
             rasterizer_bwd_.dL_dcolors_buf(),
             rasterizer_bwd_.dL_dmeans2D_buf(),
-            raw_view_);
+            raw_view_,
+            rasterizer_bwd_.dL_dgauss2screen_buf());
 
         vkEndCommandBuffer(bwd_cmd);
         ctx_.submitAndWait(bwd_cmd);
@@ -532,7 +613,8 @@ float VulkanTrainer::step(const Camera& cam,
             captured_bwd_d_means2D_,
             captured_bwd_d_conics_,
             captured_bwd_d_opacity_,
-            captured_bwd_d_rgb_);
+            captured_bwd_d_rgb_,
+            &captured_bwd_d_gauss2screen_);
         preprocessor_bwd_.download_debug_buffers(N_,
             captured_bwd_d_fabc_,
             captured_bwd_d_cov3D_,
@@ -709,60 +791,85 @@ float VulkanTrainer::step(const Camera& cam,
     //      the *previous* step's values, which is correct — same as Python reference.
     inject_position_noise(pos_lr);
 
-    // 11. Accumulate per-Gaussian gradient norm from raw position gradients
-    //     (proxy for |dL/dmeans2D|).  grads.d_raw_positions is valid on CPU
-    //     because preprocessor_bwd_ writes it there.
-    for (int i = 0; i < N_; ++i) {
-        const float* dp = grads.d_raw_positions + i * 3;
-        const float norm = std::sqrt(dp[0]*dp[0] + dp[1]*dp[1] + dp[2]*dp[2]);
-        grad_means2D_accum_[i] += norm;
+    if (tcfg_.cap_max <= 0) {
+        for (int i = 0; i < N_; ++i) {
+            const float* dp = grads.d_raw_positions + i * 3;
+            const float norm = std::sqrt(dp[0]*dp[0] + dp[1]*dp[1] + dp[2]*dp[2]);
+            grad_means2D_accum_[i] += norm;
+        }
     }
 
-    // 12. Densification step — triggered at configured intervals.
+    const bool densification_enabled = (tcfg_.densify_from_step > 0);
     const bool should_densify =
-        (tcfg_.densify_from_step > 0) &&
+        densification_enabled &&
         (step_count_ >= tcfg_.densify_from_step) &&
         (step_count_ <= tcfg_.densify_until_step) &&
         (step_count_ % tcfg_.densify_interval == 0);
 
     if (should_densify) {
-        // Compute scene_extent: max axis range of position values.
-        float pos_min[3] = { raw_positions_[0], raw_positions_[1], raw_positions_[2] };
-        float pos_max[3] = { raw_positions_[0], raw_positions_[1], raw_positions_[2] };
-        for (int i = 1; i < N_; ++i) {
-            for (int k = 0; k < 3; ++k) {
-                const float v = raw_positions_[static_cast<size_t>(i) * 3 + k];
-                if (v < pos_min[k]) pos_min[k] = v;
-                if (v > pos_max[k]) pos_max[k] = v;
-            }
-        }
-        float scene_extent = 0.0f;
-        for (int k = 0; k < 3; ++k) {
-            scene_extent = std::max(scene_extent, pos_max[k] - pos_min[k]);
-        }
-        if (scene_extent < 1e-6f) scene_extent = 1.0f;
-
-        // Pack current raw params into OwnedRawParams for densify_and_prune.
         OwnedRawParams raw_owned;
         raw_owned.sh_degree  = raw_view_.sh_degree;
         raw_owned.max_coeffs = max_coeffs_;
         raw_owned.from_raw(raw_view_);
 
-        const int new_N = densify_and_prune(
-            raw_owned, grad_means2D_accum_.data(), step_count_, tcfg_, scene_extent);
+        const int old_N = N_;
+        mcmc::DensifyResult mcmc_result{N_, {}, {}};
 
-        // Update N_ and re-allocate GPU buffers / Adam groups.
-        N_ = new_N;
+        if (tcfg_.cap_max > 0) {
+            mcmc_result = mcmc::densify_ex(
+                raw_owned, tcfg_.opacity_thresh, tcfg_.cap_max,
+                static_cast<uint32_t>(step_count_));
+            N_ = mcmc_result.final_count;
+        } else {
+            float scene_extent = 1.0f;
+            if (N_ > 0) {
+                float pos_min[3] = { raw_positions_[0], raw_positions_[1], raw_positions_[2] };
+                float pos_max[3] = { raw_positions_[0], raw_positions_[1], raw_positions_[2] };
+                for (int i = 1; i < N_; ++i) {
+                    for (int k = 0; k < 3; ++k) {
+                        const float v = raw_positions_[static_cast<size_t>(i) * 3 + k];
+                        if (v < pos_min[k]) pos_min[k] = v;
+                        if (v > pos_max[k]) pos_max[k] = v;
+                    }
+                }
+                scene_extent = 0.0f;
+                for (int k = 0; k < 3; ++k) {
+                    scene_extent = std::max(scene_extent, pos_max[k] - pos_min[k]);
+                }
+                if (scene_extent < 1e-6f) scene_extent = 1.0f;
+            }
+            N_ = densify_and_prune(
+                raw_owned, grad_means2D_accum_.data(), step_count_, tcfg_, scene_extent);
+        }
+
         raw_positions_.assign(raw_owned.positions.begin(), raw_owned.positions.end());
-        raw_scales_.assign   (raw_owned.scales.begin(),    raw_owned.scales.end());
+        raw_scales_.assign(raw_owned.scales.begin(), raw_owned.scales.end());
         raw_rotations_.assign(raw_owned.rotations.begin(), raw_owned.rotations.end());
         raw_sh_coeffs_.assign(raw_owned.sh_coeffs.begin(), raw_owned.sh_coeffs.end());
         raw_opacities_.assign(raw_owned.opacities.begin(), raw_owned.opacities.end());
 
-        reallocate_for_n(N_);
+        if (tcfg_.cap_max > 0) {
+            reallocate_for_n(N_, old_N);
+            zero_mcmc_adam_state(vulkan_adam_, max_coeffs_, mcmc_result);
+            grad_means2D_accum_.resize(static_cast<size_t>(N_), 0.0f);
+        } else {
+            reallocate_for_n(N_);
+            grad_means2D_accum_.assign(static_cast<size_t>(N_), 0.0f);
+        }
+    }
 
-        // Reset accumulated gradient norms.
-        grad_means2D_accum_.assign(static_cast<size_t>(N_), 0.0f);
+    if (densification_enabled && tcfg_.opacity_reset_interval > 0 &&
+        step_count_ > 0 && step_count_ <= tcfg_.densify_until_step &&
+        (step_count_ % tcfg_.opacity_reset_interval == 0)) {
+        raw_opacities_.assign(static_cast<size_t>(N_), logit_clamped(0.01f));
+        raw_view_.raw_opacities = raw_opacities_.data();
+        if (N_ > 0) {
+            raw_param_gpu_bufs_[3]->upload(raw_opacities_.data(),
+                                           static_cast<size_t>(N_) * sizeof(float));
+            std::vector<uint32_t> opacity_indices(static_cast<size_t>(N_));
+            std::iota(opacity_indices.begin(), opacity_indices.end(), 0u);
+            vulkan_adam_.zero_moment_floats(3, opacity_indices);
+        }
     }
 
     return last_loss_;
@@ -844,7 +951,7 @@ void VulkanTrainer::inject_position_noise(float pos_lr) {
 // reallocate_for_n — re-create GPU buffers and Adam groups after N changes
 // ---------------------------------------------------------------------------
 
-void VulkanTrainer::reallocate_for_n(int new_N)
+void VulkanTrainer::reallocate_for_n(int new_N, int old_N)
 {
     N_ = new_N;
     const int rest_coeffs = max_coeffs_ - 1;
@@ -855,6 +962,7 @@ void VulkanTrainer::reallocate_for_n(int new_N)
     act_rotations_.resize(static_cast<size_t>(N_) * 4);
     act_opacities_.resize(static_cast<size_t>(N_));
     act_sh_coeffs_.resize(static_cast<size_t>(N_) * max_coeffs_ * 3);
+    act_filter_3D_.resize(static_cast<size_t>(N_), 0.0f);
 
     // Update GaussianData view pointers.
     g_.count      = N_;
@@ -863,6 +971,7 @@ void VulkanTrainer::reallocate_for_n(int new_N)
     g_.rotations  = act_rotations_.data();
     g_.opacities  = act_opacities_.data();
     g_.sh_coeffs  = act_sh_coeffs_.data();
+    g_.filter_3D  = act_filter_3D_.data();
 
     // Update RawGaussianParams view pointers.
     raw_view_.count         = N_;
@@ -947,19 +1056,37 @@ void VulkanTrainer::reallocate_for_n(int new_N)
     grad_rotations_gpu_ = std::make_unique<VulkanBuffer>(
         ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Re-initialize VulkanAdam groups (reset clears existing m/v state).
-    vulkan_adam_.reset_groups();
-
     struct GroupSpec { uint32_t n; float lr; };
     const GroupSpec specs[6] = {
-        { static_cast<uint32_t>(N_ * 3),                     group_lrs_[0] },  // 0: positions
-        { static_cast<uint32_t>(N_ * 3),                     group_lrs_[1] },  // 1: sh DC
-        { static_cast<uint32_t>(N_ * rest_coeffs * 3),       group_lrs_[2] },  // 2: sh rest
-        { static_cast<uint32_t>(N_),                         group_lrs_[3] },  // 3: opacities
-        { static_cast<uint32_t>(N_ * 3),                     group_lrs_[4] },  // 4: scales
-        { static_cast<uint32_t>(N_ * 4),                     group_lrs_[5] },  // 5: rotations
+        { static_cast<uint32_t>(N_ * 3),                                   group_lrs_[0] },
+        { static_cast<uint32_t>(N_ * 3),                                   group_lrs_[1] },
+        { static_cast<uint32_t>(N_ * std::max(rest_coeffs, 0) * 3),         group_lrs_[2] },
+        { static_cast<uint32_t>(N_),                                       group_lrs_[3] },
+        { static_cast<uint32_t>(N_ * 3),                                   group_lrs_[4] },
+        { static_cast<uint32_t>(N_ * 4),                                   group_lrs_[5] },
     };
-    for (int i = 0; i < 6; ++i) {
-        vulkan_adam_.add_group(specs[i].n, specs[i].lr);
+
+    if (old_N < 0) {
+        vulkan_adam_.reset_groups();
+        for (int i = 0; i < 6; ++i) {
+            vulkan_adam_.add_group(specs[i].n, specs[i].lr);
+        }
+    } else if (new_N > old_N) {
+        const int delta = new_N - old_N;
+        const uint32_t added[6] = {
+            static_cast<uint32_t>(delta * 3),
+            static_cast<uint32_t>(delta * 3),
+            static_cast<uint32_t>(delta * std::max(rest_coeffs, 0) * 3),
+            static_cast<uint32_t>(delta),
+            static_cast<uint32_t>(delta * 3),
+            static_cast<uint32_t>(delta * 4),
+        };
+        for (int i = 0; i < 6; ++i) {
+            vulkan_adam_.extend_group(i, added[i]);
+        }
+    } else if (new_N < old_N) {
+        for (int i = 0; i < 6; ++i) {
+            vulkan_adam_.shrink_group(i, specs[i].n);
+        }
     }
 }

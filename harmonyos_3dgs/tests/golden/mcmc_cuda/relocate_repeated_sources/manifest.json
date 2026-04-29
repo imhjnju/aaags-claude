@@ -1,0 +1,15 @@
+{
+  "case": "relocate_repeated_sources",
+  "source": "aaa_gaussians_cuda_compute_relocation",
+  "uses_torch_multinomial": true,
+  "mirrored_reference": false,
+  "N_input": 12,
+  "N_final": 12,
+  "max_coeffs": 4,
+  "opacity_thresh": 0.005,
+  "cap_max": 12,
+  "seeds": {
+    "relocate": 20,
+    "add": null
+  }
+}

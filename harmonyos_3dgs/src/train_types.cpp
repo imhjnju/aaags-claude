@@ -40,11 +40,13 @@ void RasterGradOutput::allocate_and_zero(FrameAllocator& alloc, int N) {
     d_conics       = alloc.allocate_array<float>(N * 3);
     d_rgb          = alloc.allocate_array<float>(N * 3);
     d_opacities_2d = alloc.allocate_array<float>(N);
+    d_gauss2screen = alloc.allocate_array<float>(N * 16);
 
     std::memset(d_means2D,      0, N * 2 * sizeof(float));
     std::memset(d_conics,       0, N * 3 * sizeof(float));
     std::memset(d_rgb,          0, N * 3 * sizeof(float));
     std::memset(d_opacities_2d, 0, N * sizeof(float));
+    std::memset(d_gauss2screen, 0, N * 16 * sizeof(float));
 }
 
 void GradientOutput::allocate_and_zero(FrameAllocator& alloc, int N, int max_coeffs) {

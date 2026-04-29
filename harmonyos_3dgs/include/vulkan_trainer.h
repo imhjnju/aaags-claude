@@ -3,6 +3,7 @@
 #include "types.h"
 #include "train_types.h"
 #include "densification.h"
+#include "mcmc_densification.h"
 #include "vulkan/vk_context.h"
 #include "vulkan/vk_buffer.h"
 #include "vulkan/vulkan_adam.h"
@@ -64,6 +65,19 @@ public:
     // Access current raw parameters (for inspection/checkpointing).
     const RawGaussianParams& raw_params() const { return raw_view_; }
 
+#ifdef GS3D_TESTING
+    mcmc::DensifyResult apply_mcmc_densification_for_test(
+        float opacity_thresh,
+        int cap_max,
+        const mcmc::DensifySamplePlan& plan);
+#endif
+
+    void download_adam_moments(int group_idx,
+                               std::vector<float>& m_out,
+                               std::vector<float>& v_out) const {
+        vulkan_adam_.download_group_moments(group_idx, m_out, v_out);
+    }
+
     // Access the last rendered image (CHW [3*H*W] float in [0,1]).
     // Valid after the first call to step(). Size is cam_height * cam_width * 3.
     const float* rendered_image() const { return image_.data(); }
@@ -108,9 +122,10 @@ public:
     void enable_backward_diagnostic_capture(bool enable);
     const std::vector<float>& captured_bwd_d_means2D() const { return captured_bwd_d_means2D_; }
     const std::vector<float>& captured_bwd_d_conics()  const { return captured_bwd_d_conics_; }
-    const std::vector<float>& captured_bwd_d_opacity() const { return captured_bwd_d_opacity_; }
-    const std::vector<float>& captured_bwd_d_rgb()     const { return captured_bwd_d_rgb_; }
-    const std::vector<float>& captured_bwd_d_fabc()    const { return captured_bwd_d_fabc_; }
+    const std::vector<float>& captured_bwd_d_opacity()      const { return captured_bwd_d_opacity_; }
+    const std::vector<float>& captured_bwd_d_rgb()          const { return captured_bwd_d_rgb_; }
+    const std::vector<float>& captured_bwd_d_gauss2screen() const { return captured_bwd_d_gauss2screen_; }
+    const std::vector<float>& captured_bwd_d_fabc()         const { return captured_bwd_d_fabc_; }
     const std::vector<float>& captured_bwd_d_cov3D()   const { return captured_bwd_d_cov3D_; }
     const std::vector<float>& captured_bwd_d_M()       const { return captured_bwd_d_M_; }
     const std::vector<float>& captured_bwd_d_scale()   const { return captured_bwd_d_scale_; }
@@ -119,8 +134,8 @@ public:
 
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
-    // Re-allocate GPU buffers and re-initialize Adam groups after Gaussian count changes.
-    void reallocate_for_n(int new_N);
+    // Re-allocate GPU buffers after Gaussian count changes.
+    void reallocate_for_n(int new_N, int old_N = -1);
 
     // Shared forward+loss path used by both step() and forward_only().
     // Runs (alloc reset, activate, preprocess, bin, sort, rasterize,
@@ -165,6 +180,7 @@ private:
     std::vector<float> act_rotations_;  // [N*4]   normalized quaternion
     std::vector<float> act_opacities_;  // [N]     sigmoid(raw_opacities)
     std::vector<float> act_sh_coeffs_;  // [N*max_coeffs*3] (= raw, no activation)
+    std::vector<float> act_filter_3D_;  // [N]     copied from input model, or zeros
     GaussianData       g_;               // non-owning view into act_* buffers
 
     // Per-frame output buffers.
@@ -231,6 +247,7 @@ private:
     std::vector<float>         captured_bwd_d_conics_;         // [N*3]
     std::vector<float>         captured_bwd_d_opacity_;        // [N]
     std::vector<float>         captured_bwd_d_rgb_;            // [N*3]
+    std::vector<float>         captured_bwd_d_gauss2screen_;   // [N*16]
     std::vector<float>         captured_bwd_d_fabc_;           // [N*3]
     std::vector<float>         captured_bwd_d_cov3D_;          // [N*6]
     std::vector<float>         captured_bwd_d_M_;              // [N*9]

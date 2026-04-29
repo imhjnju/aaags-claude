@@ -500,19 +500,23 @@ int main(int argc, char** argv) {
     cfg.scale_modifier = 1.0f;
     cfg.training = true;
     cfg.eval_3D = args.eval_3D;
+    cfg.eval_3D_parity_mode = args.eval_3D;
     cfg.sh_degree = (args.sh_degree >= 0) ? args.sh_degree : raw.sh_degree;
 
     // Vulkan training config
     VkTrainingConfig tcfg{};
     tcfg.max_steps = args.iterations;
     tcfg.densify_from_step = 0;
+    tcfg.cap_max = 0;
+    tcfg.opacity_reset_interval = 0;
     tcfg.lambda_dssim = 0.0f;     // L1-only (match CUDA reference for parity)
     tcfg.opacity_reg = 0.0f;      // Disable regularization (CUDA has none)
     tcfg.scale_reg = 0.0f;        // Disable regularization (CUDA has none)
     tcfg.pos_lr_final = 1.6e-4f;  // Disable LR decay (CUDA uses constant LR)
     tcfg.sh_degree_warmup = 0;    // Disable SH warmup (CUDA uses degree 3 from start)
     tcfg.noise_lr = 0.0f;         // Disable position noise (CUDA has no such feature)
-
+    tcfg.eval_3D = args.eval_3D;
+    tcfg.parity_mode = args.eval_3D;
     // Build training views
     std::vector<TrainView> views;
 
@@ -632,6 +636,7 @@ int main(int argc, char** argv) {
     printf("  Resolution:  %dx%d\n", views[0].cam.width, views[0].cam.height);
     printf("  pos LR:      %.6f -> %.6f\n", tcfg.pos_lr_init, tcfg.pos_lr_final);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
+    printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
     printf("  opacity_reg: %.4f\n", tcfg.opacity_reg);
     printf("  scale_reg:   %.4f\n", tcfg.scale_reg);
     printf("  noise_lr:    %.0f\n", tcfg.noise_lr);
