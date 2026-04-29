@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <vector>
 #include <chrono>
@@ -66,12 +68,12 @@ static void freeRawParams(RawGaussianParams& raw) {
 // ---------------------------------------------------------------------------
 // PLY saver: write RawGaussianParams to binary PLY
 // ---------------------------------------------------------------------------
-static bool savePly(const char* path, const RawGaussianParams& raw) {
+static bool savePly(const char* path, const RawGaussianParams& raw, const float* filter_3D = nullptr) {
     int N = raw.count;
     int mc3 = raw.max_coeffs * 3;
     int sh_rest_per_channel = raw.max_coeffs - 1;
     int sh_rest_total = sh_rest_per_channel * 3;
-    int props_per_vertex = 3 + 3 + sh_rest_total + 1 + 3 + 4;
+    int props_per_vertex = 3 + 3 + sh_rest_total + 1 + 3 + 4 + (filter_3D ? 1 : 0);
 
     FILE* f = fopen(path, "wb");
     if (!f) return false;
@@ -95,6 +97,8 @@ static bool savePly(const char* path, const RawGaussianParams& raw) {
     fprintf(f, "property float rot_1\n");
     fprintf(f, "property float rot_2\n");
     fprintf(f, "property float rot_3\n");
+    if (filter_3D)
+        fprintf(f, "property float filter_3D\n");
     fprintf(f, "end_header\n");
 
     std::vector<float> vertex(props_per_vertex);
@@ -121,6 +125,8 @@ static bool savePly(const char* path, const RawGaussianParams& raw) {
         vertex[vi++] = raw.raw_rotations[i*4+1];
         vertex[vi++] = raw.raw_rotations[i*4+2];
         vertex[vi++] = raw.raw_rotations[i*4+3];
+        if (filter_3D)
+            vertex[vi++] = filter_3D[i];
 
         fwrite(vertex.data(), sizeof(float), props_per_vertex, f);
     }
@@ -399,34 +405,92 @@ struct TrainArgs {
     int save_every = 0;
     int log_every = 100;
     bool eval_3D = false;
+    bool densify = false;
+    int densify_from_step = 500;
+    int densify_until_step = 15000;
+    int densify_interval = 100;
+    int cap_max = 0;
+    bool cap_max_provided = false;
+    int opacity_reset_interval = 3000;
+    std::string parse_error;
 };
 
 static TrainArgs parseArgs(int argc, char** argv) {
     TrainArgs args;
-    for (int i = 1; i < argc; i++) {
-        auto match = [&](const char* flag) { return strcmp(argv[i], flag) == 0 && i + 1 < argc; };
-        if (match("--ply"))            args.ply_path = argv[++i];
-        else if (match("--gt"))        args.gt_path = argv[++i];
-        else if (match("--cameras"))   args.cameras_json = argv[++i];
-        else if (match("--gt_dir"))    args.gt_dir = argv[++i];
-        else if (match("--output"))    args.output_path = argv[++i];
-        else if (match("--iterations")) args.iterations = atoi(argv[++i]);
-        else if (match("--width"))     args.width = atoi(argv[++i]);
-        else if (match("--height"))    args.height = atoi(argv[++i]);
-        else if (match("--cam_x"))     args.cam_x = (float)atof(argv[++i]);
-        else if (match("--cam_y"))     args.cam_y = (float)atof(argv[++i]);
-        else if (match("--cam_z"))     args.cam_z = (float)atof(argv[++i]);
-        else if (match("--look_x"))    args.look_x = (float)atof(argv[++i]);
-        else if (match("--look_y"))    args.look_y = (float)atof(argv[++i]);
-        else if (match("--look_z"))    args.look_z = (float)atof(argv[++i]);
-        else if (match("--fov"))       args.fov = (float)atof(argv[++i]);
-        else if (match("--sh_degree")) args.sh_degree = atoi(argv[++i]);
-        else if (match("--save_every")) args.save_every = atoi(argv[++i]);
-        else if (match("--log_every")) args.log_every = atoi(argv[++i]);
-        else if (match("--eval_3d")) {
-            int v = atoi(argv[++i]);
-            args.eval_3D = (v != 0);
+    auto require_value = [&](int& i, const char* flag) -> const char* {
+        if (i + 1 >= argc || strncmp(argv[i + 1], "--", 2) == 0) {
+            args.parse_error = std::string("missing value for ") + flag;
+            return nullptr;
         }
+        return argv[++i];
+    };
+    auto parse_int = [&](int& i, const char* flag, int& out) -> bool {
+        const char* value = require_value(i, flag);
+        if (!value) return false;
+        errno = 0;
+        char* end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+            args.parse_error = std::string("invalid integer for ") + flag + ": " + value;
+            return false;
+        }
+        out = static_cast<int>(parsed);
+        return true;
+    };
+    auto parse_float = [&](int& i, const char* flag, float& out) -> bool {
+        const char* value = require_value(i, flag);
+        if (!value) return false;
+        errno = 0;
+        char* end = nullptr;
+        float parsed = std::strtof(value, &end);
+        if (errno != 0 || end == value || *end != '\0' || !std::isfinite(parsed)) {
+            args.parse_error = std::string("invalid finite float for ") + flag + ": " + value;
+            return false;
+        }
+        out = parsed;
+        return true;
+    };
+    auto parse_bool = [&](int& i, const char* flag, bool& out) -> bool {
+        int v = 0;
+        if (!parse_int(i, flag, v)) return false;
+        if (v != 0 && v != 1) {
+            args.parse_error = std::string("invalid boolean for ") + flag + ": expected 0 or 1";
+            return false;
+        }
+        out = (v != 0);
+        return true;
+    };
+
+    for (int i = 1; i < argc && args.parse_error.empty(); i++) {
+        if (strcmp(argv[i], "--ply") == 0)            args.ply_path = require_value(i, "--ply");
+        else if (strcmp(argv[i], "--gt") == 0)        args.gt_path = require_value(i, "--gt");
+        else if (strcmp(argv[i], "--cameras") == 0)   args.cameras_json = require_value(i, "--cameras");
+        else if (strcmp(argv[i], "--gt_dir") == 0)    args.gt_dir = require_value(i, "--gt_dir");
+        else if (strcmp(argv[i], "--output") == 0)    args.output_path = require_value(i, "--output");
+        else if (strcmp(argv[i], "--iterations") == 0) { if (!parse_int(i, "--iterations", args.iterations)) break; }
+        else if (strcmp(argv[i], "--width") == 0) { if (!parse_int(i, "--width", args.width)) break; }
+        else if (strcmp(argv[i], "--height") == 0) { if (!parse_int(i, "--height", args.height)) break; }
+        else if (strcmp(argv[i], "--cam_x") == 0) { if (!parse_float(i, "--cam_x", args.cam_x)) break; }
+        else if (strcmp(argv[i], "--cam_y") == 0) { if (!parse_float(i, "--cam_y", args.cam_y)) break; }
+        else if (strcmp(argv[i], "--cam_z") == 0) { if (!parse_float(i, "--cam_z", args.cam_z)) break; }
+        else if (strcmp(argv[i], "--look_x") == 0) { if (!parse_float(i, "--look_x", args.look_x)) break; }
+        else if (strcmp(argv[i], "--look_y") == 0) { if (!parse_float(i, "--look_y", args.look_y)) break; }
+        else if (strcmp(argv[i], "--look_z") == 0) { if (!parse_float(i, "--look_z", args.look_z)) break; }
+        else if (strcmp(argv[i], "--fov") == 0) { if (!parse_float(i, "--fov", args.fov)) break; }
+        else if (strcmp(argv[i], "--sh_degree") == 0) { if (!parse_int(i, "--sh_degree", args.sh_degree)) break; }
+        else if (strcmp(argv[i], "--save_every") == 0) { if (!parse_int(i, "--save_every", args.save_every)) break; }
+        else if (strcmp(argv[i], "--log_every") == 0) { if (!parse_int(i, "--log_every", args.log_every)) break; }
+        else if (strcmp(argv[i], "--densify") == 0) { if (!parse_bool(i, "--densify", args.densify)) break; }
+        else if (strcmp(argv[i], "--densify_from_step") == 0) { if (!parse_int(i, "--densify_from_step", args.densify_from_step)) break; }
+        else if (strcmp(argv[i], "--densify_until_step") == 0) { if (!parse_int(i, "--densify_until_step", args.densify_until_step)) break; }
+        else if (strcmp(argv[i], "--densify_interval") == 0) { if (!parse_int(i, "--densify_interval", args.densify_interval)) break; }
+        else if (strcmp(argv[i], "--cap_max") == 0) {
+            if (!parse_int(i, "--cap_max", args.cap_max)) break;
+            args.cap_max_provided = true;
+        }
+        else if (strcmp(argv[i], "--opacity_reset_interval") == 0) { if (!parse_int(i, "--opacity_reset_interval", args.opacity_reset_interval)) break; }
+        else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
+        else args.parse_error = std::string("unknown option: ") + argv[i];
     }
     return args;
 }
@@ -452,6 +516,12 @@ static void printUsage(const char* prog) {
     printf("  --sh_degree <0-3>     SH degree override (default: from PLY)\n");
     printf("  --save_every <N>      Checkpoint interval (default: end only)\n");
     printf("  --log_every <N>       Print loss interval (default: 100)\n");
+    printf("  --densify <0|1>       Enable densification schedule; defaults to MCMC growth (default: 0)\n");
+    printf("  --cap_max <N>         MCMC Gaussian cap; >0 also enables densification, 0 with --densify 1 selects legacy\n");
+    printf("  --densify_from_step <N>   First densification step (default: 500)\n");
+    printf("  --densify_until_step <N>  Last densification step (default: 15000)\n");
+    printf("  --densify_interval <N>    Densification interval (default: 100)\n");
+    printf("  --opacity_reset_interval <N>  Reset opacity interval when densifying (default: 3000)\n");
     printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
 }
 
@@ -473,9 +543,42 @@ int main(int argc, char** argv) {
     }
 
     TrainArgs args = parseArgs(argc, argv);
+    if (!args.parse_error.empty()) {
+        printf("Error: %s\n", args.parse_error.c_str());
+        printUsage(argv[0]);
+        return 1;
+    }
     if (!args.ply_path) {
         printf("Error: --ply is required\n");
         printUsage(argv[0]);
+        return 1;
+    }
+    if (args.iterations <= 0) {
+        printf("Error: --iterations must be > 0\n");
+        return 1;
+    }
+    if (args.width <= 0 || args.height <= 0) {
+        printf("Error: --width and --height must be > 0\n");
+        return 1;
+    }
+    if (args.width > INT_MAX / args.height || args.width * args.height > INT_MAX / 3) {
+        printf("Error: --width * --height is too large\n");
+        return 1;
+    }
+    if (args.fov <= 0.0f || args.fov >= 180.0f) {
+        printf("Error: --fov must be in the open range (0, 180)\n");
+        return 1;
+    }
+    if (args.save_every < 0) {
+        printf("Error: --save_every must be >= 0\n");
+        return 1;
+    }
+    if (args.log_every <= 0) {
+        printf("Error: --log_every must be > 0\n");
+        return 1;
+    }
+    if (args.sh_degree < -1 || args.sh_degree > 3) {
+        printf("Error: --sh_degree must be -1, 0, 1, 2, or 3\n");
         return 1;
     }
 
@@ -490,6 +593,8 @@ int main(int argc, char** argv) {
     // Load PLY model
     printf("Loading PLY: %s\n", args.ply_path);
     auto model = loadPly(args.ply_path);
+    const int initial_N = model.data.count;
+    const bool save_filter_3D = (model.data.filter_3D != nullptr) || args.eval_3D;
     printf("Loaded %d Gaussians, SH degree %d\n", model.data.count, model.data.sh_degree);
 
     RawGaussianParams raw = initRawFromGaussianData(model.data);
@@ -503,12 +608,50 @@ int main(int argc, char** argv) {
     cfg.eval_3D_parity_mode = args.eval_3D;
     cfg.sh_degree = (args.sh_degree >= 0) ? args.sh_degree : raw.sh_degree;
 
+    if (args.cap_max_provided && args.cap_max > 0)
+        args.densify = true;
+
+    if (args.densify && args.densify_from_step <= 0) {
+        printf("Error: --densify_from_step must be > 0 when densification is enabled\n");
+        freeRawParams(raw);
+        model.free();
+        return 1;
+    }
+    if (args.densify && args.densify_interval <= 0) {
+        printf("Error: --densify_interval must be > 0 when densification is enabled\n");
+        freeRawParams(raw);
+        model.free();
+        return 1;
+    }
+    if (args.densify && args.densify_until_step < args.densify_from_step) {
+        printf("Error: --densify_until_step must be >= --densify_from_step\n");
+        freeRawParams(raw);
+        model.free();
+        return 1;
+    }
+    if (args.cap_max < 0) {
+        printf("Error: --cap_max must be >= 0\n");
+        freeRawParams(raw);
+        model.free();
+        return 1;
+    }
+    if (args.opacity_reset_interval < 0) {
+        printf("Error: --opacity_reset_interval must be >= 0\n");
+        freeRawParams(raw);
+        model.free();
+        return 1;
+    }
+    if (args.densify && !args.cap_max_provided)
+        args.cap_max = std::max(initial_N + 1, static_cast<int>(initial_N * 1.5f));
+
     // Vulkan training config
     VkTrainingConfig tcfg{};
     tcfg.max_steps = args.iterations;
-    tcfg.densify_from_step = 0;
-    tcfg.cap_max = 0;
-    tcfg.opacity_reset_interval = 0;
+    tcfg.densify_from_step = args.densify ? args.densify_from_step : 0;
+    tcfg.densify_until_step = args.densify_until_step;
+    tcfg.densify_interval = args.densify_interval;
+    tcfg.cap_max = args.densify ? args.cap_max : 0;
+    tcfg.opacity_reset_interval = args.densify ? args.opacity_reset_interval : 0;
     tcfg.lambda_dssim = 0.0f;     // L1-only (match CUDA reference for parity)
     tcfg.opacity_reg = 0.0f;      // Disable regularization (CUDA has none)
     tcfg.scale_reg = 0.0f;        // Disable regularization (CUDA has none)
@@ -629,7 +772,7 @@ int main(int argc, char** argv) {
 
     printf("\n=== Vulkan Training ===\n");
     printf("  Device:      %s\n", ctx.deviceName().c_str());
-    printf("  Gaussians:   %d\n", model.data.count);
+    printf("  Gaussians:   %d\n", initial_N);
     printf("  SH degree:   %d\n", cfg.sh_degree);
     printf("  Iterations:  %d\n", args.iterations);
     printf("  Views:       %zu\n", views.size());
@@ -637,6 +780,14 @@ int main(int argc, char** argv) {
     printf("  pos LR:      %.6f -> %.6f\n", tcfg.pos_lr_init, tcfg.pos_lr_final);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
     printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
+    printf("  densify:     %s", tcfg.densify_from_step > 0 ? "ON" : "OFF");
+    if (tcfg.densify_from_step > 0)
+        printf(" (from=%d until=%d interval=%d cap_max=%d opacity_reset=%d)",
+               tcfg.densify_from_step, tcfg.densify_until_step,
+               tcfg.densify_interval, tcfg.cap_max,
+               tcfg.opacity_reset_interval);
+    printf("\n");
+    printf("  save filter_3D: %s\n", save_filter_3D ? "ON" : "OFF");
     printf("  opacity_reg: %.4f\n", tcfg.opacity_reg);
     printf("  scale_reg:   %.4f\n", tcfg.scale_reg);
     printf("  noise_lr:    %.0f\n", tcfg.noise_lr);
@@ -716,7 +867,8 @@ int main(int argc, char** argv) {
         if (args.save_every > 0 && (iter + 1) % args.save_every == 0) {
             char ckpt_path[512];
             snprintf(ckpt_path, sizeof(ckpt_path), "%s.iter%d.ply", args.output_path, iter + 1);
-            savePly(ckpt_path, trainer.raw_params());
+            savePly(ckpt_path, trainer.raw_params(),
+                    save_filter_3D ? trainer.filter_3D().data() : nullptr);
             printf("  Saved checkpoint: %s\n", ckpt_path);
         }
     }
@@ -751,7 +903,8 @@ int main(int argc, char** argv) {
 
     // Save trained model
     printf("Saving trained model: %s\n", args.output_path);
-    if (!savePly(args.output_path, trainer.raw_params())) {
+    if (!savePly(args.output_path, trainer.raw_params(),
+                 save_filter_3D ? trainer.filter_3D().data() : nullptr)) {
         printf("Error: failed to save PLY: %s\n", args.output_path);
         return 1;
     }

@@ -64,6 +64,7 @@ public:
 
     // Access current raw parameters (for inspection/checkpointing).
     const RawGaussianParams& raw_params() const { return raw_view_; }
+    const std::vector<float>& filter_3D() const { return act_filter_3D_; }
 
 #ifdef GS3D_TESTING
     mcmc::DensifyResult apply_mcmc_densification_for_test(
