@@ -221,6 +221,60 @@ TEST(TileBinner, Bin_TinyFixture_ValidKeys) {
 }
 
 // -----------------------------------------------------------------------------
+// eval_3D parity mode: CUDA default eval_3D uses global view-space depth sorting
+// and no tile-based culling. The Vulkan parity path must therefore scatter the
+// same normal tile/depth keys even when PreprocessOutput came from eval_3D.
+// -----------------------------------------------------------------------------
+TEST(TileBinner, Eval3DParityMode_UsesViewDepthKey) {
+    constexpr int N = 1;
+    float means2d[N * 2] = {8.0f, 8.0f};
+    float depths[N] = {2.25f};
+    float conics[N * 3] = {0.0f, 0.0f, 0.0f};
+    float opacities[N] = {0.5f};
+    float rgb[N * 3] = {0.0f, 0.0f, 0.0f};
+    int radii[N] = {5};
+    int tiles_touched[N] = {1};
+
+    PreprocessOutput pre{};
+    pre.means2D = means2d;
+    pre.depths = depths;
+    pre.conics = conics;
+    pre.opacities_2d = opacities;
+    pre.rgb = rgb;
+    pre.radii = radii;
+    pre.tiles_touched = tiles_touched;
+    pre.eval_3D = true;
+
+    Camera cam{};
+    cam.width = 64;
+    cam.height = 64;
+
+    RenderConfig cfg{};
+    cfg.eval_3D = true;
+    cfg.eval_3D_parity_mode = true;
+    cfg.tile_w = 16;
+    cfg.tile_h = 16;
+
+    VulkanContext ctx;
+    ASSERT_TRUE(ctx.init()) << "Vulkan init failed — no compute-capable device?";
+
+    FrameAllocator alloc(4u * 1024u * 1024u);
+    TileBinnerVulkan binner(ctx);
+    BinningOutput result = binner.bin(pre, N, cam, cfg, alloc);
+
+    ASSERT_EQ(result.total_pairs, 1);
+    ASSERT_NE(result.keys_unsorted, nullptr);
+    ASSERT_NE(result.values_unsorted, nullptr);
+    EXPECT_EQ(result.values_unsorted[0], 0u);
+    EXPECT_EQ(static_cast<uint32_t>(result.keys_unsorted[0] >> 32), 0u);
+
+    uint32_t depth_bits = static_cast<uint32_t>(result.keys_unsorted[0] & 0xffffffffull);
+    float decoded_depth = 0.0f;
+    std::memcpy(&decoded_depth, &depth_bits, sizeof(float));
+    EXPECT_FLOAT_EQ(decoded_depth, depths[0]);
+}
+
+// -----------------------------------------------------------------------------
 // Empty-scene fast path: all Gaussians culled (radii=0, tiles_touched=0).
 // -----------------------------------------------------------------------------
 TEST(TileBinner, Bin_EmptyScene) {

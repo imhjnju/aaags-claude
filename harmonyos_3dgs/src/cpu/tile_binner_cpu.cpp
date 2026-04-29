@@ -85,7 +85,7 @@ BinningOutput TileBinnerCPU::bin(const PreprocessOutput& pre, int N,
             for (int x = rect_min[0]; x < rect_max[0]; x++) {
                 // Per-tile depth key via depthAlongRay (StopThePop corrects at pixel level)
                 uint32_t tile_depth_bits = depth_bits;
-                if (pre.eval_3D && pre.cov3D_inv && have_inverse_vp) {
+                if (pre.eval_3D && !cfg.eval_3D_parity_mode && pre.cov3D_inv && have_inverse_vp) {
                     float tile_cx = (x + 0.5f) * cfg.tile_w;
                     float tile_cy = (y + 0.5f) * cfg.tile_h;
                     float viewdir[3];

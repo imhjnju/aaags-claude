@@ -41,6 +41,44 @@ struct alignas(16) RasterizeBackwardUBO {
 static_assert(sizeof(RasterizeBackwardUBO) == 32,
               "RasterizeBackwardUBO must be 32 bytes (std140)");
 
+namespace rasterize_backward_eval3d_bind {
+constexpr uint32_t TILE_RANGES      = 0;
+constexpr uint32_t VALUES_SORTED    = 1;
+constexpr uint32_t GAUSS2SCREEN     = 2;   // RO float[N*16], row-major
+constexpr uint32_t CONIC_OPACITY    = 3;   // RO float[N*4], opacity in .w
+constexpr uint32_t COLORS           = 4;   // RO float[N*3]
+constexpr uint32_t T_FINAL          = 5;   // RO float[H*W]
+constexpr uint32_t N_CONTRIB        = 6;   // RO uint[H*W], eval_3D blended count
+constexpr uint32_t RENDERED_IMAGE   = 7;   // RO float[3*H*W], CHW
+constexpr uint32_t DL_DPIXELS       = 8;   // RO float[3*H*W], CHW
+constexpr uint32_t DL_DGAUSS2SCREEN = 9;   // RW float[N*16], atomicAdd
+constexpr uint32_t DL_DOPACITY      = 10;  // RW float[N], atomicAdd
+constexpr uint32_t DL_DCOLORS       = 11;  // RW float[N*3], atomicAdd
+constexpr uint32_t BACKWARD_UBO     = 12;
+constexpr uint32_t BINDING_COUNT    = 13;
+}  // namespace rasterize_backward_eval3d_bind
+
+namespace preprocess_backward_eval3d_bind {
+constexpr uint32_t POSITIONS        = 0;
+constexpr uint32_t RADII            = 1;
+constexpr uint32_t SH_COEFFS        = 2;
+constexpr uint32_t SCALES           = 3;
+constexpr uint32_t ROTATIONS        = 4;
+constexpr uint32_t D_RGB            = 5;
+constexpr uint32_t D_OPACITY        = 6;
+constexpr uint32_t D_GAUSS2SCREEN   = 7;
+constexpr uint32_t D_MEANS3D        = 8;
+constexpr uint32_t D_SH             = 9;
+constexpr uint32_t D_SCALES         = 10;
+constexpr uint32_t D_ROTATIONS      = 11;
+constexpr uint32_t OPACITIES        = 12;
+constexpr uint32_t D_RAW_OPACITIES  = 13;
+constexpr uint32_t RAW_ROTATIONS    = 14;
+constexpr uint32_t PREPROCESS_BACKWARD_UBO = 15;
+constexpr uint32_t FILTER_3D        = 16;
+constexpr uint32_t BINDING_COUNT    = 17;
+}  // namespace preprocess_backward_eval3d_bind
+
 // ---- preprocess_backward.comp binding layout (23 total: 22 SSBOs + 1 UBO) ----
 //
 // Binding layout:

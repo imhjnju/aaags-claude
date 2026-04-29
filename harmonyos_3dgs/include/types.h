@@ -62,6 +62,7 @@ struct RenderConfig {
     float scale_modifier = 1.0f;
     bool antialiasing = false;
     bool eval_3D = false;        // AAA-Gaussians: full 3D Gaussian evaluation
+    bool eval_3D_parity_mode = false;  // Match CUDA eval_3D sort_mode=GLOBAL/no tile culling
     bool training = false;       // Training mode: skip upper color clamp in SH eval
     int sh_degree = 3;
     int tile_w = 16;

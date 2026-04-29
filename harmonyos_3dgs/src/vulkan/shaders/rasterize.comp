@@ -33,10 +33,8 @@
 // Shared memory footprint (2D path):  10 arrays * 256 floats/uints = 10.24 KB.
 // Shared memory footprint (eval_3D):   s_g2s (16 KB) + s_opa (1 KB) +
 //                                      s_rgb_{r,g,b}+s_gid reused (4 KB) +
-//                                      sub_order[16][256] uint (16 KB) +
-//                                      sub_count[16] (64 B) ≈ 37 KB.
-// All paths fit within typical Vulkan maxComputeSharedMemorySize (≥ 32 KB on
-// target hardware; 48 KB on desktop).
+//                                      packed sub_order (4 KB) + sub_count (64 B)
+//                                      ≈ 25 KB live / 31.1 KB conservative.
 //
 // Synchronisation: barriers bracket each batch's cooperative load; pixels
 // whose tile has early-terminated still participate in barriers so divergent
@@ -156,14 +154,28 @@ shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
 //   - Streaming drain to HEAD on TAIL overflow is replaced with a full-batch
 //     sort + sweep: every qualifying Gaussian is sorted once per batch and
 //     fed to HEAD in that order. No Gaussians are dropped.
-// Shared memory: 16 sub-tiles * 256 slots * 4B = 16 KB.
+// Shared memory: 16 sub-tiles * 64 packed words * 4B = 4 KB.
 const int  NUM_SUBTILES = 16;
-shared uint sub_order[NUM_SUBTILES][256];  // permutation of [0..batch_size) per sub-tile
-shared int  sub_count[NUM_SUBTILES];        // culled-in count per sub-tile for this batch
+const uint SUB_ORDER_WORDS = 64u;
+shared uint sub_order_packed[NUM_SUBTILES][64];  // four 8-bit batch indices per word
+shared int  sub_count[NUM_SUBTILES];             // culled-in count per sub-tile for this batch
 
 const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
 const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
 const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
+
+void setSubOrder(uint subtile, uint slot, uint value) {
+    uint word_idx = slot >> 2u;
+    uint shift = (slot & 3u) * 8u;
+    uint mask = 0xffu << shift;
+    uint word = sub_order_packed[subtile][word_idx];
+    sub_order_packed[subtile][word_idx] = (word & ~mask) | ((value & 0xffu) << shift);
+}
+
+uint getSubOrder(uint subtile, uint slot) {
+    uint word = sub_order_packed[subtile][slot >> 2u];
+    return (word >> ((slot & 3u) * 8u)) & 0xffu;
+}
 
 // --- eval_3D helper functions ------------------------------------------------
 
@@ -239,6 +251,71 @@ void main() {
     // sees every qualifying Gaussian — we only REORDER the stream.
     // =================================================================
 
+    if (spec_disable_subtile_resort == 1u) {
+        for (uint batch_start = range_start;
+             batch_start < range_end;
+             batch_start += BATCH_SIZE)
+        {
+            uint load_idx = batch_start + local_idx;
+            if (load_idx < range_end) {
+                uint gid = values_sorted[load_idx];
+                s_gid[local_idx] = gid;
+                for (int j = 0; j < 4; j++) {
+                    s_g2s[local_idx * 16u + uint(j)]       = gauss2screen[gid * 16u + 0u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 4u + uint(j)]  = gauss2screen[gid * 16u + 1u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 8u + uint(j)]  = gauss2screen[gid * 16u + 2u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 12u + uint(j)] = gauss2screen[gid * 16u + 3u * 4u + uint(j)];
+                }
+                s_opa[local_idx]   = conic_opacity[gid * 4u + 3u];
+                s_rgb_r[local_idx] = rgb[gid * 3u + 0u];
+                s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
+                s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
+            }
+            barrier();
+
+            uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+            if (!pixel_done) {
+                float fpx = float(pixel_x);
+                float fpy = float(pixel_y);
+                for (uint k = 0u; k < batch_size; ++k) {
+                    contributor_pos += 1u;
+
+                    float plane_x[4], plane_y[4];
+                    for (int j = 0; j < 4; j++) {
+                        plane_x[j] = s_g2s[k * 16u + uint(j)]      - s_g2s[k * 16u + 12u + uint(j)] * fpx;
+                        plane_y[j] = s_g2s[k * 16u + 4u + uint(j)] - s_g2s[k * 16u + 12u + uint(j)] * fpy;
+                    }
+
+                    float max_pos[4];
+                    float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
+                    if (power > 0.0) continue;
+
+                    float alpha = min(0.99, s_opa[k] * exp(power));
+                    if (alpha < ALPHA_THRESHOLD) continue;
+
+                    float w_ndc = 0.0, z_ndc = 0.0;
+                    for (int j = 0; j < 4; j++) {
+                        w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
+                        z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                    }
+                    if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+                    float test_T = T * (1.0 - alpha);
+                    if (test_T < T_MIN) {
+                        pixel_done = true;
+                        break;
+                    }
+                    C.r += s_rgb_r[k] * alpha * T;
+                    C.g += s_rgb_g[k] * alpha * T;
+                    C.b += s_rgb_b[k] * alpha * T;
+                    T = test_T;
+                    n = contributor_pos;
+                }
+            }
+            barrier();
+        }
+    } else {
+
     // Per-pixel k-buffer (HEAD): HEAD_W sorted slots (ascending per-pixel depth).
     // Private (per-thread register/local memory) — no shared memory needed.
     // HEAD_W=4 matches CUDA exactly. Depth refinement comes from the TAIL
@@ -312,12 +389,18 @@ void main() {
             // thread writes an identity permutation so step 3 walks the batch
             // in raw input (tile-center sorted) order — matches CUDA sort_mode=0.
             if (is_subtile_leader) {
+                for (uint w = 0u; w < SUB_ORDER_WORDS; ++w) {
+                    sub_order_packed[subtile_id][w] = 0u;
+                }
                 for (uint k = 0u; k < batch_size; ++k) {
-                    sub_order[subtile_id][k] = k;
+                    setSubOrder(subtile_id, k, k);
                 }
                 sub_count[subtile_id] = int(batch_size);
             }
         } else if (is_subtile_leader) {
+            for (uint w = 0u; w < SUB_ORDER_WORDS; ++w) {
+                sub_order_packed[subtile_id][w] = 0u;
+            }
             float priv_depth[256];
             int cnt = 0;
 
@@ -347,15 +430,15 @@ void main() {
 
                 // Bubble-up insertion into the ascending-depth permutation.
                 priv_depth[cnt] = d;
-                sub_order[subtile_id][cnt] = k;
+                setSubOrder(subtile_id, uint(cnt), k);
                 for (int i = cnt; i > 0; --i) {
                     if (priv_depth[i - 1] > priv_depth[i]) {
                         float td = priv_depth[i];
                         priv_depth[i]     = priv_depth[i - 1];
                         priv_depth[i - 1] = td;
-                        uint tk = sub_order[subtile_id][i];
-                        sub_order[subtile_id][i]     = sub_order[subtile_id][i - 1];
-                        sub_order[subtile_id][i - 1] = tk;
+                        uint tk = getSubOrder(subtile_id, uint(i));
+                        setSubOrder(subtile_id, uint(i), getSubOrder(subtile_id, uint(i - 1)));
+                        setSubOrder(subtile_id, uint(i - 1), tk);
                     } else {
                         break;
                     }
@@ -373,7 +456,7 @@ void main() {
             float fpy = float(pixel_y);
 
             for (int t = 0; t < tsz; ++t) {
-                uint k = sub_order[subtile_id][t];
+                uint k = getSubOrder(subtile_id, uint(t));
 
                 float plane_x[4], plane_y[4];
                 for (int j = 0; j < 4; j++) {
@@ -395,10 +478,8 @@ void main() {
                 }
                 if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
 
-                // Per-pixel depth for HEAD k-buffer.
-                // Use z_ndc + 8.0 (same +8 bias as scatter.comp; w_ndc is ~ constant per tile,
-                // so z_ndc alone gives correct relative ordering within a tile's pre-sorted list).
-                float sort_depth = z_ndc;
+                // Per-pixel HEAD ordering matches CUDA eval_3D local sorting: z_ndc / w_ndc.
+                float sort_depth = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc);
 
                 // HEAD overflow: blend shallowest entry, pop.
                 if (kbuf_size == HEAD_W) {
@@ -453,6 +534,8 @@ void main() {
             }
             kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
         }
+    }
+
     }
 
     } else {

@@ -44,6 +44,7 @@ REPO_DIR   = os.path.dirname(SCRIPT_DIR)
 BUILD_DIR  = os.path.join(REPO_DIR, "build")
 
 INIT_PLY   = "/tmp/basketball_init_3dgs.ply"
+EVAL_3D    = False
 CAM_JSON   = "/home/robota/Downloads/basketball/_sp0_dump_output/cameras.json"
 GT_JPG     = "/home/robota/Downloads/basketball/images/78899858295079.jpg"
 COLMAP_PLY = "/home/robota/Downloads/basketball/sparse/0/points3D.ply"
@@ -191,7 +192,7 @@ def run_cuda_training(outdir: str, steps: int) -> np.ndarray:
     for step in range(1, steps + 1):
         es = ExtendedSettings()
         es.proper_ewa_scaling = False
-        es.eval_3D = False
+        es.eval_3D = EVAL_3D
 
         render_pkg = render(cam, gaussians, pipe, bg, splat_args=es)
         image = render_pkg["render"]
@@ -218,7 +219,7 @@ def run_cuda_training(outdir: str, steps: int) -> np.ndarray:
     with torch.no_grad():
         es = ExtendedSettings()
         es.proper_ewa_scaling = False
-        es.eval_3D = False
+        es.eval_3D = EVAL_3D
         final_pkg = render(cam, gaussians, pipe, bg, splat_args=es)
         rendered  = final_pkg["render"].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
 
@@ -266,6 +267,7 @@ def run_vk_training(outdir: str, steps: int) -> np.ndarray:
         "--output",     vk_ply,
         "--iterations", str(steps),
         "--log_every",  "200",
+        "--eval_3d",    "1" if EVAL_3D else "0",
     ]
     print(f"  Running: {' '.join(cmd)}")
     ret = subprocess.run(cmd, capture_output=False, text=True)
@@ -275,29 +277,34 @@ def run_vk_training(outdir: str, steps: int) -> np.ndarray:
     elapsed_train = time.time() - t0
     print(f"  VK training done in {elapsed_train:.1f}s")
 
-    # 4. VK render from cam0
-    vk_render_bin = os.path.join(BUILD_DIR, "gs3d_vk_render")
-    render_wd     = os.path.join(outdir, "vk_render_tmp")
-    os.makedirs(render_wd, exist_ok=True)
-    cmd2 = [vk_render_bin, vk_ply, cam0_json_path, "0", "--eval_3d", "0"]
-    print(f"  Running: {' '.join(cmd2)}")
-    ret2 = subprocess.run(cmd2, capture_output=False, text=True, cwd=render_wd)
-    if ret2.returncode != 0:
-        raise RuntimeError(f"gs3d_vk_render failed (exit {ret2.returncode})")
-
-    # Load raw float CHW output
-    raw_path = os.path.join(render_wd, "vk_float.raw")
-    if os.path.exists(raw_path):
-        data = np.fromfile(raw_path, dtype=np.float32)
-        vk_np = data.reshape(3, H, W).transpose(1, 2, 0).clip(0, 1)
+    # 4. VK render from cam0. eval_3D depends on filter_3D, which is currently
+    # consumed during training but not preserved when vk_train_main saves PLY.
+    # For eval_3D comparisons, use the final render emitted by training itself.
+    if EVAL_3D:
+        ppm_out = vk_ply + ".render.ppm"
+        print(f"  Loading VK final training render: {ppm_out}")
+        vk_np = np.asarray(Image.open(ppm_out).convert("RGB"), dtype=np.float32) / 255.0
     else:
-        # Fallback: load uint8 PPM
-        from io import BytesIO
-        ppm_out = os.path.join(render_wd, "output_vk.ppm")
-        with open(ppm_out, "rb") as f:
-            f.readline(); dims = f.readline().split(); f.readline()
-            W2, H2 = int(dims[0]), int(dims[1])
-            vk_np = np.frombuffer(f.read(), dtype=np.uint8).reshape(H2, W2, 3).astype(np.float32) / 255.0
+        vk_render_bin = os.path.join(BUILD_DIR, "gs3d_vk_render")
+        render_wd     = os.path.join(outdir, "vk_render_tmp")
+        os.makedirs(render_wd, exist_ok=True)
+        cmd2 = [vk_render_bin, vk_ply, cam0_json_path, "0", "--eval_3d", "0"]
+        print(f"  Running: {' '.join(cmd2)}")
+        ret2 = subprocess.run(cmd2, capture_output=False, text=True, cwd=render_wd)
+        if ret2.returncode != 0:
+            raise RuntimeError(f"gs3d_vk_render failed (exit {ret2.returncode})")
+
+        # Load raw float CHW output
+        raw_path = os.path.join(render_wd, "vk_float.raw")
+        if os.path.exists(raw_path):
+            data = np.fromfile(raw_path, dtype=np.float32)
+            vk_np = data.reshape(3, H, W).transpose(1, 2, 0).clip(0, 1)
+        else:
+            ppm_out = os.path.join(render_wd, "output_vk.ppm")
+            with open(ppm_out, "rb") as f:
+                f.readline(); dims = f.readline().split(); f.readline()
+                W2, H2 = int(dims[0]), int(dims[1])
+                vk_np = np.frombuffer(f.read(), dtype=np.uint8).reshape(H2, W2, 3).astype(np.float32) / 255.0
 
     p = psnr(vk_np, gt_np)
     elapsed = time.time() - t0
@@ -331,6 +338,7 @@ def compare_and_report(cuda_np, vk_np, outdir, steps):
   Adam lr_sh  : dc={LR_SH_DC:.1e}  rest={LR_SH_REST:.1e}
   Adam lr_op  : {LR_OP:.1e}
   proper_ewa  : False
+  eval_3D     : {EVAL_3D}
 ====================================================
   PSNR (CUDA render vs GT)   = {p_cuda:6.2f} dB
   PSNR (VK   render vs GT)   = {p_vk:6.2f} dB
@@ -353,12 +361,19 @@ def compare_and_report(cuda_np, vk_np, outdir, steps):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    global INIT_PLY, EVAL_3D
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir",    default="/tmp/compare_fair_2000")
     parser.add_argument("--steps",     type=int, default=steps)
+    parser.add_argument("--init_ply",  default=INIT_PLY)
+    parser.add_argument("--eval_3d",   action="store_true")
     parser.add_argument("--skip_cuda", action="store_true")
     parser.add_argument("--skip_vk",   action="store_true")
     args = parser.parse_args()
+
+    INIT_PLY = args.init_ply
+    EVAL_3D = args.eval_3d
 
     for p, n in [(INIT_PLY, "init PLY"), (GT_JPG, "GT JPG"), (CAM_JSON, "cameras.json")]:
         if not os.path.exists(p):
