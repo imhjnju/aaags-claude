@@ -102,17 +102,33 @@ Do not chase another shader formula change until a controlled same-state experim
 
 ## Follow-up: eval_3D Training/Rendering Smoke
 
-Added `--eval_3d 0|1` support to `gs3d_vk_train` to match the existing render CLI flag. A 10-step scan1 eval_3D run was launched.
+Added `--eval_3d 0|1` support to `gs3d_vk_train` to match the existing render CLI flag. The first smoke was misleading: the CLI set `RenderConfig::eval_3D`, but not `VkTrainingConfig::eval_3D`, while `VulkanTrainer` specializes `PreprocessorVulkan` and `RasterizerVulkan` from `VkTrainingConfig`. Therefore the earlier 10-step run completed without constructing a true eval_3D trainer.
 
-First attempt used `/tmp/scan1_init_3dgs.ply`, which lacks the AAA `filter_3D` PLY property. Vulkan eval_3D rendered all black and loss stayed at `0.665102` for all 10 steps.
+First attempt used `/tmp/scan1_init_3dgs.ply`, which lacks the AAA `filter_3D` PLY property. Generated `/tmp/scan1_init_3dgs_filter3d.ply` by appending raw `filter_3D = min_valid_depth / max_focal * sqrt(0.3)` from scan1 camera 0. The generated field had 26,377 nonzero values, max `0.0016296807`.
 
-Generated `/tmp/scan1_init_3dgs_filter3d.ply` by appending raw `filter_3D = min_valid_depth / max_focal * sqrt(0.3)` from scan1 camera 0. The generated field had 26,377 nonzero values, max `0.0016296807`. Re-running eval_3D still rendered all black and loss stayed unchanged.
+Forward eval_3D rendering is not empty with the filtered PLY. With black background it appears black because the initialization's RGB is zero; with `BG_WHITE=1`, `gs3d_vk_render --eval_3d 1` produces 1,450,525 non-white pixels (`min=0`, `max=255`, `mean≈142.06`), proving transmittance changes and the forward rasterizer contributes.
 
-Diagnostic dump with the filtered PLY showed preprocess was not fully empty: `tiles_touched` had 25,213 nonzero Gaussians (max 99). However rasterization produced `n_contrib` all zero, `T_final` all 1, and `rendered_image` all zero. Therefore the current eval_3D blocker is in the eval_3D rasterize contribution path, not only missing `filter_3D`.
+After propagating `--eval_3d` into `VkTrainingConfig`, true eval_3D training initially reached the backward unsupported guard. That blocker is now closed by the eval_3D backward port: the CLI maps `--eval_3d 1` training to the validated `parity_mode=true` replay path while the internal trainer still rejects eval_3D training with `parity_mode=false`.
+
+Post-backward 10-step scan1 camera0 smoke:
+
+```text
+harmonyos_3dgs/build/gs3d_vk_train \
+  --ply /tmp/scan1_init_3dgs_filter3d.ply \
+  --cameras /home/robota/h00813233/Graph/datasets/scan1/cameras.json \
+  --gt_dir /tmp/scan1_gt_cam0_ppm \
+  --output /tmp/scan1_vk_eval3d_filter_10_postbwd/trained.ply \
+  --iterations 10 --eval_3d 1 --log_every 1
+```
+
+Result: training completed on camera0 with `loss 0.665102 → 0.660058` (0.8% reduction, ~4.1 it/s). The final render was saved to `/tmp/scan1_vk_eval3d_filter_10_postbwd/trained.ply.render.ppm`; PSNR against the JPEG-converted camera0 GT was `2.664990 dB` (`mean_abs=0.657764673`, render mean `0.005347`). This is a smoke result only, not a CUDA eval_3D parity claim.
 
 Eval_3D smoke artifacts:
 
 - Missing-filter run: `/tmp/scan1_vk_eval3d_10_20260428_172824/`
-- Filtered-Ply run: `/tmp/scan1_vk_eval3d_filter_10_20260428_173438/`
+- Filtered-Ply run before the CLI propagation fix: `/tmp/scan1_vk_eval3d_filter_10_20260428_173438/`
 - Filtered init PLY: `/tmp/scan1_init_3dgs_filter3d.ply`
-- Eval_3D diagnostic dump: `/tmp/scan1_vk_eval3d_dump/`
+- Misleading pre-fix diagnostic dump: `/tmp/scan1_vk_eval3d_dump/`
+- Forward white-background check: `/tmp/scan1_vk_eval3d_forward_white/`
+- Post-backward 10-step camera0 smoke: `/tmp/scan1_vk_eval3d_filter_10_postbwd/`
+- Temporary camera0 PPM GT converted from JPEG: `/tmp/scan1_gt_cam0_ppm/00000000.ppm`
