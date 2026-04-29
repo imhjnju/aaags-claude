@@ -397,6 +397,7 @@ mcmc::DensifyResult VulkanTrainer::apply_mcmc_densification_for_test(
     raw_owned.sh_degree = raw_view_.sh_degree;
     raw_owned.max_coeffs = max_coeffs_;
     raw_owned.from_raw(raw_view_);
+    raw_owned.filter_3D = act_filter_3D_;
 
     const int old_N = N_;
     mcmc::DensifyResult result = mcmc::densify_with_samples(
@@ -408,6 +409,7 @@ mcmc::DensifyResult VulkanTrainer::apply_mcmc_densification_for_test(
     raw_rotations_.assign(raw_owned.rotations.begin(), raw_owned.rotations.end());
     raw_sh_coeffs_.assign(raw_owned.sh_coeffs.begin(), raw_owned.sh_coeffs.end());
     raw_opacities_.assign(raw_owned.opacities.begin(), raw_owned.opacities.end());
+    act_filter_3D_.assign(raw_owned.filter_3D.begin(), raw_owned.filter_3D.end());
 
     reallocate_for_n(N_, old_N);
     zero_mcmc_adam_state(vulkan_adam_, max_coeffs_, result);
@@ -563,11 +565,6 @@ float VulkanTrainer::step(const Camera& cam,
         throw std::runtime_error(
             "VulkanTrainer::step: eval_3D training currently requires parity_mode=true");
     }
-    if (tcfg_.eval_3D && tcfg_.cap_max > 0) {
-        throw std::runtime_error(
-            "VulkanTrainer::step: eval_3D MCMC densification requires filter_3D propagation support");
-    }
-
     // Steps 1-5: forward + loss. Out-params alias FrameAllocator memory which
     // remains valid until the next alloc_.reset() — the backward path below
     // reads them in-place.
@@ -811,6 +808,7 @@ float VulkanTrainer::step(const Camera& cam,
         raw_owned.sh_degree  = raw_view_.sh_degree;
         raw_owned.max_coeffs = max_coeffs_;
         raw_owned.from_raw(raw_view_);
+        raw_owned.filter_3D = act_filter_3D_;
 
         const int old_N = N_;
         mcmc::DensifyResult mcmc_result{N_, {}, {}};
@@ -847,6 +845,7 @@ float VulkanTrainer::step(const Camera& cam,
         raw_rotations_.assign(raw_owned.rotations.begin(), raw_owned.rotations.end());
         raw_sh_coeffs_.assign(raw_owned.sh_coeffs.begin(), raw_owned.sh_coeffs.end());
         raw_opacities_.assign(raw_owned.opacities.begin(), raw_owned.opacities.end());
+        act_filter_3D_.assign(raw_owned.filter_3D.begin(), raw_owned.filter_3D.end());
 
         if (tcfg_.cap_max > 0) {
             reallocate_for_n(N_, old_N);

@@ -29,6 +29,7 @@ OwnedRawParams make_params_split(int N, int num_dead,
     p.sh_degree  = 0;
     p.max_coeffs = 1;
     p.resize(N);
+    p.filter_3D.resize(static_cast<size_t>(N));
     const float raw_sc = std::log(0.1f);
     for (int i = 0; i < N; ++i) {
         p.positions[i * 3 + 0] = static_cast<float>(i);
@@ -40,6 +41,7 @@ OwnedRawParams make_params_split(int N, int num_dead,
         p.rotations[i * 4 + 2] = 0.0f;
         p.rotations[i * 4 + 3] = 0.0f;
         p.opacities[i] = (i < num_dead) ? raw_opacity_dead : raw_opacity_alive;
+        p.filter_3D[static_cast<size_t>(i)] = 1000.0f + static_cast<float>(i);
     }
     return p;
 }
@@ -69,6 +71,7 @@ TEST(McmcRelocate, NoDeadIsNoOp) {
     EXPECT_EQ(p.scales,    p0.scales);
     EXPECT_EQ(p.rotations, p0.rotations);
     EXPECT_EQ(p.sh_coeffs, p0.sh_coeffs);
+    EXPECT_EQ(p.filter_3D, p0.filter_3D);
 }
 
 TEST(McmcRelocate, AllDeadIsNoOp) {
@@ -156,6 +159,7 @@ TEST(McmcRelocate, Determinism) {
     EXPECT_EQ(p1.scales,    p2.scales);
     EXPECT_EQ(p1.rotations, p2.rotations);
     EXPECT_EQ(p1.sh_coeffs, p2.sh_coeffs);
+    EXPECT_EQ(p1.filter_3D, p2.filter_3D);
 }
 
 TEST(McmcRelocate, DifferentSeedsCanDiffer) {
@@ -169,6 +173,17 @@ TEST(McmcRelocate, DifferentSeedsCanDiffer) {
     mcmc::relocate_gs(p2, 0.005f, 999999u);
 
     EXPECT_NE(p1.positions, p2.positions);
+}
+
+TEST(McmcRelocate, CopiesFilter3DFromAliveSource) {
+    OwnedRawParams p = make_params_split(3, /*num_dead=*/2, -10.0f, 2.0f);
+
+    int n = mcmc::relocate_gs(p, 0.005f, 42);
+
+    EXPECT_EQ(n, 2);
+    EXPECT_FLOAT_EQ(p.filter_3D[0], 1002.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[1], 1002.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[2], 1002.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +254,22 @@ TEST(McmcAddNewGs, Determinism) {
     EXPECT_EQ(p1.positions, p2.positions);
     EXPECT_EQ(p1.opacities, p2.opacities);
     EXPECT_EQ(p1.scales,    p2.scales);
+    EXPECT_EQ(p1.filter_3D, p2.filter_3D);
+}
+
+TEST(McmcAddNewGs, AppendedSlotsCopyFilter3DFromSource) {
+    OwnedRawParams p = make_params_all_alive(100, 2.0f);
+
+    mcmc::DensifySamplePlan plan;
+    plan.add_sources = {4, 7, 4, 9, 12};
+    mcmc::DensifyResult r = mcmc::densify_with_samples(p, 0.005f, 105, plan);
+
+    EXPECT_EQ(r.final_count, 105);
+    EXPECT_FLOAT_EQ(p.filter_3D[100], 1004.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[101], 1007.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[102], 1004.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[103], 1009.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[104], 1012.0f);
 }
 
 // ---------------------------------------------------------------------------

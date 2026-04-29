@@ -4,13 +4,13 @@
 
 Ported the AAA-Gaussians MCMC densification path from the `densification` worktree into the training worktree without replacing the existing eval_3D parity files wholesale. The new path is selected by `VkTrainingConfig::cap_max > 0`; `cap_max <= 0` preserves the legacy clone/split/prune densification path. `vk_train_main` still disables densification by default for parity-safe CLI behavior.
 
-Added `mcmc_densification` and `relocation` modules plus CUDA-golden replay fixtures. Test coverage now includes relocation math, MCMC relocate/add/densify behavior, replay against CUDA-generated sample plans, VulkanTrainer MCMC integration, Adam moment preservation, opacity reset, and explicit rejection of `eval_3D + MCMC` until `filter_3D` propagation is implemented.
+Added `mcmc_densification` and `relocation` modules plus CUDA-golden replay fixtures. Test coverage now includes relocation math, MCMC relocate/add/densify behavior, replay against CUDA-generated sample plans, VulkanTrainer MCMC integration, Adam moment preservation, opacity reset, and `eval_3D + MCMC` filter propagation.
 
 Extended `VulkanAdam` with state-preserving group resize and selective moment zeroing. `VulkanTrainer` now reallocates Adam groups without resetting untouched MCMC slots, zeros modified source/replaced destination slots across all six parameter groups, and resets opacity to raw `logit(0.01)` on schedule while zeroing opacity Adam moments.
 
-Independent review found three substantive issues and they were fixed before final validation: `eval_3D + MCMC` would lose/misassign `filter_3D`, opacity reset initially left stale opacity moments, and the opacity reset gate was too broad. The current behavior rejects eval_3D MCMC explicitly, zeros group-3 moments on reset, and gates reset to the densification window.
+Independent review found substantive issues and they were fixed before final validation: `eval_3D + MCMC` would lose/misassign `filter_3D`, opacity reset initially left stale opacity moments, the opacity reset gate was too broad, and legacy split children initially failed to inherit `filter_3D`. Current behavior propagates filter values through MCMC relocate/add and legacy clone/split paths, zeros group-3 moments on reset, and gates reset to the densification window.
 
-Validation: build passed; targeted MCMC/Adam/densification/training/config/relocation tests passed **40/40**; parity-sensitive regression passed **42/42** with expected skips; full CTest passed **310/310** in 39.94s. A second independent subagent review of current uncommitted changes found no blockers. The project test inventory is updated to 66 `.cpp` test files.
+Validation: build passed; targeted MCMC/Adam/densification/training/config/filter tests passed **54/54**; parity-sensitive regression passed **42/42** with expected skips; full CTest passed **313/313** in 40.04s. Independent subagent review of current uncommitted changes found no blockers after the filter propagation pass. The project test inventory remains 66 `.cpp` test files.
 
 ## Session 13 — 2026-04-28 — scan1 n_contrib replay-boundary fix
 

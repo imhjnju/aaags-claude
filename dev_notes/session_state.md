@@ -1,14 +1,14 @@
 # Session State
 
 ## Current Phase (S14 — 2026-04-29)
-Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densification path ported from the `densification` worktree. `VkTrainingConfig::cap_max > 0` selects MCMC relocate/add densification; `cap_max <= 0` preserves the existing legacy clone/split/prune path. Vulkan Adam now supports state-preserving group extend/shrink and selective moment zeroing, so untouched Gaussian slots retain moments while MCMC-modified source/destination slots are reset. Opacity reset scheduling is implemented with raw opacity `logit(0.01)` and group-3 Adam moment zeroing. `eval_3D + MCMC` is explicitly rejected until `filter_3D` propagation through MCMC relocate/add is implemented.
+Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densification path ported from the `densification` worktree. `VkTrainingConfig::cap_max > 0` selects MCMC relocate/add densification; `cap_max <= 0` preserves the existing legacy clone/split/prune path. Vulkan Adam now supports state-preserving group extend/shrink and selective moment zeroing, so untouched Gaussian slots retain moments while MCMC-modified source/destination slots are reset. Opacity reset scheduling is implemented with raw opacity `logit(0.01)` and group-3 Adam moment zeroing. `filter_3D` now propagates through `OwnedRawParams`, legacy clone/split, DensityController clone/split, MCMC relocate/add, and the VulkanTrainer eval_3D+MCMC path.
 
 ## Test Counts (2026-04-29 current)
-- Build: `cmake -B harmonyos_3dgs/build -S harmonyos_3dgs -DBUILD_TESTS=ON && cmake --build harmonyos_3dgs/build` OK after the MCMC densification, VulkanAdam resize, opacity reset, and eval_3D+MCMC guard changes.
-- Targeted MCMC/Adam/densification/training/config/relocation tests: **40/40 passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "Mcmc|mcmc|Densification|VulkanAdam|TrainingStepVk|TrainTypes|Relocation"`, 2.81s).
-- Parity-sensitive regression: **42/42 passed** with expected skips (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "VkVsPyReference|VkVsCuda|Basketball|Eval3D|TileBinner"`, 15.77s).
-- Full CTest baseline after MCMC densification port: **310/310 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, 39.94s; expected inventory is now 66 .cpp files).
-- Added MCMC regression coverage: CPU relocation, MCMC relocate/add/densify behavior, CUDA-golden MCMC replay fixtures, VulkanTrainer MCMC integration, Adam-state preservation/zeroing, opacity reset raw value + moment reset, and eval_3D+MCMC rejection.
+- Build: `cmake --build harmonyos_3dgs/build` OK after `filter_3D` propagation on top of MCMC densification, VulkanAdam resize, opacity reset, and eval_3D parity-mode training changes.
+- Targeted MCMC/Adam/densification/training/config/relocation/filter tests: **54/54 passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "Mcmc|Densification|VulkanAdam|DensityController|TrainTypes|OwnedRawParams"`, 2.90s).
+- Parity-sensitive regression: **42/42 passed** with expected skips (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "VkVsPyReference|VkVsCuda|Basketball|Eval3D|TileBinner"`, 15.79s).
+- Full CTest baseline after MCMC densification + `filter_3D` propagation: **313/313 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, 40.04s; expected inventory is now 66 .cpp files).
+- Added MCMC/filter regression coverage: CPU relocation, MCMC relocate/add/densify behavior, CUDA-golden MCMC replay fixtures, VulkanTrainer MCMC integration, Adam-state preservation/zeroing, opacity reset raw value + moment reset, eval_3D+MCMC filter propagation, and legacy split child `filter_3D` inheritance.
 - Previous S13 parity status remains valid: scan1 2D replay-boundary fix improved VK↔CUDA PSNR to **107.136986 dB** at 10 steps, **49.822707 dB** at 200 steps, and **27.773822 dB** at 1000 steps; eval_3D parity-mode training remains enabled only for `parity_mode=true`.
 - Hook/gate health: `.claude/gates/test-audit.md` and `.claude/gates/research.md` were not present in this worktree; review was still performed via independent subagent diff review plus local build/targeted/parity/full CTest.
 
@@ -65,8 +65,8 @@ Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densi
 - Ported AAA-Gaussians MCMC densification from the `densification` worktree: relocation/add/growth to `min(cap_max, int(1.05*N))`, CUDA-golden replay fixtures, and deterministic test sample plans.
 - Extended Vulkan training config with `cap_max` and `opacity_reset_interval`. `cap_max > 0` enables MCMC; `cap_max <= 0` keeps the legacy clone/split/prune path. `vk_train_main` keeps densification disabled by default for parity-safe CLI behavior.
 - Extended `VulkanAdam` with state-preserving `extend_group`, `shrink_group`, `zero_moment_floats`, and `download_group_moments`; `VulkanTrainer` now preserves untouched MCMC Adam slots and zeros modified/replaced slots across all six parameter groups.
-- Added opacity reset scheduling to Vulkan training using raw `logit(0.01)` and zeroing opacity Adam moments. Added a guard rejecting `eval_3D + MCMC` until `filter_3D` propagation through MCMC relocation/add is implemented.
-- Verification: build OK; targeted MCMC/Adam/densification/training/config/relocation tests **40/40 PASS**; parity-sensitive regression **42/42 PASS** with expected skips; full CTest **310/310 PASS**. Independent subagent diff review found no blockers.
+- Added opacity reset scheduling to Vulkan training using raw `logit(0.01)` and zeroing opacity Adam moments. Implemented `filter_3D` propagation through `OwnedRawParams`, legacy clone/split, DensityController clone/split, MCMC relocation/add, and VulkanTrainer eval_3D+MCMC.
+- Verification: build OK; targeted MCMC/Adam/densification/training/config/filter tests **54/54 PASS**; parity-sensitive regression **42/42 PASS** with expected skips; full CTest **313/313 PASS**. Independent subagent diff review found no blockers after the filter propagation pass.
 
 ### S13 — 2026-04-28 — scan1 n_contrib replay-boundary fix + eval_3D backward smoke
 - Targeted scan1 camera 0 at 1600×1200 with 28,747 Gaussians and measured VK↔CUDA independent-training drift at 10/200/1000 steps.

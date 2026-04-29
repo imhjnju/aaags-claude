@@ -70,6 +70,7 @@ public:
         float opacity_thresh,
         int cap_max,
         const mcmc::DensifySamplePlan& plan);
+    const std::vector<float>& filter_3D_for_test() const { return act_filter_3D_; }
 #endif
 
     void download_adam_moments(int group_idx,

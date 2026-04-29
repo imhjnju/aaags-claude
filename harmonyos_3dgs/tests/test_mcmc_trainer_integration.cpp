@@ -387,7 +387,7 @@ TEST(McmcDensify, OpacityResetIntervalResetsRawOpacity) {
     }
 }
 
-TEST(McmcDensify, VulkanTrainerRejectsEval3DMcmcUntilFilterPropagation) {
+TEST(McmcDensify, VulkanTrainerSupportsEval3DMcmcWithFilterPropagation) {
     VulkanContext ctx;
     if (!ctx.init()) {
         GTEST_SKIP() << "No Vulkan compute device — skipping.";
@@ -419,7 +419,8 @@ TEST(McmcDensify, VulkanTrainerRejectsEval3DMcmcUntilFilterPropagation) {
     cfg.eval_3D_parity_mode = true;
     std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
 
-    EXPECT_THROW(trainer.step(scene.cam, cfg, target.data(), scene.W, scene.H), std::runtime_error);
+    EXPECT_NO_THROW(trainer.step(scene.cam, cfg, target.data(), scene.W, scene.H));
+    ASSERT_EQ(static_cast<int>(trainer.filter_3D_for_test().size()), trainer.raw_params().count);
 }
 
 TEST(McmcDensify, VulkanTrainerReplayMatchesCudaGolden) {
@@ -450,8 +451,10 @@ TEST(McmcDensify, VulkanTrainerReplayMatchesCudaGolden) {
 
     std::vector<float> act_scales(raw_scales.size());
     std::vector<float> act_opacities(raw_opacities.size());
+    std::vector<float> filter_3d(static_cast<size_t>(N));
     for (size_t i = 0; i < raw_scales.size(); ++i) act_scales[i] = std::exp(raw_scales[i]);
     for (size_t i = 0; i < raw_opacities.size(); ++i) act_opacities[i] = sigmoid_mcmc_int(raw_opacities[i]);
+    for (int i = 0; i < N; ++i) filter_3d[static_cast<size_t>(i)] = 500.0f + static_cast<float>(i);
 
     GaussianData g{};
     g.count = N;
@@ -462,7 +465,7 @@ TEST(McmcDensify, VulkanTrainerReplayMatchesCudaGolden) {
     g.rotations = raw_rotations.data();
     g.opacities = act_opacities.data();
     g.sh_coeffs = raw_sh.data();
-    g.filter_3D = nullptr;
+    g.filter_3D = filter_3d.data();
 
     RawGaussianParams raw{};
     raw.count = N;
@@ -485,6 +488,23 @@ TEST(McmcDensify, VulkanTrainerReplayMatchesCudaGolden) {
     plan.add_sources = add_sources;
     mcmc::DensifyResult result = trainer.apply_mcmc_densification_for_test(0.005f, 80, plan);
 
+    std::vector<float> expected_filter = filter_3d;
+    std::vector<int> dead_indices;
+    for (int i = 0; i < N; ++i) {
+        if (sigmoid_mcmc_int(raw_opacities[static_cast<size_t>(i)]) <= 0.005f) {
+            dead_indices.push_back(i);
+        }
+    }
+    ASSERT_EQ(dead_indices.size(), relocate_sources.size());
+    for (size_t k = 0; k < dead_indices.size(); ++k) {
+        expected_filter[static_cast<size_t>(dead_indices[k])] = filter_3d[static_cast<size_t>(relocate_sources[k])];
+    }
+    std::vector<float> filter_after_reloc = expected_filter;
+    expected_filter.resize(expected_opacities.size());
+    for (size_t k = 0; k < add_sources.size(); ++k) {
+        expected_filter[static_cast<size_t>(N) + k] = filter_after_reloc[static_cast<size_t>(add_sources[k])];
+    }
+
     EXPECT_EQ(result.final_count, static_cast<int>(expected_opacities.size()));
     EXPECT_EQ(result.modified_source_indices, expected_modified);
     EXPECT_EQ(result.replaced_destination_indices, expected_dsts);
@@ -501,4 +521,5 @@ TEST(McmcDensify, VulkanTrainerReplayMatchesCudaGolden) {
     expect_f32_close_mcmc(got_sh, expected_sh, 1e-6f, 1e-6f, "sh");
     expect_f32_close_mcmc(got_opacities, expected_opacities, 2e-5f, 2e-5f, "opacities");
     expect_f32_close_mcmc(got_scales, expected_scales, 2e-5f, 2e-5f, "scales");
+    EXPECT_EQ(trainer.filter_3D_for_test(), expected_filter);
 }

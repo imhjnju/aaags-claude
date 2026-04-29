@@ -55,6 +55,7 @@ int densify_and_prune(
     output.rotations.reserve(static_cast<size_t>(N) * 4 * 3);
     output.sh_coeffs.reserve(static_cast<size_t>(N) * mc3 * 3);
     output.opacities.reserve(static_cast<size_t>(N) * 3);
+    if (!params_owned.filter_3D.empty()) output.filter_3D.reserve(static_cast<size_t>(N) * 3);
 
     const float grad_thresh     = cfg.densify_grad_thresh;
     const float opacity_thresh  = cfg.opacity_thresh;
@@ -70,6 +71,7 @@ int densify_and_prune(
         const float* rot = params_owned.rotations.data() + static_cast<size_t>(i) * 4;
         const float* sh  = params_owned.sh_coeffs.data() + static_cast<size_t>(i) * mc3;
         const float  op  = params_owned.opacities[i];
+        const float* filter_3D = params_owned.filter_3D.empty() ? nullptr : &params_owned.filter_3D[static_cast<size_t>(i)];
 
         // Compute exp(raw_scales) and find max.
         const float s0 = std::exp(sc[0]);
@@ -86,12 +88,12 @@ int densify_and_prune(
 
         // --- Keep original (if not pruned) ---
         if (!pruned) {
-            output.append(pos, sc, rot, sh, op);
+            output.append(pos, sc, rot, sh, op, filter_3D);
         }
 
         // --- Clone: small Gaussians with high gradient ---
         if (should_densify && is_small && !pruned) {
-            output.append(pos, sc, rot, sh, op);
+            output.append(pos, sc, rot, sh, op, filter_3D);
         }
 
         // --- Split: large Gaussians with high gradient (bypasses opacity prune) ---
@@ -107,8 +109,8 @@ int densify_and_prune(
             pos_child1[max_axis] += half_offset;
             pos_child2[max_axis] -= half_offset;
 
-            output.append(pos_child1, new_sc, rot, sh, op);
-            output.append(pos_child2, new_sc, rot, sh, op);
+            output.append(pos_child1, new_sc, rot, sh, op, filter_3D);
+            output.append(pos_child2, new_sc, rot, sh, op, filter_3D);
         }
     }
 

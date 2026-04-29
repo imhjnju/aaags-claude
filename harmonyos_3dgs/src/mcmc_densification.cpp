@@ -188,6 +188,9 @@ static RelocateResult relocate_gs_ex(OwnedRawParams& params,
         std::memcpy(&params.sh_coeffs[static_cast<size_t>(dst) * mc3],
                     &params.sh_coeffs[static_cast<size_t>(src) * mc3],
                     static_cast<size_t>(mc3) * sizeof(float));
+        if (!params.filter_3D.empty()) {
+            params.filter_3D[static_cast<size_t>(dst)] = params.filter_3D[static_cast<size_t>(src)];
+        }
     }
 
     for (int k = 0; k < num_dead; ++k) {
@@ -276,6 +279,8 @@ static AddResult add_new_gs_ex(OwnedRawParams& params,
     std::vector<float> src_pos(static_cast<size_t>(num_add) * 3);
     std::vector<float> src_rot(static_cast<size_t>(num_add) * 4);
     std::vector<float> src_sh (static_cast<size_t>(num_add) * mc3);
+    std::vector<float> src_filter;
+    if (!params.filter_3D.empty()) src_filter.resize(static_cast<size_t>(num_add));
     for (int k = 0; k < num_add; ++k) {
         const int src = add_idx[k];
         std::memcpy(&src_pos[static_cast<size_t>(k) * 3],
@@ -287,6 +292,9 @@ static AddResult add_new_gs_ex(OwnedRawParams& params,
         std::memcpy(&src_sh [static_cast<size_t>(k) * mc3],
                     &params.sh_coeffs[static_cast<size_t>(src) * mc3],
                     static_cast<size_t>(mc3) * sizeof(float));
+        if (!params.filter_3D.empty()) {
+            src_filter[static_cast<size_t>(k)] = params.filter_3D[static_cast<size_t>(src)];
+        }
     }
 
     params.resize(new_total);
@@ -305,6 +313,9 @@ static AddResult add_new_gs_ex(OwnedRawParams& params,
                     &src_sh [static_cast<size_t>(k) * mc3],
                     static_cast<size_t>(mc3) * sizeof(float));
         params.opacities[dst] = u.raw_opacity;
+        if (!params.filter_3D.empty()) {
+            params.filter_3D[static_cast<size_t>(dst)] = src_filter[static_cast<size_t>(k)];
+        }
         for (int j = 0; j < 3; ++j)
             params.scales[static_cast<size_t>(dst) * 3 + j] = u.raw_scale[j];
     }

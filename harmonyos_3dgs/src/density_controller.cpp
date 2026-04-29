@@ -70,8 +70,11 @@ void DensityController::densify_and_clone(OwnedRawParams& params,
         std::vector<float> sh_copy(params.sh_coeffs.begin() + i * mc3,
                                    params.sh_coeffs.begin() + (i + 1) * mc3);
         float op_copy = params.opacities[i];
+        const float* filter_3D = params.filter_3D.empty() ? nullptr : &params.filter_3D[static_cast<size_t>(i)];
+        float filter_copy = filter_3D ? *filter_3D : 0.0f;
 
-        params.append(pos_copy, scale_copy, rot_copy, sh_copy.data(), op_copy);
+        params.append(pos_copy, scale_copy, rot_copy, sh_copy.data(), op_copy,
+                      filter_3D ? &filter_copy : nullptr);
     }
 }
 
@@ -127,6 +130,8 @@ void DensityController::densify_and_split(OwnedRawParams& params,
         std::vector<float> sh_copy(params.sh_coeffs.begin() + i * mc3,
                                    params.sh_coeffs.begin() + (i + 1) * mc3);
         float op_copy = params.opacities[i];
+        const float* filter_3D = params.filter_3D.empty() ? nullptr : &params.filter_3D[static_cast<size_t>(i)];
+        float filter_copy = filter_3D ? *filter_3D : 0.0f;
         float pos_src[3];
         for (int j = 0; j < 3; j++) pos_src[j] = params.positions[i * 3 + j];
 
@@ -142,7 +147,8 @@ void DensityController::densify_and_split(OwnedRawParams& params,
             for (int j = 0; j < 3; j++)
                 new_pos[j] = pos_src[j] + offset[j];
 
-            params.append(new_pos, new_scale_log, rot_copy, sh_copy.data(), op_copy);
+            params.append(new_pos, new_scale_log, rot_copy, sh_copy.data(), op_copy,
+                          filter_3D ? &filter_copy : nullptr);
         }
 
         to_remove[i] = true;

@@ -304,9 +304,11 @@ TEST(Densification, SplitLargeGaussians) {
     p.max_coeffs = 1;
     const int N = 10;
     p.resize(N);
+    p.filter_3D.resize(static_cast<size_t>(N));
 
     // Large scale: exp(2.0) ≈ 7.39 >> percent_dense * scene_extent = 0.01 * 1.0 = 0.01
     for (int i = 0; i < N; ++i) {
+        p.filter_3D[static_cast<size_t>(i)] = 20.0f + static_cast<float>(i);
         p.scales[i * 3 + 0] = 2.0f;
         p.scales[i * 3 + 1] = 2.0f;
         p.scales[i * 3 + 2] = 2.0f;
@@ -348,6 +350,11 @@ TEST(Densification, SplitLargeGaussians) {
         const int orig_idx  = 3 * i + 0;
         const int childA_idx = 3 * i + 1;
         const int childB_idx = 3 * i + 2;
+        const float expected_filter = 20.0f + static_cast<float>(i);
+
+        EXPECT_FLOAT_EQ(p.filter_3D[static_cast<size_t>(orig_idx)], expected_filter);
+        EXPECT_FLOAT_EQ(p.filter_3D[static_cast<size_t>(childA_idx)], expected_filter);
+        EXPECT_FLOAT_EQ(p.filter_3D[static_cast<size_t>(childB_idx)], expected_filter);
 
         // Original should be unchanged.
         for (int k = 0; k < 3; ++k) {
