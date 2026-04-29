@@ -405,6 +405,7 @@ struct TrainArgs {
     int save_every = 0;
     int log_every = 100;
     bool eval_3D = false;
+    bool proper_ewa = false;
     bool densify = false;
     int densify_from_step = 500;
     int densify_until_step = 15000;
@@ -490,6 +491,7 @@ static TrainArgs parseArgs(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--opacity_reset_interval") == 0) { if (!parse_int(i, "--opacity_reset_interval", args.opacity_reset_interval)) break; }
         else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
+        else if (strcmp(argv[i], "--proper_ewa") == 0) { if (!parse_bool(i, "--proper_ewa", args.proper_ewa)) break; }
         else args.parse_error = std::string("unknown option: ") + argv[i];
     }
     return args;
@@ -523,6 +525,7 @@ static void printUsage(const char* prog) {
     printf("  --densify_interval <N>    Densification interval (default: 100)\n");
     printf("  --opacity_reset_interval <N>  Reset opacity interval when densifying (default: 3000)\n");
     printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
+    printf("  --proper_ewa <0|1>    Use AAA proper EWA preprocessing during training (default: 0)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +663,7 @@ int main(int argc, char** argv) {
     tcfg.noise_lr = 0.0f;         // Disable position noise (CUDA has no such feature)
     tcfg.eval_3D = args.eval_3D;
     tcfg.parity_mode = args.eval_3D;
+    tcfg.proper_ewa = args.proper_ewa;
     // Build training views
     std::vector<TrainView> views;
 
@@ -780,6 +784,7 @@ int main(int argc, char** argv) {
     printf("  pos LR:      %.6f -> %.6f\n", tcfg.pos_lr_init, tcfg.pos_lr_final);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
     printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
+    printf("  proper_ewa:  %s\n", tcfg.proper_ewa ? "ON" : "OFF");
     printf("  densify:     %s", tcfg.densify_from_step > 0 ? "ON" : "OFF");
     if (tcfg.densify_from_step > 0)
         printf(" (from=%d until=%d interval=%d cap_max=%d opacity_reset=%d)",
@@ -796,9 +801,11 @@ int main(int argc, char** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
     float first_loss = 0, last_loss = 0;
     int nan_count = 0;
+    int last_view_idx = 0;
 
     for (int iter = 0; iter < args.iterations; iter++) {
         int view_idx = (views.size() > 1) ? view_dist(rng) : 0;
+        last_view_idx = view_idx;
         auto& tv = views[view_idx];
 
         if (iter == 0) {
@@ -822,8 +829,11 @@ int main(int argc, char** argv) {
         const RawGaussianParams& current_raw = trainer.raw_params();
         (void)current_raw;
 
+        const bool is_final_iter = (iter == args.iterations - 1);
+        // Match CUDA reference training: final forward/backward runs, final Adam update does not.
         float loss = trainer.step(tv.cam, cfg, tv.gt_image.data(),
-                                  tv.cam.width, tv.cam.height);
+                                  tv.cam.width, tv.cam.height,
+                                  !is_final_iter);
 
         if (std::isnan(loss) || std::isinf(loss)) {
             nan_count++;
@@ -889,7 +899,8 @@ int main(int argc, char** argv) {
     // Save final rendered image (convert CHW→HWC for writePPM)
     const float* rendered = trainer.rendered_image();
     if (rendered) {
-        int pw = views[0].cam.width, ph = views[0].cam.height;
+        const auto& final_view = views[last_view_idx];
+        int pw = final_view.cam.width, ph = final_view.cam.height;
         int npix = pw * ph;
         std::vector<float> hwc(npix * 3);
         for (int px = 0; px < npix; px++)

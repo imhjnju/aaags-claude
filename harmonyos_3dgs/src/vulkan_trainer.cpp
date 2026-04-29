@@ -559,7 +559,8 @@ float VulkanTrainer::step(const Camera& cam,
                           const RenderConfig& cfg,
                           const float* target,
                           int W,
-                          int H)
+                          int H,
+                          bool apply_update)
 {
     if (tcfg_.eval_3D && !tcfg_.parity_mode) {
         throw std::runtime_error(
@@ -713,6 +714,12 @@ float VulkanTrainer::step(const Camera& cam,
                                      tcfg_.sh_degree_max);
     else
         active_sh_degree_ = tcfg_.sh_degree_max;
+
+    if (!apply_update) {
+        captured_adam_m_.clear();
+        captured_adam_v_.clear();
+        return last_loss_;
+    }
 
     // GPU Adam — chain all 6 groups into one CB (6 submit+wait → 1).
     {

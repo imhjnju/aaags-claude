@@ -241,7 +241,7 @@ def vk_render_cam0(ply_path: str, outdir: str) -> np.ndarray:
     render_wd  = os.path.join(outdir, "vk_render_tmp")
     os.makedirs(render_wd, exist_ok=True)
 
-    cmd = [vk_render, ply_path, CAM_JSON, str(CAM0_IDX)]
+    cmd = [vk_render, ply_path, CAM_JSON, str(CAM0_IDX), "--eval_3d", "0", "--proper_ewa", "0"]
     print(f"  Running: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=False, text=True, cwd=render_wd)
     if proc.returncode != 0:

@@ -18,9 +18,9 @@
 #include <memory>
 
 // VulkanTrainer wires the full forward→backward→Adam pipeline for one
-// training step. The optimizer is VulkanAdam (GPU compute). All 6 parameter
-// groups are updated via GPU dispatch each step; raw params are then downloaded
-// back to CPU for the next forward pass activation.
+// training step. The optimizer is VulkanAdam (GPU compute). By default all 6
+// parameter groups are updated via GPU dispatch each step; raw params are then
+// downloaded back to CPU for the next forward pass activation.
 class VulkanTrainer {
 public:
     // init_g: initial Gaussian parameters (activated values)
@@ -33,12 +33,15 @@ public:
                   int cam_height,
                   const VkTrainingConfig& tcfg = VkTrainingConfig{});
 
-    // One training step. Returns L1 loss value.
+    // One training step. Returns L1 loss value. apply_update=false is for a
+    // terminal parity step: it runs forward/backward but skips Adam and all
+    // post-update maintenance.
     float step(const Camera& cam,
                const RenderConfig& cfg,
                const float* target_image,   // [3*H*W] CHW channel-first
                int target_W,
-               int target_H);
+               int target_H,
+               bool apply_update = true);
 
     // Run forward (preprocess + bin + sort + rasterize) and L1+DSSIM loss
     // computation only. No backward, no Adam, no densification, no

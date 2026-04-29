@@ -288,7 +288,7 @@ def run_vk_training(outdir: str, steps: int) -> np.ndarray:
         vk_render_bin = os.path.join(BUILD_DIR, "gs3d_vk_render")
         render_wd     = os.path.join(outdir, "vk_render_tmp")
         os.makedirs(render_wd, exist_ok=True)
-        cmd2 = [vk_render_bin, vk_ply, cam0_json_path, "0", "--eval_3d", "0"]
+        cmd2 = [vk_render_bin, vk_ply, cam0_json_path, "0", "--eval_3d", "0", "--proper_ewa", "0"]
         print(f"  Running: {' '.join(cmd2)}")
         ret2 = subprocess.run(cmd2, capture_output=False, text=True, cwd=render_wd)
         if ret2.returncode != 0:

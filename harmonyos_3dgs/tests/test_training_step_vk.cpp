@@ -1,12 +1,16 @@
 // test_training_step_vk.cpp — SP-4 Task 8 + SP-5 Task 3: VulkanTrainer integration tests.
 //
-// Eight tests:
+// Nine tests:
 //   T-step-count  : VulkanTrainer.StepCountIncreases
 //       Load tiny golden fixture. Run 3 steps, assert step_count() == 3.
 //
 //   T-step1       : VulkanTrainer.GradientsNonZeroAfterStep
 //       One step with all-zeros target. Assert that raw_scales, raw_opacities,
 //       and/or raw_rotations change from their initial values (gradients flow).
+//
+//   T-no-update   : VulkanTrainer.StepCanSkipAdamUpdate
+//       One step with all-zeros target and apply_update=false. Assert gradients
+//       are captured, step_count advances, and raw parameters do not change.
 //
 //   T-eval3d      : VulkanTrainer.Eval3DOneStepSmoke
 //       One eval_3D step with all-zeros target. Assert finite loss and at least
@@ -321,6 +325,72 @@ TEST(VulkanTrainer, GradientsNonZeroAfterStep) {
     EXPECT_FALSE(std::isnan(trainer.last_loss()));
     // The scene renders non-black Gaussians, so L1 loss against zero must be > 0.
     EXPECT_GT(trainer.last_loss(), 0.0f) << "Loss is zero — no visible Gaussians?";
+}
+
+// ---------------------------------------------------------------------------
+// T-no-update : final-step mode runs backward but skips Adam
+// ---------------------------------------------------------------------------
+
+TEST(VulkanTrainer, StepCanSkipAdamUpdate) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H);
+    trainer.enable_gradient_capture(true);
+
+    const RawGaussianParams& before = trainer.raw_params();
+    std::vector<float> init_raw_positions(before.raw_positions, before.raw_positions + scene.N * 3);
+    std::vector<float> init_raw_scales(before.raw_scales, before.raw_scales + scene.N * 3);
+    std::vector<float> init_raw_rotations(before.raw_rotations, before.raw_rotations + scene.N * 4);
+    std::vector<float> init_raw_sh(before.raw_sh_coeffs, before.raw_sh_coeffs + scene.N * scene.max_coeffs * 3);
+    std::vector<float> init_raw_opacities(before.raw_opacities, before.raw_opacities + scene.N);
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const float loss = trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+
+    EXPECT_TRUE(std::isfinite(loss));
+    EXPECT_GE(loss, 0.0f);
+    EXPECT_EQ(trainer.step_count(), 1);
+    ASSERT_NE(trainer.rendered_image(), nullptr);
+
+    auto max_abs = [](const std::vector<float>& v) {
+        float m = 0.0f;
+        for (float x : v) m = std::max(m, std::fabs(x));
+        return m;
+    };
+    ASSERT_EQ(trainer.captured_grad_positions().size(), static_cast<size_t>(scene.N) * 3);
+    ASSERT_EQ(trainer.captured_grad_scales().size(), static_cast<size_t>(scene.N) * 3);
+    ASSERT_EQ(trainer.captured_grad_rotations().size(), static_cast<size_t>(scene.N) * 4);
+    ASSERT_EQ(trainer.captured_grad_sh().size(), static_cast<size_t>(scene.N) * scene.max_coeffs * 3);
+    ASSERT_EQ(trainer.captured_grad_opacities().size(), static_cast<size_t>(scene.N));
+    const float max_grad = std::max({
+        max_abs(trainer.captured_grad_positions()),
+        max_abs(trainer.captured_grad_scales()),
+        max_abs(trainer.captured_grad_rotations()),
+        max_abs(trainer.captured_grad_sh()),
+        max_abs(trainer.captured_grad_opacities())});
+    EXPECT_GT(max_grad, 0.0f);
+
+    const RawGaussianParams& after = trainer.raw_params();
+    for (int i = 0; i < scene.N * 3; ++i) {
+        EXPECT_FLOAT_EQ(after.raw_positions[i], init_raw_positions[i]);
+        EXPECT_FLOAT_EQ(after.raw_scales[i], init_raw_scales[i]);
+    }
+    for (int i = 0; i < scene.N * 4; ++i) {
+        EXPECT_FLOAT_EQ(after.raw_rotations[i], init_raw_rotations[i]);
+    }
+    for (int i = 0; i < scene.N * scene.max_coeffs * 3; ++i) {
+        EXPECT_FLOAT_EQ(after.raw_sh_coeffs[i], init_raw_sh[i]);
+    }
+    for (int i = 0; i < scene.N; ++i) {
+        EXPECT_FLOAT_EQ(after.raw_opacities[i], init_raw_opacities[i]);
+    }
 }
 
 // ---------------------------------------------------------------------------

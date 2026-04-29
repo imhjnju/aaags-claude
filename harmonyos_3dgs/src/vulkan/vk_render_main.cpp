@@ -1,7 +1,7 @@
 // harmonyos_3dgs/src/vulkan/vk_render_main.cpp
 //
 // gs3d_vk_render — Vulkan forward render CLI for calibration.
-// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1]
+// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1]
 
 #include "camera_utils.h"
 #include "image_io.h"
@@ -23,7 +23,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "Usage: %s <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1]\n",
+                     "Usage: %s <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1]\n",
                      argv[0]);
         return 1;
     }
@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     int cam_id = 0;
     bool eval_3D = true;
     bool parity_mode = false;
+    bool proper_ewa = true;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--eval_3d") == 0 && i + 1 < argc) {
             const char* value = argv[++i];
@@ -59,6 +60,19 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--parity_mode") == 0) {
             std::fprintf(stderr, "Error: --parity_mode requires 0 or 1\n");
+            return 1;
+        } else if (std::strcmp(argv[i], "--proper_ewa") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "0") == 0) {
+                proper_ewa = false;
+            } else if (std::strcmp(value, "1") == 0) {
+                proper_ewa = true;
+            } else {
+                std::fprintf(stderr, "Error: --proper_ewa requires 0 or 1\n");
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--proper_ewa") == 0) {
+            std::fprintf(stderr, "Error: --proper_ewa requires 0 or 1\n");
             return 1;
         } else {
             cam_id = std::atoi(argv[i]);
@@ -95,11 +109,12 @@ int main(int argc, char** argv) {
     // PreprocessorVulkan hardcodes spec_training=1 (no upper SH clamp).
     // Match on the CPU side so Renderer::render sees consistent config.
     config.training = true;
-    std::printf("Config: eval_3D=%s, parity_mode=%s, training=%s, bg=%.0f, sh_degree=%d\n",
+    std::printf("Config: eval_3D=%s, parity_mode=%s, training=%s, bg=%.0f, sh_degree=%d, proper_ewa=%s\n",
                 config.eval_3D ? "ON" : "OFF",
                 config.eval_3D_parity_mode ? "ON" : "OFF",
                 config.training ? "ON" : "OFF",
-                bg_val, config.sh_degree);
+                bg_val, config.sh_degree,
+                proper_ewa ? "ON" : "OFF");
 
     // 5. Create Vulkan renderer
     size_t alloc_size = 512ULL * 1024 * 1024;
@@ -107,7 +122,7 @@ int main(int argc, char** argv) {
         alloc_size = 4ULL * 1024 * 1024 * 1024;
 
     auto renderer = std::make_unique<Renderer>(
-        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D),
+        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D, proper_ewa),
         std::make_unique<TileBinnerVulkan>(ctx),
         std::make_unique<SorterVulkan>(ctx),
         std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/config.eval_3D,
