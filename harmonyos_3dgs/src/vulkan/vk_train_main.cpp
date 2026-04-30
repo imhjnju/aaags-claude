@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <algorithm>
+#include <stdexcept>
 
 // ---------------------------------------------------------------------------
 // PLY-based initialization: convert activated GaussianData -> RawGaussianParams
@@ -264,6 +265,20 @@ struct CameraWithImage {
     std::string img_name;
 };
 
+static std::vector<int> loadViewSchedule(const char* path) {
+    std::ifstream sf(path);
+    if (!sf.is_open())
+        throw std::runtime_error(std::string("Cannot open view schedule ") + path);
+
+    std::vector<int> schedule;
+    int idx = 0;
+    while (sf >> idx)
+        schedule.push_back(idx);
+    if (!sf.eof())
+        throw std::runtime_error(std::string("Invalid integer in view schedule ") + path);
+    return schedule;
+}
+
 static std::vector<CameraWithImage> loadCamerasJson(const char* json_path) {
     std::ifstream jf(json_path);
     if (!jf.is_open())
@@ -394,6 +409,7 @@ struct TrainArgs {
     const char* gt_path = nullptr;
     const char* cameras_json = nullptr;
     const char* gt_dir = nullptr;
+    const char* view_schedule_path = nullptr;
     const char* output_path = "trained.ply";
     int iterations = 30000;
     int width = 512;
@@ -406,6 +422,7 @@ struct TrainArgs {
     int log_every = 100;
     bool eval_3D = false;
     bool proper_ewa = false;
+    bool require_all_gt = false;
     bool densify = false;
     int densify_from_step = 500;
     int densify_until_step = 15000;
@@ -467,6 +484,7 @@ static TrainArgs parseArgs(int argc, char** argv) {
         else if (strcmp(argv[i], "--gt") == 0)        args.gt_path = require_value(i, "--gt");
         else if (strcmp(argv[i], "--cameras") == 0)   args.cameras_json = require_value(i, "--cameras");
         else if (strcmp(argv[i], "--gt_dir") == 0)    args.gt_dir = require_value(i, "--gt_dir");
+        else if (strcmp(argv[i], "--view_schedule") == 0) args.view_schedule_path = require_value(i, "--view_schedule");
         else if (strcmp(argv[i], "--output") == 0)    args.output_path = require_value(i, "--output");
         else if (strcmp(argv[i], "--iterations") == 0) { if (!parse_int(i, "--iterations", args.iterations)) break; }
         else if (strcmp(argv[i], "--width") == 0) { if (!parse_int(i, "--width", args.width)) break; }
@@ -492,6 +510,7 @@ static TrainArgs parseArgs(int argc, char** argv) {
         else if (strcmp(argv[i], "--opacity_reset_interval") == 0) { if (!parse_int(i, "--opacity_reset_interval", args.opacity_reset_interval)) break; }
         else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
         else if (strcmp(argv[i], "--proper_ewa") == 0) { if (!parse_bool(i, "--proper_ewa", args.proper_ewa)) break; }
+        else if (strcmp(argv[i], "--require_all_gt") == 0) { if (!parse_bool(i, "--require_all_gt", args.require_all_gt)) break; }
         else args.parse_error = std::string("unknown option: ") + argv[i];
     }
     return args;
@@ -508,6 +527,8 @@ static void printUsage(const char* prog) {
     printf("  --gt <path>           Ground truth image (PPM, single-camera mode)\n");
     printf("  --cameras <path>      Cameras JSON file (multi-view mode)\n");
     printf("  --gt_dir <path>       Directory of GT images for multi-view\n");
+    printf("  --view_schedule <path>  Whitespace-separated 0-based view index per iteration\n");
+    printf("  --require_all_gt <0|1>  Fail if any camera has no GT image (default: 0)\n");
     printf("  --output <path>       Output PLY file (default: trained.ply)\n");
     printf("  --iterations <N>      Training iterations (default: 30000)\n");
     printf("  --width <W>           Image width (default: 512)\n");
@@ -676,9 +697,9 @@ int main(int argc, char** argv) {
             TrainView tv;
             tv.cam = entry.cam;
 
+            bool loaded = false;
             if (args.gt_dir && !entry.img_name.empty()) {
                 const char* exts[] = {".ppm", ".PPM", ""};
-                bool loaded = false;
                 for (auto ext : exts) {
                     std::string img_path = std::string(args.gt_dir) + "/" + entry.img_name + ext;
                     int iw, ih;
@@ -711,8 +732,15 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                if (!loaded)
-                    printf("  Warning: no GT image found for '%s'\n", entry.img_name.c_str());
+            }
+            if (!loaded) {
+                printf("  Warning: no GT image found for '%s'\n", entry.img_name.c_str());
+                if (args.require_all_gt) {
+                    printf("Error: --require_all_gt is set and a camera is missing GT\n");
+                    freeRawParams(raw);
+                    model.free();
+                    return 1;
+                }
             }
 
             if (!tv.gt_image.empty())
@@ -763,6 +791,46 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    for (size_t i = 1; i < views.size(); ++i) {
+        if (views[i].cam.width != views[0].cam.width || views[i].cam.height != views[0].cam.height) {
+            printf("Error: mixed-resolution multi-view training is not supported yet (%dx%d vs %dx%d at view %zu)\n",
+                   views[0].cam.width, views[0].cam.height,
+                   views[i].cam.width, views[i].cam.height, i);
+            freeRawParams(raw);
+            model.free();
+            return 1;
+        }
+    }
+
+    std::vector<int> view_schedule;
+    if (args.view_schedule_path) {
+        try {
+            view_schedule = loadViewSchedule(args.view_schedule_path);
+        } catch (const std::exception& e) {
+            printf("Error: %s\n", e.what());
+            freeRawParams(raw);
+            model.free();
+            return 1;
+        }
+        if (static_cast<int>(view_schedule.size()) < args.iterations) {
+            printf("Error: view schedule has %zu entries but --iterations is %d\n",
+                   view_schedule.size(), args.iterations);
+            freeRawParams(raw);
+            model.free();
+            return 1;
+        }
+        for (int iter = 0; iter < args.iterations; ++iter) {
+            const int idx = view_schedule[static_cast<size_t>(iter)];
+            if (idx < 0 || idx >= static_cast<int>(views.size())) {
+                printf("Error: view schedule entry %d is out of range [0, %zu): %d\n",
+                       iter, views.size(), idx);
+                freeRawParams(raw);
+                model.free();
+                return 1;
+            }
+        }
+    }
+
     // Create VulkanTrainer
     VulkanTrainer trainer(ctx, model.data, raw, cfg.sh_degree,
                           views[0].cam.width, views[0].cam.height, tcfg);
@@ -781,6 +849,7 @@ int main(int argc, char** argv) {
     printf("  Iterations:  %d\n", args.iterations);
     printf("  Views:       %zu\n", views.size());
     printf("  Resolution:  %dx%d\n", views[0].cam.width, views[0].cam.height);
+    printf("  view schedule: %s\n", view_schedule.empty() ? "random seed 42" : args.view_schedule_path);
     printf("  pos LR:      %.6f -> %.6f\n", tcfg.pos_lr_init, tcfg.pos_lr_final);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
     printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
@@ -804,7 +873,9 @@ int main(int argc, char** argv) {
     int last_view_idx = 0;
 
     for (int iter = 0; iter < args.iterations; iter++) {
-        int view_idx = (views.size() > 1) ? view_dist(rng) : 0;
+        int view_idx = !view_schedule.empty()
+            ? view_schedule[static_cast<size_t>(iter)]
+            : ((views.size() > 1) ? view_dist(rng) : 0);
         last_view_idx = view_idx;
         auto& tv = views[view_idx];
 
