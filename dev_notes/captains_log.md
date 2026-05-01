@@ -1,5 +1,19 @@
 # Captain's Log
 
+## Session 15 — 2026-04-30 — Full-dataset feature matrix
+
+Exposed the next set of parity-controlled training features through `gs3d_vk_train`: DSSIM loss weight, position LR init/final, spatial LR scale, and SH warmup. Defaults preserve the prior strict baseline: L1-only, constant position LR, full SH from the first step, no regularization, no position noise.
+
+Extended `harmonyos_3dgs/tools/compare_basketball_eval3d_proper_mcmc_full.py` into a reusable feature-matrix harness. It now writes `config.json` and `metrics.csv`, passes the new feature knobs to both CUDA and Vulkan, reports timing and quality metrics in machine-readable form, and defaults to not writing per-view render `.npy` files. The generated image `.npy` files under `harmonyos_3dgs/build/compare_runs` were cleaned.
+
+Review found a real SH-warmup methodology issue: CUDA/training-final renders can use a lower active SH degree than a saved PLY's full degree. Added `--sh_degree` to `gs3d_vk_render`, propagated `--sh_degree` into `VkTrainingConfig::sh_degree_max`, and made the harness render saved PLYs with the final training-forward active degree. The rerun SH-warmup report records `render SH: 0`.
+
+Feature matrix, all 76 basketball views, eval_3D/proper_ewa/MCMC, 1000 steps, `cap_max=100000`, no opacity reset: baseline PASS (`VK saved vs CUDA 28.71 dB`, GT gap `-0.33 dB`), DSSIM 0.2 PASS (`29.30 dB`, gap `-0.05 dB`), LR decay PASS (`30.71 dB`, gap `-0.04 dB`), SH warmup 1000 PASS after render-SH fix (`30.91 dB`, gap `-0.18 dB`). All runs matched final counts **3513/3513**. The DSSIM run exposed a real performance bug: 1000 Vulkan steps took **2632.7s**, far slower than the L1 baseline.
+
+DSSIM bottleneck root cause was the C++ loss path, not Vulkan raster/Adam: `compute_combined_loss_gradient` recomputed direct 11x11 clamp-window SSIM statistics and analytical gradient accumulation on the CPU. Replaced it with separable Gaussian moment blurs plus transpose/adjoint blur accumulation, then parallelized the independent image/channel passes. The 50-step DSSIM training check dropped from **127.7s** after the separable-only rewrite to **7.2s** after parallelization; the full 1000-step DSSIM matrix rerun dropped to **167.6s** while still PASSing (`VK saved vs CUDA 28.25 dB`, counts **3513/3513**).
+
+Validation: `python3 -m py_compile` passed, 1-view/2-step smoke passed with no render `.npy`, targeted matrix runs passed, no render `.npy` files remained under compare outputs, `DSSIM` tests passed **4/4**, targeted DSSIM/training regression passed **66/66** with expected skips, and final full CTest passed **315/315** in 40.03s. Added `DSSIM.SlowReferenceSlidingWindowEquivalence` to compare optimized loss and selected gradients against a direct clamp-window reference. Independent subagent review was performed before/after the SH-warmup fix and after the DSSIM optimization; remaining DSSIM notes are non-blocking performance/refinement follow-ups.
+
 ## Session 14 — 2026-04-29 — Vulkan MCMC densification port
 
 Ported the AAA-Gaussians MCMC densification path from the `densification` worktree into the training worktree without replacing the existing eval_3D parity files wholesale. The new path is selected by `VkTrainingConfig::cap_max > 0`; `cap_max <= 0` preserves the legacy clone/split/prune densification path. `vk_train_main` still disables densification by default for parity-safe CLI behavior.

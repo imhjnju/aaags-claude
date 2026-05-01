@@ -1,7 +1,7 @@
 // harmonyos_3dgs/src/vulkan/vk_render_main.cpp
 //
 // gs3d_vk_render — Vulkan forward render CLI for calibration.
-// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1]
+// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1] [--sh_degree 0..3]
 
 #include "camera_utils.h"
 #include "image_io.h"
@@ -23,7 +23,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "Usage: %s <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1]\n",
+                     "Usage: %s <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1] [--sh_degree 0..3]\n",
                      argv[0]);
         return 1;
     }
@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     bool eval_3D = true;
     bool parity_mode = false;
     bool proper_ewa = true;
+    int sh_degree_override = -1;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--eval_3d") == 0 && i + 1 < argc) {
             const char* value = argv[++i];
@@ -74,6 +75,17 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--proper_ewa") == 0) {
             std::fprintf(stderr, "Error: --proper_ewa requires 0 or 1\n");
             return 1;
+        } else if (std::strcmp(argv[i], "--sh_degree") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || value < 0 || value > 3) {
+                std::fprintf(stderr, "Error: --sh_degree requires an integer in [0, 3]\n");
+                return 1;
+            }
+            sh_degree_override = static_cast<int>(value);
+        } else if (std::strcmp(argv[i], "--sh_degree") == 0) {
+            std::fprintf(stderr, "Error: --sh_degree requires an integer in [0, 3]\n");
+            return 1;
         } else {
             cam_id = std::atoi(argv[i]);
         }
@@ -93,6 +105,12 @@ int main(int argc, char** argv) {
     std::printf("  %d Gaussians, SH degree %d, filter_3D: %s\n",
                 model.data.count, model.data.sh_degree,
                 model.data.filter_3D ? "yes" : "no");
+    if (sh_degree_override > model.data.sh_degree) {
+        std::fprintf(stderr, "Error: --sh_degree %d exceeds model SH degree %d\n",
+                     sh_degree_override, model.data.sh_degree);
+        model.free();
+        return 1;
+    }
 
     // 3. Load camera
     Camera cam = loadCameraJson(cam_path, cam_id);
@@ -102,7 +120,7 @@ int main(int argc, char** argv) {
     const char* bg_env = std::getenv("BG_WHITE");
     float bg_val = (bg_env && bg_env[0] == '1') ? 1.0f : 0.0f;
     config.bg_color[0] = config.bg_color[1] = config.bg_color[2] = bg_val;
-    config.sh_degree = model.data.sh_degree;
+    config.sh_degree = (sh_degree_override >= 0) ? sh_degree_override : model.data.sh_degree;
     config.eval_3D = eval_3D;
     config.eval_3D_parity_mode = parity_mode;
     config.antialiasing = false;

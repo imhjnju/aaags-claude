@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import math
 import os
@@ -111,6 +112,17 @@ def build_schedule(steps, n_views, seed):
     return rng.integers(0, n_views, size=steps, endpoint=False, dtype=np.int32)
 
 
+def exp_lr(lr_init, lr_final, step, max_steps, spatial_lr_scale):
+    t = max(0.0, min(1.0, float(step) / float(max_steps)))
+    return spatial_lr_scale * math.exp(math.log(lr_init) * (1.0 - t) + math.log(lr_final) * t)
+
+
+def final_forward_sh_degree(steps, sh_degree_warmup):
+    if sh_degree_warmup <= 0:
+        return SH_DEGREE
+    return min((steps - 1) // sh_degree_warmup, SH_DEGREE)
+
+
 def make_cuda_camera(cam_info, gt_np, idx):
     import torch
     from scene.cameras import Camera
@@ -128,13 +140,19 @@ def make_cuda_camera(cam_info, gt_np, idx):
 
 
 def run_cuda(outdir, init_ply, dataset, schedule, steps, densify_from_iter, densify_until_iter,
-             densify_interval, cap_max, proper_ewa, seed):
+             densify_interval, cap_max, proper_ewa, seed, lambda_dssim,
+             pos_lr_init, pos_lr_final, spatial_lr_scale, sh_degree_warmup,
+             save_render_npy):
     sys.path.insert(0, str(AAA_ROOT))
     import torch
     from diff_gaussian_rasterization import ExtendedSettings
     from gaussian_renderer import render
     from scene import GaussianModel
     from utils.loss_utils import l1_loss
+    if lambda_dssim > 0.0:
+        from fused_ssim import fused_ssim
+    else:
+        fused_ssim = None
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -144,11 +162,13 @@ def run_cuda(outdir, init_ply, dataset, schedule, steps, densify_from_iter, dens
 
     gaussians = GaussianModel(sh_degree=SH_DEGREE)
     gaussians.load_ply(str(init_ply))
+    if sh_degree_warmup > 0:
+        gaussians.active_sh_degree = 0
     if gaussians.filter_3D is None:
         raise RuntimeError(f"{init_ply} does not contain filter_3D")
 
     params = [
-        {"params": [gaussians._xyz], "lr": LR_POS, "name": "xyz"},
+        {"params": [gaussians._xyz], "lr": pos_lr_init * spatial_lr_scale, "name": "xyz"},
         {"params": [gaussians._features_dc], "lr": LR_SH_DC, "name": "f_dc"},
         {"params": [gaussians._features_rest], "lr": LR_SH_REST, "name": "f_rest"},
         {"params": [gaussians._opacity], "lr": LR_OP, "name": "opacity"},
@@ -233,9 +253,18 @@ def run_cuda(outdir, init_ply, dataset, schedule, steps, densify_from_iter, dens
     print(f"\n=== CUDA basketball full-dataset eval_3D MCMC ({steps} steps, views={len(dataset)}, proper_ewa={proper_ewa}) ===")
     for step in range(1, steps + 1):
         view_idx = int(schedule[step - 1])
+        if sh_degree_warmup > 0:
+            gaussians.active_sh_degree = min((step - 1) // sh_degree_warmup, SH_DEGREE)
+        pos_lr = exp_lr(pos_lr_init, pos_lr_final, step, steps, spatial_lr_scale)
+        optimizer.param_groups[0]["lr"] = pos_lr
         cam, gt_tensor = cuda_views[view_idx]
         image = render(cam, gaussians, PipeCfg(), bg, splat_args=settings())["render"]
-        loss = l1_loss(image, gt_tensor)
+        l1 = l1_loss(image, gt_tensor)
+        if lambda_dssim > 0.0:
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_tensor.unsqueeze(0))
+            loss = (1.0 - lambda_dssim) * l1 + lambda_dssim * (1.0 - ssim_value)
+        else:
+            loss = l1
         optimizer.zero_grad()
         loss.backward()
         if step < densify_until_iter and step > densify_from_iter and step % densify_interval == 0:
@@ -265,7 +294,8 @@ def run_cuda(outdir, init_ply, dataset, schedule, steps, densify_from_iter, dens
         for idx, (cam, _) in enumerate(cuda_views):
             rendered = render(cam, gaussians, PipeCfg(), bg, splat_args=settings())["render"].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             renders.append(rendered)
-            np.save(outdir / f"cuda_render_view{idx:03d}.npy", rendered)
+            if save_render_npy:
+                np.save(outdir / f"cuda_render_view{idx:03d}.npy", rendered)
             if idx < 6:
                 save_png(rendered, outdir / f"cuda_render_view{idx:03d}.png")
     render_seconds = time.time() - render_t0
@@ -274,7 +304,9 @@ def run_cuda(outdir, init_ply, dataset, schedule, steps, densify_from_iter, dens
 
 
 def run_vk(outdir, init_ply, dataset, schedule, steps, vk_from_step, densify_until_iter,
-           densify_interval, cap_max, opacity_reset_interval, proper_ewa):
+           densify_interval, cap_max, opacity_reset_interval, proper_ewa, lambda_dssim,
+           pos_lr_init, pos_lr_final, spatial_lr_scale, sh_degree_warmup,
+           save_render_npy):
     cam_json = outdir / "cameras_selected.json"
     json.dump([cam for cam, _ in dataset], open(cam_json, "w"), indent=2)
 
@@ -317,6 +349,11 @@ def run_vk(outdir, init_ply, dataset, schedule, steps, vk_from_step, densify_unt
         "--densify_interval", str(densify_interval),
         "--cap_max", str(cap_max),
         "--opacity_reset_interval", str(opacity_reset_interval),
+        "--lambda_dssim", str(lambda_dssim),
+        "--pos_lr_init", str(pos_lr_init),
+        "--pos_lr_final", str(pos_lr_final),
+        "--spatial_lr_scale", str(spatial_lr_scale),
+        "--sh_degree_warmup", str(sh_degree_warmup),
     ]
     print(f"\n=== VK basketball full-dataset eval_3D MCMC ({steps} steps, views={len(dataset)}, proper_ewa={proper_ewa}) ===")
     print("  Running:", " ".join(cmd))
@@ -329,6 +366,7 @@ def run_vk(outdir, init_ply, dataset, schedule, steps, vk_from_step, densify_unt
 
     render_t0 = time.time()
     renders = []
+    render_sh_degree = final_forward_sh_degree(steps, sh_degree_warmup)
     for idx, (cam, _) in enumerate(dataset):
         render_wd = outdir / f"vk_render_view{idx:03d}"
         render_wd.mkdir(exist_ok=True)
@@ -340,13 +378,15 @@ def run_vk(outdir, init_ply, dataset, schedule, steps, vk_from_step, densify_unt
             "--eval_3d", "1",
             "--parity_mode", "1",
             "--proper_ewa", "1" if proper_ewa else "0",
+            "--sh_degree", str(render_sh_degree),
         ]
         subprocess.run(render_cmd, check=True, cwd=render_wd, stdout=subprocess.DEVNULL)
         h, w = cam["height"], cam["width"]
         raw = np.fromfile(render_wd / "vk_float.raw", dtype=np.float32)
         vk = raw.reshape(3, h, w).transpose(1, 2, 0).clip(0, 1)
         renders.append(vk)
-        np.save(outdir / f"vk_render_view{idx:03d}.npy", vk)
+        if save_render_npy:
+            np.save(outdir / f"vk_render_view{idx:03d}.npy", vk)
         if idx < 6:
             save_png(vk, outdir / f"vk_render_view{idx:03d}.png")
     render_seconds = time.time() - render_t0
@@ -370,12 +410,27 @@ def main():
     ap.add_argument("--cap_max", type=int, default=30000)
     ap.add_argument("--opacity_reset_interval", type=int, default=0)
     ap.add_argument("--proper_ewa", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--lambda_dssim", type=float, default=0.0)
+    ap.add_argument("--pos_lr_init", type=float, default=LR_POS)
+    ap.add_argument("--pos_lr_final", type=float, default=LR_POS)
+    ap.add_argument("--spatial_lr_scale", type=float, default=1.0)
+    ap.add_argument("--sh_degree_warmup", type=int, default=0)
+    ap.add_argument("--label", default="")
+    ap.add_argument("--save_render_npy", type=int, default=0, choices=[0, 1])
     ap.add_argument("--min_vk_cuda_psnr", type=float, default=20.0)
     ap.add_argument("--max_gt_psnr_gap", type=float, default=2.0)
     args = ap.parse_args()
 
     if not args.init_ply.exists():
         raise RuntimeError(f"missing filtered init PLY: {args.init_ply}")
+    if not 0.0 <= args.lambda_dssim <= 1.0:
+        raise RuntimeError("--lambda_dssim must be in [0, 1]")
+    if args.pos_lr_init <= 0.0 or args.pos_lr_final <= 0.0:
+        raise RuntimeError("--pos_lr_init and --pos_lr_final must be > 0")
+    if args.spatial_lr_scale <= 0.0:
+        raise RuntimeError("--spatial_lr_scale must be > 0")
+    if args.sh_degree_warmup < 0:
+        raise RuntimeError("--sh_degree_warmup must be >= 0")
     outdir = pathlib.Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     dataset = load_dataset(args.cameras, args.image_dir, args.max_views)
@@ -383,15 +438,46 @@ def main():
     np.save(outdir / "view_schedule.npy", schedule)
     proper_ewa = bool(args.proper_ewa)
     init_n = ply_count(args.init_ply)
+    render_sh_degree = final_forward_sh_degree(args.steps, args.sh_degree_warmup)
+    config = {
+        "label": args.label,
+        "init_ply": str(args.init_ply),
+        "cameras": str(args.cameras),
+        "image_dir": str(args.image_dir),
+        "views": len(dataset),
+        "initial_n": init_n,
+        "steps": args.steps,
+        "seed": args.seed,
+        "proper_ewa": int(proper_ewa),
+        "lambda_dssim": args.lambda_dssim,
+        "pos_lr_init": args.pos_lr_init,
+        "pos_lr_final": args.pos_lr_final,
+        "spatial_lr_scale": args.spatial_lr_scale,
+        "sh_degree_warmup": args.sh_degree_warmup,
+        "render_sh_degree": render_sh_degree,
+        "cuda_densify_from_iter": args.cuda_densify_from_iter,
+        "vk_densify_from_step": args.vk_densify_from_step,
+        "densify_until": args.densify_until,
+        "densify_interval": args.densify_interval,
+        "cap_max": args.cap_max,
+        "opacity_reset_interval": args.opacity_reset_interval,
+        "save_render_npy": args.save_render_npy,
+    }
+    (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
+    save_render_npy = bool(args.save_render_npy)
     cuda, gt_images, losses, cuda_n, events, cuda_timing = run_cuda(
         outdir, args.init_ply, dataset, schedule, args.steps,
         args.cuda_densify_from_iter, args.densify_until, args.densify_interval,
-        args.cap_max, proper_ewa, args.seed)
+        args.cap_max, proper_ewa, args.seed, args.lambda_dssim,
+        args.pos_lr_init, args.pos_lr_final, args.spatial_lr_scale,
+        args.sh_degree_warmup, save_render_npy)
     vk, vk_train_final, vk_n, vk_from_arg, vk_until_arg, vk_timing = run_vk(
         outdir, args.init_ply, dataset, schedule, args.steps,
         args.vk_densify_from_step, args.densify_until, args.densify_interval,
-        args.cap_max, args.opacity_reset_interval, proper_ewa)
+        args.cap_max, args.opacity_reset_interval, proper_ewa, args.lambda_dssim,
+        args.pos_lr_init, args.pos_lr_final, args.spatial_lr_scale,
+        args.sh_degree_warmup, save_render_npy)
 
     if dataset:
         panels = []
@@ -428,6 +514,10 @@ def main():
   Steps       : {args.steps}
   Seed        : {args.seed}
   proper_ewa  : {int(proper_ewa)}
+  lambda_dssim: {args.lambda_dssim:.3f}
+  pos LR      : {args.pos_lr_init:.8f} -> {args.pos_lr_final:.8f} (scale={args.spatial_lr_scale:.3f})
+  SH warmup   : {args.sh_degree_warmup}
+  render SH   : {render_sh_degree}
   CUDA gate   : iter > {args.cuda_densify_from_iter}, iter < {args.densify_until}, iter % {args.densify_interval} == 0
   VK gate     : step >= {vk_from_arg}, step <= {vk_until_arg}, step % {args.densify_interval} == 0
   VK opacity reset interval: {args.opacity_reset_interval}
@@ -450,6 +540,33 @@ def main():
   Gate status       : {'PASS' if not failed else 'FAIL — ' + '; '.join(failed)}
 ====================================================
 """
+    metrics_row = {
+        **config,
+        "cuda_final_n": cuda_n,
+        "vk_final_n": vk_n,
+        "cuda_final_loss": losses[-1],
+        "cuda_train_seconds": cuda_timing["train_seconds"],
+        "vk_train_seconds": vk_timing["train_seconds"],
+        "cuda_render_seconds": cuda_timing["render_seconds"],
+        "vk_render_seconds": vk_timing["render_seconds"],
+        "cuda_total_seconds": cuda_total_seconds,
+        "vk_total_seconds": vk_total_seconds,
+        "train_cuda_over_vk": train_speedup,
+        "render_cuda_over_vk": render_speedup,
+        "total_cuda_over_vk": total_speedup,
+        "cuda_gt_psnr": cuda_gt["psnr"],
+        "vk_gt_psnr": vk_gt["psnr"],
+        "vk_cuda_psnr": vk_cuda["psnr"],
+        "vk_saved_train_psnr": vk_saved_train["psnr"],
+        "gt_psnr_gap": cuda_gt["psnr"] - vk_gt["psnr"],
+        "final_view": final_view,
+        "gate_status": "PASS" if not failed else "FAIL",
+        "gate_failures": "; ".join(failed),
+    }
+    with open(outdir / "metrics.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(metrics_row.keys()))
+        writer.writeheader()
+        writer.writerow(metrics_row)
     print(report)
     (outdir / "report.txt").write_text(report)
     if failed:

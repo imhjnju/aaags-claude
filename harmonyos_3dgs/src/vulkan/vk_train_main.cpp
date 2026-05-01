@@ -423,6 +423,11 @@ struct TrainArgs {
     bool eval_3D = false;
     bool proper_ewa = false;
     bool require_all_gt = false;
+    float lambda_dssim = 0.0f;
+    float pos_lr_init = 1.6e-4f;
+    float pos_lr_final = 1.6e-4f;
+    float spatial_lr_scale = 1.0f;
+    int sh_degree_warmup = 0;
     bool densify = false;
     int densify_from_step = 500;
     int densify_until_step = 15000;
@@ -511,6 +516,11 @@ static TrainArgs parseArgs(int argc, char** argv) {
         else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
         else if (strcmp(argv[i], "--proper_ewa") == 0) { if (!parse_bool(i, "--proper_ewa", args.proper_ewa)) break; }
         else if (strcmp(argv[i], "--require_all_gt") == 0) { if (!parse_bool(i, "--require_all_gt", args.require_all_gt)) break; }
+        else if (strcmp(argv[i], "--lambda_dssim") == 0) { if (!parse_float(i, "--lambda_dssim", args.lambda_dssim)) break; }
+        else if (strcmp(argv[i], "--pos_lr_init") == 0) { if (!parse_float(i, "--pos_lr_init", args.pos_lr_init)) break; }
+        else if (strcmp(argv[i], "--pos_lr_final") == 0) { if (!parse_float(i, "--pos_lr_final", args.pos_lr_final)) break; }
+        else if (strcmp(argv[i], "--spatial_lr_scale") == 0) { if (!parse_float(i, "--spatial_lr_scale", args.spatial_lr_scale)) break; }
+        else if (strcmp(argv[i], "--sh_degree_warmup") == 0) { if (!parse_int(i, "--sh_degree_warmup", args.sh_degree_warmup)) break; }
         else args.parse_error = std::string("unknown option: ") + argv[i];
     }
     return args;
@@ -547,6 +557,11 @@ static void printUsage(const char* prog) {
     printf("  --opacity_reset_interval <N>  Reset opacity interval when densifying (default: 3000)\n");
     printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
     printf("  --proper_ewa <0|1>    Use AAA proper EWA preprocessing during training (default: 0)\n");
+    printf("  --lambda_dssim <v>    DSSIM weight in combined loss, [0,1] (default: 0)\n");
+    printf("  --pos_lr_init <v>     Position LR init (default: 1.6e-4)\n");
+    printf("  --pos_lr_final <v>    Position LR final; same as init disables decay (default: 1.6e-4)\n");
+    printf("  --spatial_lr_scale <v>  Position LR spatial scale (default: 1)\n");
+    printf("  --sh_degree_warmup <N>  Steps between SH degree increments; 0 uses full degree from start\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +618,22 @@ int main(int argc, char** argv) {
     }
     if (args.sh_degree < -1 || args.sh_degree > 3) {
         printf("Error: --sh_degree must be -1, 0, 1, 2, or 3\n");
+        return 1;
+    }
+    if (args.lambda_dssim < 0.0f || args.lambda_dssim > 1.0f) {
+        printf("Error: --lambda_dssim must be in [0, 1]\n");
+        return 1;
+    }
+    if (args.pos_lr_init <= 0.0f || args.pos_lr_final <= 0.0f) {
+        printf("Error: --pos_lr_init and --pos_lr_final must be > 0\n");
+        return 1;
+    }
+    if (args.spatial_lr_scale <= 0.0f) {
+        printf("Error: --spatial_lr_scale must be > 0\n");
+        return 1;
+    }
+    if (args.sh_degree_warmup < 0) {
+        printf("Error: --sh_degree_warmup must be >= 0\n");
         return 1;
     }
 
@@ -676,12 +707,15 @@ int main(int argc, char** argv) {
     tcfg.densify_interval = args.densify_interval;
     tcfg.cap_max = args.densify ? args.cap_max : 0;
     tcfg.opacity_reset_interval = args.densify ? args.opacity_reset_interval : 0;
-    tcfg.lambda_dssim = 0.0f;     // L1-only (match CUDA reference for parity)
-    tcfg.opacity_reg = 0.0f;      // Disable regularization (CUDA has none)
-    tcfg.scale_reg = 0.0f;        // Disable regularization (CUDA has none)
-    tcfg.pos_lr_final = 1.6e-4f;  // Disable LR decay (CUDA uses constant LR)
-    tcfg.sh_degree_warmup = 0;    // Disable SH warmup (CUDA uses degree 3 from start)
-    tcfg.noise_lr = 0.0f;         // Disable position noise (CUDA has no such feature)
+    tcfg.lambda_dssim = args.lambda_dssim;
+    tcfg.opacity_reg = 0.0f;      // Disable regularization until CUDA harness exposes matching terms.
+    tcfg.scale_reg = 0.0f;        // Disable regularization until CUDA harness exposes matching terms.
+    tcfg.pos_lr_init = args.pos_lr_init;
+    tcfg.pos_lr_final = args.pos_lr_final;
+    tcfg.spatial_lr_scale = args.spatial_lr_scale;
+    tcfg.sh_degree_max = cfg.sh_degree;
+    tcfg.sh_degree_warmup = args.sh_degree_warmup;
+    tcfg.noise_lr = 0.0f;         // Disable position noise until statistical, non-exact comparison is added.
     tcfg.eval_3D = args.eval_3D;
     tcfg.parity_mode = args.eval_3D;
     tcfg.proper_ewa = args.proper_ewa;
@@ -850,7 +884,8 @@ int main(int argc, char** argv) {
     printf("  Views:       %zu\n", views.size());
     printf("  Resolution:  %dx%d\n", views[0].cam.width, views[0].cam.height);
     printf("  view schedule: %s\n", view_schedule.empty() ? "random seed 42" : args.view_schedule_path);
-    printf("  pos LR:      %.6f -> %.6f\n", tcfg.pos_lr_init, tcfg.pos_lr_final);
+    printf("  pos LR:      %.6f -> %.6f (scale=%.3f)\n", tcfg.pos_lr_init, tcfg.pos_lr_final, tcfg.spatial_lr_scale);
+    printf("  SH warmup:   %d\n", tcfg.sh_degree_warmup);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
     printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
     printf("  proper_ewa:  %s\n", tcfg.proper_ewa ? "ON" : "OFF");
