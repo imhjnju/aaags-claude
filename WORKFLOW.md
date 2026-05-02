@@ -75,6 +75,6 @@ Legitimate bypass: stale state from a parked prior session. NOT legitimate: "it'
 
 When Tier 0/1 memory files are updated, keep repo and auto-memory in sync:
 - **Auto-memory** (`~/.claude/projects/-home-robota-h00813233-Graph-aaags-claude/memory/`) is the source of truth
-- Sync edits to repo `memory/` for version control and other agents (reviewer, auditor)
+- Update auto-memory first, then sync edits to repo `memory/` for version control and other agents (reviewer, auditor)
 
 Repo copy is always available for other agents and version control.
