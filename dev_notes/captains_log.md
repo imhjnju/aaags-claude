@@ -1,5 +1,11 @@
 # Captain's Log
 
+## Session 16 — 2026-05-01 — CUDA intermediate Gate_P2 opened
+
+Opened `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` as the next first-loss intermediate gate after P1. The first attempt compared `conic_opacity.npy` as rows of `{a,b,c,opacity}` and correctly failed; investigation of `dump_cuda_training_step.py` and the CUDA extension showed the basketball golden was generated with `eval_3D=true`, where CUDA writes opacity through `((float*)conic_opacity)[gid]`. The `[P,4]` dump is therefore a raw memory view, and only `conic_opacity.reshape(-1)[gid]` is semantically valid for this fixture.
+
+The gate now compares CUDA flat opacity against VK `captured_conic_opacity()[gid*4+3]` for overlap-active Gaussians and asserts a non-vacuous overlap population before checking values. One remaining single-sided active Gaussian was isolated as an active-set/radii/AABB issue and left visible for Gate_P4 instead of weakening the opacity check. Validation passed: targeted P2 PASS, all `VkVsCudaFirstLoss` gates **12/12 PASS** with expected skips for P3-P7/L1, and full CTest **315/315 PASS** in 40.87s. +1 and +2 independent reviews both approved with no findings.
+
 ## Session 15 — 2026-04-30 — Full-dataset feature matrix
 
 Exposed the next set of parity-controlled training features through `gs3d_vk_train`: DSSIM loss weight, position LR init/final, spatial LR scale, and SH warmup. Defaults preserve the prior strict baseline: L1-only, constant position LR, full SH from the first step, no regularization, no position noise.

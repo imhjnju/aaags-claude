@@ -920,7 +920,175 @@ TEST(VkVsCudaFirstLoss, Gate_P1_Means2D) {
     model.free();
 }
 TEST(VkVsCudaFirstLoss, Gate_P2_ConicOpacity) {
-    GTEST_SKIP() << "Phase 2 gate (conic+opacity parity), not yet implemented";
+    const std::string ply = resolve_ply_path();
+    if (ply.empty()) GTEST_SKIP() << "basket-aaa.ply not found";
+    if (!std::filesystem::exists(kCamPath))
+        GTEST_SKIP() << "cameras.json not found: " << kCamPath;
+    if (!std::filesystem::exists(dump_dir()))
+        GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
+    if (!std::filesystem::exists(dump_dir() + "/conic_opacity.npy"))
+        GTEST_SKIP() << "conic_opacity.npy missing in CUDA dump";
+    if (!std::filesystem::exists(dump_dir() + "/radii.npy"))
+        GTEST_SKIP() << "radii.npy missing in CUDA dump";
+    if (!std::filesystem::exists(dump_dir() + "/gt_image.npy"))
+        GTEST_SKIP() << "gt_image.npy missing in CUDA dump";
+
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+
+    auto model = loadPly(ply.c_str());
+    Camera cam = loadCameraJson(kCamPath.c_str(), /*cam_id=*/0);
+    ASSERT_EQ(cam.width,  kW);
+    ASSERT_EQ(cam.height, kH);
+    ASSERT_EQ(model.data.max_coeffs, 16);
+
+    NpyArray gt = load_npy(dump_dir() + "/gt_image.npy");
+    assert_dtype(gt, NpyDtype::float32);
+    ASSERT_EQ(gt.shape, (std::vector<size_t>{3u, (size_t)kH, (size_t)kW}));
+
+    std::vector<float> vk_pos, vk_scl, vk_rot, vk_sh, vk_opa;
+    RawGaussianParams vk_raw = deriveRawFromPlyLoaded(
+        model.data, vk_pos, vk_scl, vk_rot, vk_sh, vk_opa);
+
+    VkTrainingConfig tcfg{};
+    tcfg.sh_degree_max     = 3;
+    tcfg.sh_degree_warmup  = 0;
+    tcfg.lambda_dssim      = 0.0f;
+    tcfg.eval_3D           = true;
+    tcfg.parity_mode       = true;
+    tcfg.densify_from_step = 0;
+    tcfg.opacity_reg       = 0.0f;
+    tcfg.scale_reg         = 0.0f;
+    tcfg.noise_lr          = 0.0f;
+
+    GaussianData init_g = model.data;
+    auto trainer = std::make_unique<VulkanTrainer>(
+        ctx, init_g, vk_raw, /*sh_degree=*/3, kW, kH, tcfg);
+    trainer->enable_intermediate_capture(true);
+
+    RenderConfig rcfg{};
+    rcfg.bg_color[0] = rcfg.bg_color[1] = rcfg.bg_color[2] = 0.0f;
+    rcfg.sh_degree      = 3;
+    rcfg.eval_3D        = true;
+    rcfg.antialiasing   = false;
+    rcfg.training       = true;
+    rcfg.scale_modifier = 1.0f;
+
+    const float vk_loss = trainer->forward_only(cam, rcfg, gt.f32(), kW, kH);
+    std::printf("[Gate P2] forward_only loss = %.8f\n", vk_loss);
+    EXPECT_TRUE(std::isfinite(vk_loss)) << "VK forward_only returned non-finite loss";
+
+    NpyArray cuda_co = load_npy(dump_dir() + "/conic_opacity.npy");
+    assert_dtype(cuda_co, NpyDtype::float32);
+    ASSERT_EQ(cuda_co.shape.size(), 2u);
+    ASSERT_EQ(cuda_co.shape[1], 4u);
+    const size_t N = cuda_co.shape[0];
+    ASSERT_EQ(static_cast<int>(N), model.data.count)
+        << "Gaussian count mismatch CUDA vs PLY";
+
+    NpyArray cuda_radii = load_npy(dump_dir() + "/radii.npy");
+    assert_dtype(cuda_radii, NpyDtype::int32);
+    ASSERT_EQ(cuda_radii.shape, (std::vector<size_t>{N}));
+
+    const std::vector<float>& vk_co = trainer->captured_conic_opacity();
+    ASSERT_EQ(vk_co.size(), N * 4u)
+        << "VK captured_conic_opacity() size mismatch (expected " << (N * 4) << ")";
+    const std::vector<int>& vk_radii = trainer->captured_radii();
+    ASSERT_EQ(vk_radii.size(), N)
+        << "VK captured_radii() size mismatch (expected " << N << ")";
+
+    const float* vk_p = vk_co.data();
+    const float* cuda_p = cuda_co.f32();
+    const int32_t* cuda_r = cuda_radii.i32();
+
+    constexpr float kAbsTolOpacity = 1e-5f;
+    constexpr float kRelTolOpacity = 1e-4f;
+    auto tol_for = [&](float cuda_val) {
+        return std::max(kAbsTolOpacity,
+                        kRelTolOpacity * std::max(std::fabs(cuda_val), 1.0f));
+    };
+
+    struct Diff { float abs_d; float vk; float cuda; size_t gid; size_t flat_idx; };
+    std::vector<Diff> diffs;
+    diffs.reserve(N);
+    int bad = 0;
+    int both_active = 0;
+    int only_cuda_active = 0;
+    int only_vk_active = 0;
+    int both_inactive = 0;
+    double sum_abs = 0.0;
+    float max_abs = 0.f;
+    size_t max_gid = 0u;
+
+    for (size_t i = 0; i < N; ++i) {
+        const bool cuda_active = cuda_r[i] > 0;
+        const bool vk_active = vk_radii[i] > 0;
+        if (!cuda_active || !vk_active) {
+            if (cuda_active) ++only_cuda_active;
+            else if (vk_active) ++only_vk_active;
+            else ++both_inactive;
+            continue;
+        }
+        ++both_active;
+
+        const float vk = vk_p[i * 4 + 3];
+        const float cu = cuda_p[i];
+        const float d = std::fabs(vk - cu);
+        diffs.push_back({d, vk, cu, i, i});
+        sum_abs += d;
+        if (d > max_abs) {
+            max_abs = d;
+            max_gid = i;
+        }
+        if (d > tol_for(cu)) ++bad;
+    }
+
+    const int cuda_active_count = both_active + only_cuda_active;
+    const int vk_active_count = both_active + only_vk_active;
+    ASSERT_GT(cuda_active_count, 0)
+        << "Gate P2 has no active CUDA Gaussians; cannot validate opacity parity.";
+    ASSERT_GT(vk_active_count, 0)
+        << "Gate P2 has no active VK Gaussians; cannot validate opacity parity.";
+    const int min_overlap_active =
+        std::max(1, (std::min(cuda_active_count, vk_active_count) * 95) / 100);
+    ASSERT_GE(both_active, min_overlap_active)
+        << "Gate P2 has insufficient overlap-active Gaussians to validate opacity parity. "
+        << "both_active=" << both_active
+        << " cuda_active=" << cuda_active_count
+        << " vk_active=" << vk_active_count
+        << " only_cuda_active=" << only_cuda_active
+        << " only_vk_active=" << only_vk_active
+        << " both_inactive=" << both_inactive;
+
+    if (!diffs.empty()) {
+        std::partial_sort(diffs.begin(),
+                          diffs.begin() + std::min<size_t>(32u, diffs.size()),
+                          diffs.end(),
+                          [](const Diff& a, const Diff& b) { return a.abs_d > b.abs_d; });
+    }
+
+    std::printf("[Gate P2] eval_3D opacity flat-buffer comparison: N=%zu both_active=%d "
+                "only_cuda_active=%d only_vk_active=%d both_inactive=%d bad=%d\n",
+                N, both_active, only_cuda_active, only_vk_active, both_inactive, bad);
+    std::printf("[Gate P2] opacity mean_abs=%.6e max_abs=%.6e gid=%zu\n",
+                both_active ? static_cast<float>(sum_abs / static_cast<double>(both_active)) : 0.0f,
+                max_abs, max_gid);
+    if (!diffs.empty() && diffs[0].abs_d > 0.f) {
+        std::printf("[Gate P2] Top-32 worst opacity entries (gid, cuda_flat_idx, vk, cuda, |diff|):\n");
+        for (int k = 0; k < std::min<int>(32, static_cast<int>(diffs.size())); ++k) {
+            const Diff& d = diffs[k];
+            std::printf("    gid=%-7zu flat=%-7zu vk=% .8g cuda=% .8g |diff|=%.6e\n",
+                        d.gid, d.flat_idx, d.vk, d.cuda, d.abs_d);
+        }
+    }
+
+    EXPECT_EQ(bad, 0)
+        << "VK eval_3D opacity differs from CUDA beyond tolerance. "
+        << "CUDA materialize_dump exposes eval_3D opacity as a flat float buffer; "
+        << "only cuda_conic_opacity.reshape(-1)[gid] is semantically valid. "
+        << "See Gate P2 diagnostic dump above.";
+
+    model.free();
 }
 TEST(VkVsCudaFirstLoss, Gate_P3_RgbColors) {
     GTEST_SKIP() << "Phase 2 gate (SH-evaluated RGB parity), not yet implemented";
