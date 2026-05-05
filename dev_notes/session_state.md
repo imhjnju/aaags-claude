@@ -1,16 +1,16 @@
 # Session State
 
 ## Current Phase (S16 — 2026-05-01)
-Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densification path, final-step CUDA parity for CLI training, render-config parity for saved-PLY comparisons, true multi-view/full-dataset parity control, the first full-dataset feature-matrix harness for DSSIM, position LR decay, SH warmup, and first-loss intermediate Gate_P2 eval_3D opacity parity. `VkTrainingConfig::cap_max > 0` selects MCMC relocate/add densification; `cap_max <= 0` preserves legacy clone/split/prune. `gs3d_vk_train` now skips Adam on the terminal iteration to match the CUDA harness final forward/backward/no-step contract, exposes `--proper_ewa 0|1`, accepts an explicit `--view_schedule`, and can expose parity-controlled `--lambda_dssim`, position LR schedule, spatial LR scale, and SH warmup. Full-dataset comparisons should use `--require_all_gt 1` to prevent silent camera-list drift from missing GT images; mixed-resolution multi-view training is currently rejected because `VulkanTrainer` image buffers are sized from the first view.
+Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densification path, final-step CUDA parity for CLI training, render-config parity for saved-PLY comparisons, true multi-view/full-dataset parity control, the first full-dataset feature-matrix harness for DSSIM, position LR decay, SH warmup, and first-loss intermediate Gate_P2/P3 eval_3D opacity/RGB parity. `VkTrainingConfig::cap_max > 0` selects MCMC relocate/add densification; `cap_max <= 0` preserves legacy clone/split/prune. `gs3d_vk_train` now skips Adam on the terminal iteration to match the CUDA harness final forward/backward/no-step contract, exposes `--proper_ewa 0|1`, accepts an explicit `--view_schedule`, and can expose parity-controlled `--lambda_dssim`, position LR schedule, spatial LR scale, and SH warmup. Full-dataset comparisons should use `--require_all_gt 1` to prevent silent camera-list drift from missing GT images; mixed-resolution multi-view training is currently rejected because `VulkanTrainer` image buffers are sized from the first view.
 
 ## Test Counts (2026-05-01 current)
 - Build: `cmake -S harmonyos_3dgs -B harmonyos_3dgs/build -DBUILD_TESTS=ON && cmake --build harmonyos_3dgs/build` OK after final-step no-update mode, train/render `--proper_ewa`, MCMC densification, `filter_3D` propagation, full-dataset view-schedule CLI changes, feature-matrix CLI knobs, and render `--sh_degree` override.
 - Targeted MCMC/Adam/densification/training/config/relocation/filter tests: **54/54 passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "Mcmc|Densification|VulkanAdam|DensityController|TrainTypes|OwnedRawParams"`, 2.90s).
 - Parity-sensitive regression: **42/42 passed** with expected skips (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "VkVsPyReference|VkVsCuda|Basketball|Eval3D|TileBinner"`, 15.79s).
 - Targeted post-review full-dataset/trainer regression: **52/52 passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "TrainingStepVk|VulkanTrainer|VkVsCuda|Mcmc|Densification|TrainTypes"`).
-- Full CTest after feature-matrix, render-SH, DSSIM optimization, and Gate_P2 opening: **315/315 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, latest 40.87s; expected inventory is 66 .cpp files).
+- Full CTest after feature-matrix, render-SH, DSSIM optimization, and Gate_P2/P3 opening: **315/315 tests passed** (`ctest --test-dir harmonyos_3dgs/build --output-on-failure`, latest 42.05s; expected inventory is 66 .cpp files).
 - DSSIM optimization validation added slow-reference sliding-window equivalence coverage; targeted DSSIM tests are **4/4 passed** after adding `DSSIM.SlowReferenceSlidingWindowEquivalence`, and targeted DSSIM/training regression is **66/66 passed** with expected skips (`ctest --test-dir harmonyos_3dgs/build --output-on-failure -R "DSSIM|TrainingStepVk|VulkanTrainer|VkVsCuda|Mcmc|Densification"`, 11.97s).
-- First-loss intermediate gate validation: `VkVsCudaFirstLoss` **12/12 passed** with expected skips for P3-P7/L1; Gate_P2 validates eval_3D opacity-lane parity on overlap-active Gaussians by comparing CUDA flat opacity (`conic_opacity.reshape(-1)[gid]`) against VK captured opacity, while reporting single-sided active-set differences for Gate_P4 radii/AABB follow-up.
+- First-loss intermediate gate validation: `VkVsCudaFirstLoss` **12/12 passed** with expected skips for P4-P7/L1; Gate_P2 validates eval_3D opacity-lane parity and Gate_P3 validates SH-evaluated RGB parity on overlap-active Gaussians, while reporting single-sided active-set differences for Gate_P4 radii/AABB follow-up.
 - Added MCMC/filter/full-dataset regression coverage and harnessing: CPU relocation, MCMC relocate/add/densify behavior, CUDA-golden MCMC replay fixtures, VulkanTrainer MCMC integration, Adam-state preservation/zeroing, opacity reset raw value + moment reset, eval_3D+MCMC filter propagation, legacy split child `filter_3D` inheritance, explicit Vulkan view schedules, strict all-GT validation, saved-PLY-vs-training-final render checks, and DSSIM slow-reference clamp-window equivalence.
 - Full-dataset basketball validation: all 76 views, eval_3D/proper_ewa, `cap_max=30000`, 1000 steps, shared schedule, no opacity reset. CUDA/VK final counts matched **3513/3513**; `CUDA vs GT 17.22 dB`, `VK saved vs GT 16.92 dB`, `VK saved vs CUDA 27.99 dB`, `VK saved vs train final view 59.24 dB`, GT gap **0.30 dB**, gate status PASS.
 - Full-dataset feature matrix at 1000 steps with `cap_max=100000` and no opacity reset PASSed all gates: baseline `VK saved vs CUDA 28.71 dB`, original DSSIM 0.2 `29.30 dB`, LR decay `30.71 dB`, SH warmup 1000 `30.91 dB` with render SH degree 0. All four runs matched final counts **3513/3513** and had GT gaps within **0.33 dB**. DSSIM VK training bottleneck was traced to host-side direct 11x11 sliding-window SSIM/gradient accumulation; the optimized separable/parallel path reduced the 1000-step DSSIM VK train time from **2632.7s** to **167.6s** while keeping the matrix gate PASS (`VK saved vs CUDA 28.25 dB`, counts **3513/3513**).
@@ -21,7 +21,7 @@ Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densi
 | Level | Meaning | Status |
 |-------|---------|--------|
 | L1a | CPU↔VK same-ply forward | ✅ 99.15 dB (Phase A close) |
-| L1b | VK↔CUDA same-ply forward (basketball cam0) | **54.84 dB** (5.16 dB to 60 dB target). Gate_I1-I4 + P1/P2 PASS; P3-P7 SKIP |
+| L1b | VK↔CUDA same-ply forward (basketball cam0) | **54.84 dB** (5.16 dB to 60 dB target). Gate_I1-I4 + P1-P3 PASS; P4-P7 SKIP |
 | L2 | Backward gradient parity | ✅ All 5 groups bit-exact at L2 norm + sub-1e-4 per-element except gpos atomic noise |
 | L3 | Post-Adam param parity | ✅ All groups (after SH layout bug fix); basketball 10/100-step now also captures Adam m/v |
 | L4 | 100-step trajectory | IN PROGRESS — loss aligned, but scale/rotation gradient+moment drift grows over 100 steps |
@@ -37,7 +37,7 @@ Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densi
 | SP-4: Training integration | DONE | S4 | ForwardCache, GPU Adam, VulkanTrainer |
 | SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam, LR+SH schedules, DSSIM, MCMC, basketball E2E smoke |
 | SP-6: Training gaps closed | DONE | S7 | T1-T5; 243 tests + basketball loss-decrease |
-| VK-CUDA L1b parity (PSNR≥60dB) | IN PROGRESS | S8-S16 | 25.3→54.84 dB. Phase 1 (Gate_I1-I4) + Gate_P1/P2 done; need Gate_P3-P7 implementation |
+| VK-CUDA L1b parity (PSNR≥60dB) | IN PROGRESS | S8-S16 | 25.3→54.84 dB. Phase 1 (Gate_I1-I4) + Gate_P1-P3 done; need Gate_P4-P7 implementation |
 | L2 backward parity | DONE | S11 | SH layout bug fix + test sensitivity tightening; 1 atomic noise debt |
 | L5 independent-train comparison | TODO | — | No test exists; Phase E |
 | M0: Foundation | IN PROGRESS | — | Interleaved with Vulkan migration |
@@ -51,7 +51,7 @@ Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densi
 | Gate_I4 ConfigFlags | PASS | parity_mode=1 |
 | Gate_P1 Means2D | PASS (S11) | mask CUDA huge fallback + relative tol; 5903 only-CUDA-rasterizes closed by dilation gating fix |
 | Gate_P2 ConicOpacity | PASS (S16) | validates eval_3D opacity-lane parity on overlap-active Gaussians; CUDA dump stores opacity as flat `((float*)conic_opacity)[gid]`, with single-sided active counts reported for P4 |
-| Gate_P3 RgbColors | SKIP | needs SH-evaluated RGB compare |
+| Gate_P3 RgbColors | PASS (S16) | validates SH-evaluated RGB parity on overlap-active Gaussians; inactive CUDA RGB rows are not semantically stable, with single-sided active counts reported for P4 |
 | Gate_P4 Radii | SKIP | blocked on new_aabb Phase-2 |
 | Gate_P5 SortedIds | SKIP | sort gate, gateway to cascade-trace harness |
 | Gate_P6 TFinalNContrib | SKIP | rasterize state |
@@ -66,10 +66,11 @@ Vulkan end-to-end training gap closure now includes the AAA-Gaussians MCMC densi
 
 ## Latest Sessions
 
-### S16 — 2026-05-01 — CUDA intermediate Gate_P2 opened
+### S16 — 2026-05-01 — CUDA intermediate Gate_P2/P3 opened
 - Opened `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` as a real parity gate. The CUDA basketball step-1 dump is `eval_3D=true`, so `conic_opacity.npy` is a raw `[P,4]` memory view but only the flat opacity lane `conic_opacity.reshape(-1)[gid]` is semantically valid; the 2D `{a,b,c,opacity}` row interpretation would be wrong for this fixture.
-- Gate_P2 compares that CUDA flat opacity against VK `captured_conic_opacity()[gid*4+3]` only for overlap-active Gaussians, and asserts a non-vacuous overlap population before checking values. Active-set disagreements are counted and reported, but left to Gate_P4 radii/AABB rather than mixed into the opacity gate.
-- Validation: `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` PASS; all `VkVsCudaFirstLoss` gates **12/12 passed** with expected skips for P3-P7/L1; full CTest **315/315 passed** in 40.87s. +1 and +2 independent reviews both approved with no findings.
+- Opened `VkVsCudaFirstLoss.Gate_P3_RgbColors` as a real parity gate. `rgb_colors.npy` is per-Gaussian `[N,3]` post-lower-clamp SH color, but inactive CUDA rows are not semantically stable, so the gate compares only overlap-active Gaussians.
+- Gate_P2/P3 both assert a non-vacuous overlap population before checking values. Active-set disagreements are counted and reported, but left to Gate_P4 radii/AABB rather than mixed into opacity/RGB value parity.
+- Validation: `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` PASS; `VkVsCudaFirstLoss.Gate_P3_RgbColors` PASS; all `VkVsCudaFirstLoss` gates **12/12 passed** with expected skips for P4-P7/L1; full CTest **315/315 passed** in 42.05s.
 
 ### S15 — 2026-04-30 — Full-dataset feature matrix
 - Extended `gs3d_vk_train` parity controls for full-dataset experiments: `--lambda_dssim`, position LR init/final, spatial LR scale, and SH warmup. Defaults preserve the previous strict L1/constant-LR/full-SH baseline.
