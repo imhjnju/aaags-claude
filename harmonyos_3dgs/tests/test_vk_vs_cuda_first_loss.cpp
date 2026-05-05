@@ -1282,8 +1282,189 @@ TEST(VkVsCudaFirstLoss, Gate_P3_RgbColors) {
     model.free();
 }
 TEST(VkVsCudaFirstLoss, Gate_P4_Radii) {
-    GTEST_SKIP() << "Phase 2 gate (radii / AABB parity; blocked on new_aabb "
-                    "Phase-2 risk noted in Gate_I4_ConfigFlags), not yet implemented";
+    const std::string ply = resolve_ply_path();
+    if (ply.empty()) GTEST_SKIP() << "basket-aaa.ply not found";
+    if (!std::filesystem::exists(kCamPath))
+        GTEST_SKIP() << "cameras.json not found: " << kCamPath;
+    if (!std::filesystem::exists(dump_dir()))
+        GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
+    if (!std::filesystem::exists(dump_dir() + "/radii.npy"))
+        GTEST_SKIP() << "radii.npy missing in CUDA dump";
+    if (!std::filesystem::exists(dump_dir() + "/gt_image.npy"))
+        GTEST_SKIP() << "gt_image.npy missing in CUDA dump";
+
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+
+    auto model = loadPly(ply.c_str());
+    Camera cam = loadCameraJson(kCamPath.c_str(), /*cam_id=*/0);
+    ASSERT_EQ(cam.width,  kW);
+    ASSERT_EQ(cam.height, kH);
+    ASSERT_EQ(model.data.max_coeffs, 16);
+
+    NpyArray gt = load_npy(dump_dir() + "/gt_image.npy");
+    assert_dtype(gt, NpyDtype::float32);
+    ASSERT_EQ(gt.shape, (std::vector<size_t>{3u, (size_t)kH, (size_t)kW}));
+
+    std::vector<float> vk_pos, vk_scl, vk_rot, vk_sh, vk_opa;
+    RawGaussianParams vk_raw = deriveRawFromPlyLoaded(
+        model.data, vk_pos, vk_scl, vk_rot, vk_sh, vk_opa);
+
+    VkTrainingConfig tcfg{};
+    tcfg.sh_degree_max     = 3;
+    tcfg.sh_degree_warmup  = 0;
+    tcfg.lambda_dssim      = 0.0f;
+    tcfg.eval_3D           = true;
+    tcfg.parity_mode       = true;
+    tcfg.densify_from_step = 0;
+    tcfg.opacity_reg       = 0.0f;
+    tcfg.scale_reg         = 0.0f;
+    tcfg.noise_lr          = 0.0f;
+
+    GaussianData init_g = model.data;
+    auto trainer = std::make_unique<VulkanTrainer>(
+        ctx, init_g, vk_raw, /*sh_degree=*/3, kW, kH, tcfg);
+    trainer->enable_intermediate_capture(true);
+
+    RenderConfig rcfg{};
+    rcfg.bg_color[0] = rcfg.bg_color[1] = rcfg.bg_color[2] = 0.0f;
+    rcfg.sh_degree      = 3;
+    rcfg.eval_3D        = true;
+    rcfg.antialiasing   = false;
+    rcfg.training       = true;
+    rcfg.scale_modifier = 1.0f;
+
+    const float vk_loss = trainer->forward_only(cam, rcfg, gt.f32(), kW, kH);
+    std::printf("[Gate P4] forward_only loss = %.8f\n", vk_loss);
+    EXPECT_TRUE(std::isfinite(vk_loss)) << "VK forward_only returned non-finite loss";
+
+    NpyArray cuda_radii = load_npy(dump_dir() + "/radii.npy");
+    assert_dtype(cuda_radii, NpyDtype::int32);
+    ASSERT_EQ(cuda_radii.shape.size(), 1u);
+    const size_t N = cuda_radii.shape[0];
+    ASSERT_EQ(static_cast<int>(N), model.data.count)
+        << "Gaussian count mismatch CUDA vs PLY";
+
+    const std::vector<int>& vk_radii = trainer->captured_radii();
+    ASSERT_EQ(vk_radii.size(), N)
+        << "VK captured_radii() size mismatch (expected " << N << ")";
+
+    const int32_t* cuda_r = cuda_radii.i32();
+
+    constexpr int kHugeRadius = 100000;
+    struct Diff { int abs_d; int vk; int cuda; size_t gid; };
+    std::vector<Diff> finite_diffs;
+    finite_diffs.reserve(N);
+    std::vector<Diff> sentinel_diffs;
+    int bad_large_delta = 0;
+    int off_by_one = 0;
+    int both_active = 0;
+    int only_cuda_active = 0;
+    int only_vk_active = 0;
+    int both_inactive = 0;
+    int sentinel_skipped = 0;
+    size_t finite_count = 0;
+    double sum_abs_finite = 0.0;
+    int max_abs_finite = 0;
+    size_t max_gid_finite = 0u;
+
+    for (size_t i = 0; i < N; ++i) {
+        const int vk = vk_radii[i];
+        const int cu = cuda_r[i];
+        const bool cuda_active = cu > 0;
+        const bool vk_active = vk > 0;
+        if (cuda_active && vk_active) ++both_active;
+        else if (cuda_active) ++only_cuda_active;
+        else if (vk_active) ++only_vk_active;
+        else ++both_inactive;
+
+        const int d = vk > cu ? vk - cu : cu - vk;
+        const bool sentinel = vk > kHugeRadius || cu > kHugeRadius;
+        if (sentinel) {
+            ++sentinel_skipped;
+            if (d > 0) sentinel_diffs.push_back({d, vk, cu, i});
+            continue;
+        }
+
+        ++finite_count;
+        sum_abs_finite += static_cast<double>(d);
+        if (d > max_abs_finite) {
+            max_abs_finite = d;
+            max_gid_finite = i;
+        }
+        if (d > 1) {
+            ++bad_large_delta;
+            finite_diffs.push_back({d, vk, cu, i});
+        } else if (d == 1) {
+            ++off_by_one;
+            finite_diffs.push_back({d, vk, cu, i});
+        }
+    }
+
+    const int cuda_active_count = both_active + only_cuda_active;
+    const int vk_active_count = both_active + only_vk_active;
+    ASSERT_GT(cuda_active_count, 0)
+        << "Gate P4 has no active CUDA Gaussians; cannot validate radii parity.";
+    ASSERT_GT(vk_active_count, 0)
+        << "Gate P4 has no active VK Gaussians; cannot validate radii parity.";
+    ASSERT_GT(finite_count, 0u)
+        << "Gate P4 has no finite radii after sentinel masking.";
+
+    const int max_off_by_one =
+        std::max(32, static_cast<int>((finite_count + 9999u) / 10000u));
+
+    if (!finite_diffs.empty()) {
+        std::partial_sort(finite_diffs.begin(),
+                          finite_diffs.begin() + std::min<size_t>(32u, finite_diffs.size()),
+                          finite_diffs.end(),
+                          [](const Diff& a, const Diff& b) { return a.abs_d > b.abs_d; });
+    }
+    if (!sentinel_diffs.empty()) {
+        std::partial_sort(sentinel_diffs.begin(),
+                          sentinel_diffs.begin() + std::min<size_t>(32u, sentinel_diffs.size()),
+                          sentinel_diffs.end(),
+                          [](const Diff& a, const Diff& b) { return a.abs_d > b.abs_d; });
+    }
+
+    std::printf("[Gate P4] radii comparison: N=%zu both_active=%d "
+                "only_cuda_active=%d only_vk_active=%d both_inactive=%d "
+                "sentinel_skipped=%d off_by_one=%d max_off_by_one=%d bad_large_delta=%d\n",
+                N, both_active, only_cuda_active, only_vk_active, both_inactive,
+                sentinel_skipped, off_by_one, max_off_by_one, bad_large_delta);
+    std::printf("[Gate P4] finite mean_abs=%.6e max_abs=%d gid=%zu finite_count=%zu\n",
+                finite_count ? static_cast<float>(sum_abs_finite /
+                                                  static_cast<double>(finite_count)) : 0.0f,
+                max_abs_finite, max_gid_finite, finite_count);
+    if (!finite_diffs.empty()) {
+        std::printf("[Gate P4] Top-32 finite radii deltas (gid, vk, cuda, |diff|):\n");
+        for (int k = 0; k < std::min<int>(32, static_cast<int>(finite_diffs.size())); ++k) {
+            const Diff& d = finite_diffs[k];
+            std::printf("    gid=%-7zu vk=%d cuda=%d |diff|=%d\n",
+                        d.gid, d.vk, d.cuda, d.abs_d);
+        }
+    }
+    if (!sentinel_diffs.empty()) {
+        std::printf("[Gate P4] Top-32 sentinel radii entries skipped (gid, vk, cuda, |diff|):\n");
+        for (int k = 0; k < std::min<int>(32, static_cast<int>(sentinel_diffs.size())); ++k) {
+            const Diff& d = sentinel_diffs[k];
+            std::printf("    gid=%-7zu vk=%d cuda=%d |diff|=%d\n",
+                        d.gid, d.vk, d.cuda, d.abs_d);
+        }
+    }
+
+    EXPECT_EQ(only_cuda_active, 0)
+        << "VK culled Gaussians that CUDA considered active; this is AABB/culling divergence.";
+    EXPECT_EQ(only_vk_active, 0)
+        << "VK kept Gaussians that CUDA culled; this is AABB/culling divergence.";
+    EXPECT_EQ(bad_large_delta, 0)
+        << "VK finite radii differ from CUDA by more than the 1-pixel ceil boundary "
+        << "window. Sentinel-scale radii are masked because they derive from the same "
+        << "tan(±pi/2-epsilon) degenerate-AABB fallback already masked by Gate P1.";
+    EXPECT_LE(off_by_one, max_off_by_one)
+        << "VK finite radii have too many 1-pixel ceil-boundary deltas; this indicates "
+        << "systematic AABB/radius drift rather than isolated rounding-boundary noise.";
+
+    model.free();
 }
 TEST(VkVsCudaFirstLoss, Gate_P5_SortedIds) {
     GTEST_SKIP() << "Phase 2 gate (per-tile sorted Gaussian IDs parity), "

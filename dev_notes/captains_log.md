@@ -1,12 +1,14 @@
 # Captain's Log
 
-## Session 16 — 2026-05-01 — CUDA intermediate Gate_P2/P3 opened
+## Session 16 — 2026-05-01 — CUDA intermediate Gate_P2-P4 opened
 
 Opened `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` as the next first-loss intermediate gate after P1. The first attempt compared `conic_opacity.npy` as rows of `{a,b,c,opacity}` and correctly failed; investigation of `dump_cuda_training_step.py` and the CUDA extension showed the basketball golden was generated with `eval_3D=true`, where CUDA writes opacity through `((float*)conic_opacity)[gid]`. The `[P,4]` dump is therefore a raw memory view, and only `conic_opacity.reshape(-1)[gid]` is semantically valid for this fixture.
 
-Opened `VkVsCudaFirstLoss.Gate_P3_RgbColors` after confirming `rgb_colors.npy` is raw per-Gaussian `[N,3]` post-lower-clamp SH color. CUDA does not guarantee meaningful RGB payload for inactive Gaussians, so P3 follows the same overlap-active comparison discipline as P2 and leaves active-set disagreements visible for Gate_P4 radii/AABB.
+Opened `VkVsCudaFirstLoss.Gate_P3_RgbColors` after confirming `rgb_colors.npy` is raw per-Gaussian `[N,3]` post-lower-clamp SH color. CUDA does not guarantee meaningful RGB payload for inactive Gaussians, so P3 follows the same overlap-active comparison discipline as P2.
 
-Validation passed: targeted P2 PASS, targeted P3 PASS, all `VkVsCudaFirstLoss` gates **12/12 PASS** with expected skips for P4-P7/L1, and full CTest **315/315 PASS** in 42.05s.
+Opened `VkVsCudaFirstLoss.Gate_P4_Radii` after the first strict equality attempt showed 364 mismatches, all with exact active-set agreement. 337 were sentinel-scale radii from the same `tan(±pi/2-epsilon)` degenerate-AABB fallback already masked by P1; the remaining finite deltas were 27 one-pixel `ceil(max_extent)` boundary cases out of 399663 finite radii, under the `max(32, ceil(0.01% of finite radii))` cap.
+
+Validation passed: targeted P2 PASS, targeted P3 PASS, targeted P4 PASS, all `VkVsCudaFirstLoss` gates **12/12 PASS** with expected skips for P5-P7/L1, and full CTest **315/315 PASS** in 42.94s.
 
 ## Session 15 — 2026-04-30 — Full-dataset feature matrix
 
