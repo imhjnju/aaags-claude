@@ -545,7 +545,7 @@ def main():
     ap.add_argument("--init_ply", type=pathlib.Path, default=DEFAULT_INIT_PLY)
     ap.add_argument("--cameras", type=pathlib.Path, default=DEFAULT_CAM_JSON)
     ap.add_argument("--image_dir", type=pathlib.Path, default=DEFAULT_IMAGE_DIR)
-    ap.add_argument("--steps", type=int, default=5000)
+    ap.add_argument("--steps", type=int, default=30000)
     ap.add_argument("--max_views", type=int, default=0, help="0 means all cameras")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cuda_densify_from_iter", type=int, default=500)

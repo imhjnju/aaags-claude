@@ -75,6 +75,7 @@ public:
         int cap_max,
         const mcmc::DensifySamplePlan& plan);
     const std::vector<float>& filter_3D_for_test() const { return act_filter_3D_; }
+    size_t last_replay_order_count_for_test() const { return last_replay_order_count_; }
 #endif
 
     void download_adam_moments(int group_idx,
@@ -268,6 +269,8 @@ private:
 
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;
+
+    size_t last_replay_order_count_ = 0u;
 
     // Tracks actual binner R (total Gaussian-tile pairs) from the previous step.
     // Used to size the FrameAllocator at the start of each step. After densification

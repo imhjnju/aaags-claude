@@ -599,6 +599,9 @@ TEST(VkVsCudaBasketball, Cam0_NContribDump) {
         dump("opacities_2d", pre.opacities_2d, N * sizeof(float));
         dump("means2D", pre.means2D, N * 2 * sizeof(float));
         dump("depths", pre.depths, N * sizeof(float));
+        if (pre.gauss2screen) {
+            dump("gauss2screen", pre.gauss2screen, N * 16 * sizeof(float));
+        }
     }
     auto bin = tile_binner->bin(pre, model.data.count, cam, cfg, allocator);
     if (bin.total_pairs > 0) {
@@ -644,11 +647,46 @@ TEST(VkVsCudaBasketball, Cam0_NContribDump) {
         std::printf("[NContribDump] n_contrib raw -> %s (int32 LE, %zu elements)\n",
                     nc_raw.c_str(), n_contrib.size());
 
+        std::string tf_raw = std::string(CMAKE_BINARY_DIR) + "/vk_T_final_cam0.raw";
+        std::ofstream tfo(tf_raw, std::ios::binary);
+        tfo.write(reinterpret_cast<const char*>(T_final.data()),
+                  static_cast<std::streamsize>(T_final.size() * sizeof(float)));
+        std::printf("[NContribDump] T_final raw -> %s (float32 LE, %zu elements)\n",
+                    tf_raw.c_str(), T_final.size());
+
         std::string vk_raw = std::string(CMAKE_BINARY_DIR) + "/vk_image.raw";
         std::ofstream vo(vk_raw, std::ios::binary);
         vo.write(reinterpret_cast<const char*>(vk_chw.data()),
                  static_cast<std::streamsize>(vk_chw.size() * sizeof(float)));
         std::printf("[NContribDump] VK image raw -> %s\n", vk_raw.c_str());
+
+        if (cache.replay_order_offsets && cache.replay_order_gids) {
+            std::string replay_offsets_raw = std::string(CMAKE_BINARY_DIR) + "/vk_replay_order_offsets_cam0.raw";
+            std::ofstream roo(replay_offsets_raw, std::ios::binary);
+            roo.write(reinterpret_cast<const char*>(cache.replay_order_offsets),
+                      static_cast<std::streamsize>((n_contrib.size() + 1u) * sizeof(uint32_t)));
+            std::printf("[NContribDump] replay offsets raw -> %s (%zu uint32)\n",
+                        replay_offsets_raw.c_str(), n_contrib.size() + 1u);
+
+            std::string replay_gids_raw = std::string(CMAKE_BINARY_DIR) + "/vk_replay_order_gids_cam0.raw";
+            std::ofstream rgo(replay_gids_raw, std::ios::binary);
+            rgo.write(reinterpret_cast<const char*>(cache.replay_order_gids),
+                      static_cast<std::streamsize>(cache.replay_order_count * sizeof(uint32_t)));
+            std::printf("[NContribDump] replay gids raw -> %s (%zu uint32)\n",
+                        replay_gids_raw.c_str(), cache.replay_order_count);
+
+            constexpr int kProbeX = 453;
+            constexpr int kProbeY = 52;
+            const size_t probe_px = static_cast<size_t>(kProbeY) * kW + kProbeX;
+            const uint32_t begin = cache.replay_order_offsets[probe_px];
+            const uint32_t end = cache.replay_order_offsets[probe_px + 1u];
+            std::printf("[NContribDump] probe (%d,%d) replay count=%u gids:",
+                        kProbeX, kProbeY, end - begin);
+            for (uint32_t i = begin; i < end; ++i) {
+                std::printf(" %u", cache.replay_order_gids[i]);
+            }
+            std::printf("\n");
+        }
     }
 
     // ROI ≡ x in [0,160), y in [720,960). 160*240 = 38400 pixels.

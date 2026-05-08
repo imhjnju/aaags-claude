@@ -9,7 +9,8 @@
 //   bwd.backward(pre, bin, cam, cfg, cache, d_image, rgrad, alloc);
 //
 // Preconditions:
-//   - cache.eval_3D must be false (EVAL_3D=true path is not implemented)
+//   - eval_3D backward uses cache replay sideband when production non-parity
+//     forward order was materialized; parity-mode eval_3D replays raw sorted IDs.
 //   - The output SSBOs are zeroed before dispatch (the adapter handles this)
 //   - rgrad.allocate_and_zero() is called internally
 
@@ -48,7 +49,7 @@ public:
     /// \param rgrad         Output gradients (allocated and zeroed internally)
     /// \param alloc         Frame allocator for rgrad arrays
     ///
-    /// \throws std::runtime_error if cache.eval_3D is true (not supported)
+    /// \throws std::runtime_error if required eval_3D inputs or replay buffers are inconsistent.
     void backward(const PreprocessOutput& pre,
                   const BinningOutput& bin,
                   int num_gaussians,
