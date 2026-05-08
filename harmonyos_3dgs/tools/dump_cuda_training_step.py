@@ -2,7 +2,7 @@
 """Phase 0.3 — dump ONE CUDA forward+L1 step on basket-aaa.ply / cam0 for
 VK-vs-CUDA first-loss parity testing.
 
-Writes 17 artifacts to
+Writes 18 artifacts to
 `harmonyos_3dgs/tests/golden/basketball/cuda_ref/step_0001/`:
 
     1  view_matrix.npy                (4,4) float32 column-major W2C (VK layout)
@@ -18,12 +18,13 @@ Writes 17 artifacts to
    10  rgb_colors.npy                 (N,3)  float32 SH-evaluated base colors
    11  radii.npy                      (N,)   int32 per-Gaussian screen radius
    12  tiles_touched.npy              (N,)   int32 per-Gaussian tile count
-   13  T_final.npy                    (H,W)  float32 per-pixel final transmittance
-   14  n_contrib.npy                  (H,W)  int32 per-pixel contribution count
-   15  sorted_ids_per_tile.npy        (R,)   int32 flattened per-tile Gaussian IDs
+   13  depths.npy                     (N,)   float32 per-Gaussian sort depth
+   14  T_final.npy                    (H,W)  float32 per-pixel final transmittance
+   15  n_contrib.npy                  (H,W)  int32 per-pixel contribution count
+   16  sorted_ids_per_tile.npy        (R,)   int32 flattened per-tile Gaussian IDs
        tile_offsets.npy               (num_tiles+1,) int32 start offsets + total
-   16  l1_loss.npy                    (1,)   float32 scalar L1(render - gt)
-   17  meta.json                      config, paths, layouts, N, W, H, etc.
+   17  l1_loss.npy                    (1,)   float32 scalar L1(render - gt)
+   18  meta.json                      config, paths, layouts, N, W, H, etc.
 
 Run with:
     conda run -n aaa-gs python harmonyos_3dgs/tools/dump_cuda_training_step.py
@@ -271,9 +272,9 @@ def main():
     num_tiles = num_tiles_x * num_tiles_y
     print(f"[4/8] Materialize dump  P={N}  R={R}  tiles={num_tiles_x}x{num_tiles_y}={num_tiles}")
 
-    # requires_cov3D_inv = sort_settings.requiresDepthAlongRay() — for GLOBAL + VIEWSPACE_Z
-    # this is False. requires_gauss2screen = eval_3D.
-    requires_cov3D_inv = False
+    # requires_cov3D_inv is true in this diagnostic build so the CUDA extension
+    # can materialize eval_3D AABB trace scalars through the otherwise-unused buffer.
+    requires_cov3D_inv = True
     requires_gauss2screen = True
     dump = _C.materialize_dump(
         geomBuf, binBuf, imgBuf,
@@ -281,11 +282,19 @@ def main():
         requires_cov3D_inv,
         requires_gauss2screen,
     )
+    print(f"       materialize keys: {sorted(dump.keys())}")
 
     means2D        = dump["preprocess_means2D"].cpu().contiguous().numpy().astype(np.float32)       # (N,2)
     conic_opacity  = dump["preprocess_conic_opacity"].cpu().contiguous().numpy().astype(np.float32)  # (N,4)
     rgb_colors     = dump["preprocess_rgb"].cpu().contiguous().numpy().astype(np.float32)           # (N,3)
     tiles_touched  = dump["preprocess_tiles_touched"].cpu().contiguous().numpy().astype(np.int32)   # (N,)
+    depths         = dump["preprocess_depths"].cpu().contiguous().numpy().astype(np.float32)         # (N,)
+    rects2D        = (dump["preprocess_rects2D"].cpu().contiguous().numpy().astype(np.float32)
+                      if "preprocess_rects2D" in dump else None)                                    # (N,2)
+    gauss2screen   = (dump["preprocess_gauss2screen"].cpu().contiguous().numpy().astype(np.float32)
+                      if "preprocess_gauss2screen" in dump else None)                               # (N,16)
+    aabb_debug     = (dump["preprocess_aabb_debug"].cpu().contiguous().numpy().astype(np.float32)
+                      if "preprocess_aabb_debug" in dump else None)                                 # (N,3,4)
     n_contrib      = dump["rasterize_n_contrib"].cpu().contiguous().numpy().astype(np.int32).reshape(H, W)
     T_final        = dump["rasterize_transmittance"].cpu().contiguous().numpy().astype(np.float32).reshape(H, W)
 
@@ -375,13 +384,20 @@ def main():
     save("rgb_colors.npy", rgb_colors)
     save("radii.npy", radii_np)
     save("tiles_touched.npy", tiles_touched)
+    save("depths.npy", depths)
+    if rects2D is not None:
+        save("rects2D.npy", rects2D)
+    if gauss2screen is not None:
+        save("gauss2screen.npy", gauss2screen)
+    if aabb_debug is not None:
+        save("aabb_debug.npy", aabb_debug)
     save("T_final.npy", T_final)
     save("n_contrib.npy", n_contrib)
     save("sorted_ids_per_tile.npy", sorted_values.astype(np.int32))
     save("tile_offsets.npy", tile_offsets)
     save("l1_loss.npy", np.array([l1], dtype=np.float32))
 
-    # meta.json (item 17)
+    # meta.json (item 18)
     meta = {
         "phase": "0.3",
         "description": "CUDA reference dump for VK-vs-CUDA first-loss parity",
@@ -495,6 +511,7 @@ def main():
             "rgb_colors.npy": "(N,3) SH-evaluated RGB before clamp-min in kernel",
             "radii.npy": "(N,) int32 per-Gaussian screen-space radius",
             "tiles_touched.npy": "(N,) int32 per-Gaussian tile touch count",
+            "depths.npy": "(N,) float32 per-Gaussian sort depth",
             "T_final.npy": "(H,W) float32 per-pixel final transmittance (accum_alpha)",
             "n_contrib.npy": "(H,W) int32 per-pixel contribution count",
             "sorted_ids_per_tile.npy": ("(R,) int32 flattened Gaussian IDs in "

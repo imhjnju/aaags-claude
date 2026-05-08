@@ -55,7 +55,9 @@ constexpr uint32_t DL_DGAUSS2SCREEN = 9;   // RW float[N*16], atomicAdd
 constexpr uint32_t DL_DOPACITY      = 10;  // RW float[N], atomicAdd
 constexpr uint32_t DL_DCOLORS       = 11;  // RW float[N*3], atomicAdd
 constexpr uint32_t BACKWARD_UBO     = 12;
-constexpr uint32_t BINDING_COUNT    = 13;
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 13; // RO uint[H*W+1], optional eval_3D non-parity exact replay
+constexpr uint32_t REPLAY_ORDER_GIDS    = 14; // RO uint[sum(n_contrib)], forward contribution order
+constexpr uint32_t BINDING_COUNT    = 15;
 }  // namespace rasterize_backward_eval3d_bind
 
 namespace preprocess_backward_eval3d_bind {

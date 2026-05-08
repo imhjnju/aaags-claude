@@ -440,13 +440,18 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     alloc_.reset();
     // Grow CPU arena to hold binner+sorter R-pair CPU arrays (R × 32 bytes)
     // plus cache and gradient arrays (N × ~300 bytes). Use last step's actual R,
-    // scaled by N growth ratio with 2× headroom for densification.
-    // First step: assume R/N = 50 as conservative default.
+    // scaled by N growth ratio with 4× headroom for densification.
+    // First step has no observed R yet, so cover the worst-case tile fanout.
     {
         const size_t cur_N = static_cast<size_t>(N_);
+        const size_t tile_w = static_cast<size_t>(std::max(1, cfg.tile_w));
+        const size_t tile_h = static_cast<size_t>(std::max(1, cfg.tile_h));
+        const size_t tiles_x = (static_cast<size_t>(W) + tile_w - 1u) / tile_w;
+        const size_t tiles_y = (static_cast<size_t>(H) + tile_h - 1u) / tile_h;
+        const size_t max_tiles_per_gaussian = std::max<size_t>(50u, tiles_x * tiles_y);
         const size_t est_R = (last_bin_N_ > 0)
-            ? last_bin_R_ * cur_N * 2u / last_bin_N_
-            : cur_N * 50u;
+            ? last_bin_R_ * cur_N * 4u / last_bin_N_
+            : cur_N * max_tiles_per_gaussian;
         const size_t needed = (6u << 20) + cur_N * 300u + est_R * 32u;
         alloc_.grow(needed);
     }
@@ -487,6 +492,7 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     // 4. Rasterize (populates cache.T_final and cache.n_contrib since they are non-null)
     rasterizer_.rasterize(out_pre, out_bin, cam, active_cfg, image_.data(),
                           /*depth=*/nullptr, &out_cache, &alloc_);
+    last_replay_order_count_ = out_cache.replay_order_count;
 
     // 4b. Optional intermediate capture — for VK-vs-CUDA parity tests only.
     //     All source pointers (pre.*, bin.*, cache.T_final/n_contrib) reference
@@ -511,6 +517,17 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
         captured_rgb_.assign(out_pre.rgb, out_pre.rgb + n * 3);
         captured_radii_.assign(out_pre.radii, out_pre.radii + n);
         captured_tiles_touched_.assign(out_pre.tiles_touched, out_pre.tiles_touched + n);
+        captured_depths_.assign(out_pre.depths, out_pre.depths + n);
+        if (out_pre.radius_f) {
+            captured_radius_f_.assign(out_pre.radius_f, out_pre.radius_f + n * 2);
+        } else {
+            captured_radius_f_.clear();
+        }
+        if (out_pre.gauss2screen) {
+            captured_gauss2screen_.assign(out_pre.gauss2screen, out_pre.gauss2screen + n * 16);
+        } else {
+            captured_gauss2screen_.clear();
+        }
 
         if (out_bin.values_sorted && R > 0) {
             captured_sorted_gaussian_ids_.resize(R);
@@ -562,10 +579,6 @@ float VulkanTrainer::step(const Camera& cam,
                           int H,
                           bool apply_update)
 {
-    if (tcfg_.eval_3D && !tcfg_.parity_mode) {
-        throw std::runtime_error(
-            "VulkanTrainer::step: eval_3D training currently requires parity_mode=true");
-    }
     // Steps 1-5: forward + loss. Out-params alias FrameAllocator memory which
     // remains valid until the next alloc_.reset() — the backward path below
     // reads them in-place.
@@ -631,13 +644,11 @@ float VulkanTrainer::step(const Camera& cam,
     //   => dL/d_raw_op[i] += (opacity_reg / N) * sig * (1 - sig)
     //      where sig = sigmoid(raw_op[i]) = act_opacities_[i]
     //
-    // Scale reg: loss += scale_reg * mean(|exp(raw_sc)|)  (per-component)
-    //   => dL/d_raw_sc[i,k] += (scale_reg / N) * exp(raw_sc[i,k])
+    // Scale reg: loss += scale_reg * mean(|exp(raw_sc)|) over [N,3]
+    //   => dL/d_raw_sc[i,k] += (scale_reg / (3*N)) * exp(raw_sc[i,k])
     //      where exp(raw_sc[i,k]) = act_scales_[i*3+k]
     //
-    // Evidence: test RegularizationGrad.ScaleGradAtRawLogScale asserts per-component
-    // formula (no norm division), test RegularizationGrad.OpacityGradAtRawZero asserts
-    // plain sigmoid derivative (not op_sigmoid which is for noise injection).
+    // Evidence: AAA-Gaussians/train.py loss lines + spec/README.md §7.
     if (N_ > 0 && (tcfg_.opacity_reg > 0.f || tcfg_.scale_reg > 0.f)) {
         const float inv_N = 1.0f / static_cast<float>(N_);
         for (int i = 0; i < N_; ++i) {
@@ -646,7 +657,7 @@ float VulkanTrainer::step(const Camera& cam,
                 grads.d_raw_opacities[static_cast<size_t>(i)] += (tcfg_.opacity_reg * inv_N) * sig * (1.f - sig);
             }
             if (tcfg_.scale_reg > 0.f) {
-                const float coeff = tcfg_.scale_reg * inv_N;
+                const float coeff = (tcfg_.scale_reg * inv_N) / 3.0f;
                 for (int k = 0; k < 3; ++k) {
                     const size_t idx = static_cast<size_t>(i) * 3 + k;
                     grads.d_raw_scales[idx] += coeff * act_scales_[idx];

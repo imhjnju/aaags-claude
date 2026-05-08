@@ -40,6 +40,8 @@ void RasterizeBackwardEval3DPass::bind_buffers(const Buffers& b, VkBuffer ubo) {
     pipeline_->update_ssbo(descriptor_set_, rasterize_backward_eval3d_bind::DL_DGAUSS2SCREEN, b.dL_dgauss2screen);
     pipeline_->update_ssbo(descriptor_set_, rasterize_backward_eval3d_bind::DL_DOPACITY,      b.dL_dopacity);
     pipeline_->update_ssbo(descriptor_set_, rasterize_backward_eval3d_bind::DL_DCOLORS,       b.dL_dcolors);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_backward_eval3d_bind::REPLAY_ORDER_OFFSETS, b.replay_order_offsets);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_backward_eval3d_bind::REPLAY_ORDER_GIDS,    b.replay_order_gids);
     pipeline_->update_ubo(descriptor_set_,
                           rasterize_backward_eval3d_bind::BACKWARD_UBO,
                           ubo,

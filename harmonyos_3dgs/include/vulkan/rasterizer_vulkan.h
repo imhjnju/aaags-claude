@@ -90,6 +90,7 @@ public:
 private:
     VulkanContext& ctx_;
     bool eval_3D_ = false;
+    bool disable_subtile_resort_ = false;
     std::unique_ptr<RasterizePass> pass_;
 
     // Layer-2 persistent buffers.

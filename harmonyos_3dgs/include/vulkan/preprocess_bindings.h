@@ -145,6 +145,9 @@ constexpr uint32_t OPACITIES_2D      = 10; // RO float[N]    pre-dilated opacity
 constexpr uint32_t COV3D_INV         = 11; // RO float[N*6]  inverse 3D covariance
 constexpr uint32_t MEAN_OFFSET       = 12; // RO float[N*3]  world-space offset
 constexpr uint32_t RASTER_EVAL3D_UBO = 13; // UB  RasterEval3DUBO (inverse_vp + cam info)
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 14; // RO uint[H*W+1], optional eval_3D non-parity replay sideband
+constexpr uint32_t REPLAY_ORDER_GIDS    = 15; // WO uint[sum(n_contrib)], optional forward contribution order
+constexpr uint32_t BINDING_COUNT        = 16;
 }
 struct RasterizePushConstants {
     uint32_t num_gaussians;

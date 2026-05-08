@@ -1,5 +1,65 @@
 # Captain's Log
 
+## Session 20 — 2026-05-08 — L1b production eval_3D replay-order localization and cascade port
+
+Localized the remaining basketball cam0 L1b production gap inside eval_3D contribution replay order. The prior top-level suspects are now ruled down: the same-ply golden matches `proper_ewa=1, parity_mode=0`, current CUDA render is bit-exact with the stored golden, touched Gaussian identity/tile ranges/candidate sets match, and `n_contrib`/`T_final` do not explain the highest-error pixels.
+
+Added VK replay-order diagnostics to `VkVsCudaBasketball.Cam0_NContribDump`. For worst pixel `(453,52)`, the actual VK blended sequence is `145552 397629 166619 221332 283819 289947 125398 175573 236196 260620 218837 182148 355888 255866`. Offline replay with VK preprocess data reconstructs the VK pixel within `~5e-7` RMSE. Replaying the raw tile order swaps the near-depth high-alpha pair `182148/218837` back and reconstructs the CUDA pixel for that probe.
+
+Two single-variable fixes were tested and rejected. Setting Vulkan `HEAD_W` from 8 to CUDA's configured 4 regressed full cam0 PSNR to **52.074 dB**. Adding a fixed `1e-6` near-depth tie tolerance to HEAD insertion regressed PSNR to **51.245 dB**. Both were reverted; the restored baseline passed at **54.730 dB**. These experiments proved the HEAD window only makes sense together with CUDA's MID/tail cull cascade, not as an isolated tuning knob.
+
+Top30 worst-pixel replay quantification showed VK replay reconstructs VK in **30/30** pixels. Raw tile order was closer to CUDA than VK replay in **25/30**, but exactly reconstructed CUDA in only **1/30**. This meant the gap was replay-order/cascade semantics, but CUDA was not simply raw tile order.
+
+Added `harmonyos_3dgs/tools/diagnose_l1b_mid_replay.py` as an offline simulator. MID-only v1 top100 improved over raw (`mid_h8` mean RMSE `0.047803` vs raw `0.061830`, wins `mid_h4=30`, `mid_h8=37`, raw `31`). After adding CUDA `CULL_ALPHA=true` 4x4 frustum/alpha culling, the simulator strongly matched CUDA top-error pixels: wins `mid_h4=89/100`, mean RMSE `0.008797`, and `<1e-4` exact/near-exact reconstructions `78/100`.
+
+Ported the production non-parity `eval_3D` path in `harmonyos_3dgs/src/vulkan/shaders/rasterize.comp` from the simplified sub-tile permutation to a CUDA-style full-tile private TAIL→MID→HEAD replay stream: 4x4 TAIL frustum/alpha culling, CUDA-like 32-input stages, a 64-entry TAIL queue draining the front 16 on overflow, `MID_WINDOW=8`, and `HEAD_WINDOW=4`. The parity raw-order path and the 2D conic path were left unchanged, and replay sideband writes remain tied to actual HEAD compositing order.
+
+Validation opened the L1b production gate above target: build passed; `VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline` improved **54.730 dB → 60.696 dB**; `VkVsCudaBasketball.Cam0_NContribDump` passed; offline replay confirmed sideband reconstructs Vulkan with max RMSE **2.60e-7** and mean RMSE **6.10e-8**; `VkVsCudaFirstLoss.*` passed **12/12**; targeted eval_3D trainer/forward smoke tests passed **5/5**; targeted CTest regex passed **37/37**; initial full CTest passed **315/315** in **220.53s**.
+
+Review/test-audit found and cleared one real blocker: the bounded TAIL/MID insertion helpers could write past private arrays when full and a worse candidate sorted after all residents. Fixed both helpers to drop that candidate instead, refreshed stale replay/binding comments, and strengthened `VulkanTrainer.Eval3DNonParityStepSmoke` to assert replay sideband count equals summed `n_contrib`. Post-fix targeted regression passed **15/15** with PSNR still **60.696 dB**; +1/+2 re-review found no blockers; final full CTest passed **315/315** in **243.58s**. Further PSNR work should isolate current residual cull/order differences per top-error pixel rather than tune constants blindly.
+
+## Session 19 — 2026-05-07 — non-parity eval_3D replay and AAA-default training alignment
+
+Implemented exact non-parity `eval_3D` backward replay for Vulkan training by recording the real forward HEAD flush order into replay sideband buffers and consuming that order in the eval_3D backward shader. This removes the previous `VulkanTrainer::step` fail-closed guard for `eval_3D && !parity_mode` while preserving the parity path.
+
+A review found two real replay-safety issues after the first implementation: replay sideband storage was allocated from `FrameAllocator` without arena sizing coverage, and `replay_order_count` was stored as signed `int` after only a `uint32_t` capacity check. Fixed both by making `ForwardCache` own replay offsets/GIDs in `std::vector<uint32_t>` and storing `replay_order_count` as `size_t`; independent re-review found no blocking lifetime, sizing, or truncation findings.
+
+Aligned formal training defaults with AAA-Gaussians expectations: `gs3d_vk_train` defaults to **30000** iterations, `lambda_dssim=0.2`, position LR `1.6e-4 -> 1.6e-6`, SH warmup `1000`, opacity/scale regularization `0.01`, noise LR `5e5`, and long densification until `25000`. The full-dataset comparison harness `--steps` default was also changed to **30000** so production runs do not silently use the earlier short 5000-step default; strict parity/stability harnesses must pass explicit zero-reg/noise/constant-LR knobs when needed.
+
+Validation passed: build OK; direct CLI smoke `gs3d_vk_train --eval_3d 1 --parity_mode 0 --proper_ewa 1 --iterations 1` ran successfully on the 66-view basketball train split and saved a PLY; targeted eval_3D trainer tests passed **3/3**; P5-P7/L1 replay/render/loss parity gates passed **4/4**; final full CTest passed **315/315** in 210.10s.
+
+## Session 18 — 2026-05-06 — CUDA intermediate Gate_P6-P7/L1 raster/render/loss opened
+
+Opened `VkVsCudaFirstLoss.Gate_P6_TFinalNContrib` as a real first-loss raster-state gate. The gate compares CUDA/Vulkan `T_final` and `n_contrib` in eval_3D parity mode after validating sorted-ID range extents, sorted gid bounds, and the P5-derived sorted-ID ambiguity surface.
+
+P6 locks both set-difference and near-depth order ambiguity tile identities, not just counts. `n_contrib` mismatches outside P5-ambiguous tiles are split into early-termination boundary drift near `T≈1e-4` versus true nontermination drift. The nontermination buckets are strict zero; total drift, outside-termination drift, max `n_contrib` delta, rare `T_final` pixel count, max `T_final` abs, and mean `T_final` abs are explicitly bounded.
+
+Observed P6 evidence: sorted-ID ambiguity is fixed at 27 set-difference tiles and 45 near-depth order-only tiles; `n_contrib` nontermination mismatches outside ambiguity are 0; early-termination outside-ambiguity drift is 18 `>1` cases and 13 off-by-one cases; `T_final` rare drift is 14 pixels outside ambiguity with max abs `0.00194701552` and mean abs `1.79116949e-07`.
+
+Opened `VkVsCudaFirstLoss.Gate_P7_RenderedImage` by comparing CUDA `rendered_image.npy` CHW output to `VulkanTrainer::rendered_image()` after eval_3D parity-mode `forward_only`. The gate checks artifact shape/layout, finite outputs, full-frame quality budgets, rare-pixel count budgets, and pinned first/max drift indices so localized render drift cannot silently move.
+
+Observed P7 evidence: `max_abs=0.00301802158`, `mean_abs=4.05360525e-07`, `l2_rel=9.83802837e-06`, `PSNR=103.724446 dB`, `bad_abs_1e-5=1960`, `bad_abs_1e-4=127`, `first_bad_abs_1e-5=36386`, `first_bad_abs_1e-4=36386`, and `max_abs_idx=1516009`.
+
+Opened `VkVsCudaFirstLoss.Gate_L1_L1Loss` by comparing CUDA `l1_loss.npy` against `VulkanTrainer::forward_only()` with `lambda_dssim=0` in eval_3D parity mode. The gate also recomputes serial-double L1 from CUDA/VK rendered images and GT to sanity-check CHW mean-absolute-error semantics, while intentionally not asserting naive serial-float recompute because the production VK path uses `compute_combined_loss_gradient` with parallel float partial reduction.
+
+Observed L1 evidence: `vk_forward=0.0613510013`, `vk_serial_double=0.0613514965`, `cuda_golden=0.0613514706`, `cuda_serial_double=0.061351486`, `vk_cuda_abs=4.69386578e-07`, `vk_serial_double_abs=4.95205611e-07`, and `cuda_serial_double_abs=1.53396087e-08`.
+
+Validation passed: targeted P6 passed after final tile-identity assertions; targeted P7 passed after drift-location pins; targeted L1 passed after reduction-semantics calibration; final `VkVsCudaFirstLoss` passed **12/12** with no skips in 144.22s; final full CTest passed **315/315** in 192.18s. +1 review blockers were fixed; +2 external re-review found no P6 blockers after contiguous range checks, sorted gid bounds, and exact ambiguity tile identity assertions; final +2 reviews found no P7 or L1 blockers.
+
+After first-loss closure, the remaining L1b same-ply production gap was localized with the basketball cam0 harness. Full cam0 remains **54.730 dB**, while the table subset is **67.867 dB**, so the old table ROI is no longer the dominant gap. A four-way CLI config matrix showed the same-ply golden matches `proper_ewa=1, parity_mode=0` (`54.729887 dB`); disabling proper EWA drops to about 25 dB and enabling parity mode drops to 32.70 dB.
+
+CUDA same-ply `n_contrib`/sort dumps show the active/touched set is already closed: both sides touch **181943** Gaussians with no one-sided IDs; tile ranges and candidate sets match exactly; touched RGB max abs is `9.54e-7`. `n_contrib` mismatches cover 12757 pixels but only explain **3.15%** of image SSE. The dominant residual is order-only sort drift: **1879** tiles have pure same-set order mismatches, **0** tiles have set mismatches, depth-key differences are only ±1 bit, and order-bad tiles cover **90.4%** of image SSE. A small clean-sort tail remains for later eval_3D raster/proper-EWA math investigation.
+
+## Session 17 — 2026-05-06 — CUDA intermediate Gate_P5 sorted IDs opened
+
+Opened `VkVsCudaFirstLoss.Gate_P5_SortedIds` as the next first-loss intermediate gate. The CUDA step-1 dump now writes `depths.npy` for parity-mode global sort keys and materializes `rects2D.npy`, `gauss2screen.npy`, and `aabb_debug.npy` diagnostics. VulkanTrainer intermediate capture now exposes per-Gaussian depths, anisotropic `radius_f`, and `gauss2screen` so P5 can inspect the same forward state used by bin/sort.
+
+The gate now fails rather than silently skips when required CUDA dump artifacts are missing under an existing dump directory. It explicitly asserts `eval_3D && parity_mode`, because this path compares global `depths[i]` keys; default eval_3D tile-depth binning remains out of scope for P5 parity mode.
+
+The sorted-ID assertion masks only one-sided `(tile,gid)` memberships adjacent to a specific near-integer CUDA/VK float-rect boundary edge. Shared memberships stay in the per-tile order comparison. After masking those boundary tile-instances, stable per-tile ID sets match exactly. The remaining 45 order-only tiles are accepted only when exact depth ties or pairwise-overlapping near-depth key windows explain the inversion; no separated-depth ordering bugs remain.
+
+Validation passed: targeted P5 passed after final boundary-instance tightening, all `VkVsCudaFirstLoss` gates passed with expected skips for P6-P7/L1, and full CTest passed **315/315** in 113.42s. +1 review findings were fixed, and final +2 external re-review passed with no blocking findings.
+
 ## Session 16 — 2026-05-01 — CUDA intermediate Gate_P2-P4 opened
 
 Opened `VkVsCudaFirstLoss.Gate_P2_ConicOpacity` as the next first-loss intermediate gate after P1. The first attempt compared `conic_opacity.npy` as rows of `{a,b,c,opacity}` and correctly failed; investigation of `dump_cuda_training_step.py` and the CUDA extension showed the basketball golden was generated with `eval_3D=true`, where CUDA writes opacity through `((float*)conic_opacity)[gid]`. The `[P,4]` dump is therefore a raw memory view, and only `conic_opacity.reshape(-1)[gid]` is semantically valid for this fixture.

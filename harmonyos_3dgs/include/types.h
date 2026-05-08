@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 // Arena-style frame allocator. Avoids per-frame malloc/free overhead.
 class FrameAllocator {
@@ -101,7 +102,12 @@ struct BinningOutput {
 // Cached intermediate values from the forward pass, needed for backward.
 struct ForwardCache {
     float* T_final;       // [H*W] per-pixel final transmittance
-    int*   n_contrib;     // [H*W] per-pixel last contributing candidate position
+    int*   n_contrib;     // [H*W] 2D/raw replay boundary; eval_3D non-parity replay count
+    std::vector<uint32_t> replay_order_offsets_storage;  // owns eval_3D non-parity exact replay offsets
+    std::vector<uint32_t> replay_order_gids_storage;     // owns blended Gaussian IDs in forward order
+    uint32_t* replay_order_offsets = nullptr;             // [H*W+1]
+    uint32_t* replay_order_gids = nullptr;                // [replay_order_count]
+    size_t replay_order_count = 0;                        // number of entries in replay_order_gids
     float* cov2D;         // [N*3] filtered 2D covariance
     float* cov2D_det;     // [N] determinant of filtered cov2D
     float* cov3D;         // [N*6] 3D covariance upper triangle

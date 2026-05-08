@@ -75,6 +75,7 @@ public:
         int cap_max,
         const mcmc::DensifySamplePlan& plan);
     const std::vector<float>& filter_3D_for_test() const { return act_filter_3D_; }
+    size_t last_replay_order_count_for_test() const { return last_replay_order_count_; }
 #endif
 
     void download_adam_moments(int group_idx,
@@ -119,6 +120,9 @@ public:
     const std::vector<float>&    captured_rgb()                 const { return captured_rgb_; }
     const std::vector<int>&      captured_radii()               const { return captured_radii_; }
     const std::vector<int>&      captured_tiles_touched()       const { return captured_tiles_touched_; }
+    const std::vector<float>&    captured_depths()              const { return captured_depths_; }
+    const std::vector<float>&    captured_radius_f()            const { return captured_radius_f_; }
+    const std::vector<float>&    captured_gauss2screen()        const { return captured_gauss2screen_; }
     const std::vector<int>&      captured_sorted_gaussian_ids() const { return captured_sorted_gaussian_ids_; }
     const std::vector<int>&      captured_tile_offsets()        const { return captured_tile_offsets_; }
     const std::vector<float>&    captured_T_final()             const { return captured_T_final_; }
@@ -242,6 +246,9 @@ private:
     std::vector<float>         captured_rgb_;                  // [N*3]
     std::vector<int>           captured_radii_;                // [N]
     std::vector<int>           captured_tiles_touched_;        // [N]
+    std::vector<float>         captured_depths_;               // [N]
+    std::vector<float>         captured_radius_f_;             // [N*2]
+    std::vector<float>         captured_gauss2screen_;         // [N*16]
     std::vector<int>           captured_sorted_gaussian_ids_;  // [R] — flat (values_sorted)
     std::vector<int>           captured_tile_offsets_;         // [num_tiles*2] (start, end) flat
     std::vector<float>         captured_T_final_;              // [H*W]
@@ -262,6 +269,8 @@ private:
 
     // 1-indexed step counter (incremented before each GPU Adam dispatch).
     int step_count_ = 0;
+
+    size_t last_replay_order_count_ = 0u;
 
     // Tracks actual binner R (total Gaussian-tile pairs) from the previous step.
     // Used to size the FrameAllocator at the start of each step. After densification

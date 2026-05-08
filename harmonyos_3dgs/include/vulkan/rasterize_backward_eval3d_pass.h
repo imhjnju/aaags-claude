@@ -25,6 +25,8 @@ public:
         VkBuffer dL_dgauss2screen;
         VkBuffer dL_dopacity;
         VkBuffer dL_dcolors;
+        VkBuffer replay_order_offsets;
+        VkBuffer replay_order_gids;
     };
 
     explicit RasterizeBackwardEval3DPass(VulkanContext& ctx);

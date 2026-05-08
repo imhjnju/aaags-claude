@@ -156,10 +156,10 @@ precise float preciseTransformRow4(mat4 M, vec3 pos, int row) {
 // -----------------------------------------------------------------------------
 void quat2mat(vec4 rot, out float R[9]) {
     // rot = (r, x, y, z)
-    float r = rot.x;
-    float x = rot.y;
-    float y = rot.z;
-    float z = rot.w;
+    precise float r = rot.x;
+    precise float x = rot.y;
+    precise float y = rot.z;
+    precise float z = rot.w;
     // Row 0
     R[0] = 1.0 - 2.0 * (y * y + z * z);
     R[1] = 2.0 * (x * y + r * z);
@@ -188,7 +188,7 @@ void quat2mat(vec4 rot, out float R[9]) {
 void mat4Mul16(float A[16], float B[16], out float result[16]) {
     for (int col = 0; col < 4; col++)
         for (int row = 0; row < 4; row++) {
-            float sum = 0.0;
+            precise float sum = 0.0;
             for (int k = 0; k < 4; k++)
                 sum += A[k*4 + row] * B[col*4 + k];
             result[col*4 + row] = sum;
@@ -217,19 +217,19 @@ float computeGauss2Screen(vec3 mean3D, vec3 scale, vec4 rot,
 
     if (kernel_size > 0.0) {
         // viewray_world = normalize(mean3D - cam_pos)
-        vec3 vr = mean3D - cam_pos;
-        float vr_len = sqrt(vr.x*vr.x + vr.y*vr.y + vr.z*vr.z);
+        precise vec3 vr = mean3D - cam_pos;
+        precise float vr_len = sqrt(vr.x*vr.x + vr.y*vr.y + vr.z*vr.z);
         vr /= vr_len;
 
         // viewray_gauss = R * viewray_world (R row-major: R[row][col])
-        float vrg[3];
+        precise float vrg[3];
         for (int ii = 0; ii < 3; ii++)
             vrg[ii] = RMC(R, ii, 0)*vr.x + RMC(R, ii, 1)*vr.y + RMC(R, ii, 2)*vr.z;
-        float r_sq[3] = float[3](vrg[0]*vrg[0], vrg[1]*vrg[1], vrg[2]*vrg[2]);
+        precise float r_sq[3] = float[3](vrg[0]*vrg[0], vrg[1]*vrg[1], vrg[2]*vrg[2]);
 
         // mean3D in view space via preciseTransformRow (column-major viewmatrix)
-        float mean_view_z = preciseTransformRow(cam.viewmatrix, mean3D, 2);
-        float scale_mip = (mean_view_z / focal) * (mean_view_z / focal) * kernel_size;
+        precise float mean_view_z = preciseTransformRow(cam.viewmatrix, mean3D, 2);
+        precise float scale_mip = (mean_view_z / focal) * (mean_view_z / focal) * kernel_size;
         scale_mip = max(filter_3d_val * filter_3d_val, scale_mip);
 
         scale_dilated[0] = sqrt(scale.x*scale.x + scale_mip);
@@ -237,22 +237,22 @@ float computeGauss2Screen(vec3 mean3D, vec3 scale, vec4 rot,
         scale_dilated[2] = sqrt(scale.z*scale.z + scale_mip);
 
         // Compute dilation factor from determinant ratio
-        float s[3] = float[3](scale.x*scale.x, scale.y*scale.y, scale.z*scale.z);
-        float s_dil[3] = float[3](scale_dilated[0]*scale_dilated[0],
-                                   scale_dilated[1]*scale_dilated[1],
-                                   scale_dilated[2]*scale_dilated[2]);
+        precise float s[3] = float[3](scale.x*scale.x, scale.y*scale.y, scale.z*scale.z);
+        precise float s_dil[3] = float[3](scale_dilated[0]*scale_dilated[0],
+                                           scale_dilated[1]*scale_dilated[1],
+                                           scale_dilated[2]*scale_dilated[2]);
 
-        float det_mul = r_sq[0]*(s[1]*s[2]) + r_sq[1]*(s[2]*s[0]) + r_sq[2]*(s[0]*s[1]);
-        float det_mul_dil = r_sq[0]*(s_dil[1]*s_dil[2]) + r_sq[1]*(s_dil[2]*s_dil[0]) + r_sq[2]*(s_dil[0]*s_dil[1]);
+        precise float det_mul = r_sq[0]*(s[1]*s[2]) + r_sq[1]*(s[2]*s[0]) + r_sq[2]*(s[0]*s[1]);
+        precise float det_mul_dil = r_sq[0]*(s_dil[1]*s_dil[2]) + r_sq[1]*(s_dil[2]*s_dil[0]) + r_sq[2]*(s_dil[0]*s_dil[1]);
         dilation_factor = sqrt(det_mul / det_mul_dil);
     }
 
     // Build L = transpose(S*R), where S = diag(scale_dilated * sqrt(scale_mod))
-    float sm = sqrt(scale_mod);
-    float sd[3] = float[3](scale_dilated[0]*sm, scale_dilated[1]*sm, scale_dilated[2]*sm);
+    precise float sm = sqrt(scale_mod);
+    precise float sd[3] = float[3](scale_dilated[0]*sm, scale_dilated[1]*sm, scale_dilated[2]*sm);
 
     // L[row][col] = sd[col] * R[col][row]
-    float L[9];
+    precise float L[9];
     for (int ii = 0; ii < 3; ii++)
         for (int jj = 0; jj < 3; jj++)
             L[ii*3 + jj] = sd[jj] * RMC(R, jj, ii);
@@ -567,14 +567,14 @@ bool computeAABBScreen(float g2s[16], float cutoff,
 
 // -----------------------------------------------------------------------------
 // normalizeAngle: normalize angle to [-pi, pi].
-// Port of math_utils.cpp:391-396.
-// Uses floor-based modulo instead of fmod for consistent GLSL behavior.
+// Port of CUDA consistent_common.cuh::normalize_angle.
+// CUDA fmod uses truncation toward zero.
 // -----------------------------------------------------------------------------
 const float PI_VAL = 3.14159265358979323846;
 
 float normalizeAngle(float theta) {
     float TWO_PI = 2.0 * PI_VAL;
-    theta = theta - floor(theta / TWO_PI) * TWO_PI;
+    theta = theta - trunc(theta / TWO_PI) * TWO_PI;
     if (theta > PI_VAL) theta -= TWO_PI;
     if (theta <= -PI_VAL) theta += TWO_PI;
     return theta;
@@ -600,30 +600,32 @@ bool computeAABBView(float gauss2view[16], vec3 mean3D_view,
     float bounds_hi[2];
 
     for (int axis = 0; axis < 2; axis++) {
-        float theta_mu = atan(axis == 0 ? viewdir[0] : viewdir[1], viewdir[2]);
+        precise float theta_mu = atan(axis == 0 ? viewdir[0] : viewdir[1], viewdir[2]);
 
         // T[axis] row and T[2] row from gauss2view (row-major)
         // Ta = gauss2view[axis*4 .. axis*4+3]
         // T2 = gauss2view[2*4 .. 2*4+3]
 
-        float squared_axis = 0.0, squared_z = 0.0, mid_val = 0.0;
+        precise float squared_axis = 0.0;
+        precise float squared_z = 0.0;
+        precise float mid_val = 0.0;
         for (int ii = 0; ii < 4; ii++) {
-            float ta = gauss2view[axis*4+ii];
-            float t2 = gauss2view[2*4+ii];
+            precise float ta = gauss2view[axis*4+ii];
+            precise float t2 = gauss2view[2*4+ii];
             squared_axis += t[ii] * ta * ta;
             squared_z += t[ii] * t2 * t2;
             mid_val += t[ii] * ta * t2;
         }
 
-        float inside_sqrt = mid_val * mid_val - squared_z * squared_axis;
+        precise float inside_sqrt = mid_val * mid_val - squared_z * squared_axis;
 
-        float result_lo = -(PI_VAL / 2.0 - 1e-5);
-        float result_hi = PI_VAL / 2.0 - 1e-5;
+        precise float result_lo = -(PI_VAL / 2.0 - 1e-5);
+        precise float result_hi = PI_VAL / 2.0 - 1e-5;
 
         if (inside_sqrt > 0.0) {
-            float sqrt_val = sqrt(inside_sqrt);
-            float theta_axis_0 = atan(-(mid_val + sqrt_val), -squared_z);
-            float theta_axis_1 = atan(-(mid_val - sqrt_val), -squared_z);
+            precise float sqrt_val = sqrt(inside_sqrt);
+            precise float theta_axis_0 = atan(-(mid_val + sqrt_val), -squared_z);
+            precise float theta_axis_1 = atan(-(mid_val - sqrt_val), -squared_z);
 
             // Rotate to get correct order around theta_mu.
             // Matches CUDA unbounded `while` loops (consistent_common.cuh:253-257).
@@ -646,8 +648,8 @@ bool computeAABBView(float gauss2view[16], vec3 mean3D_view,
                 theta_axis_1 -= PI_VAL;
             }
 
-            float norm0 = normalizeAngle(theta_axis_0);
-            float norm1 = normalizeAngle(theta_axis_1);
+            precise float norm0 = normalizeAngle(theta_axis_0);
+            precise float norm1 = normalizeAngle(theta_axis_1);
             if (theta_mu < 0.0 && abs(norm0) < abs(norm1)) {
                 theta_axis_0 += 2.0 * PI_VAL;
                 theta_axis_1 += 2.0 * PI_VAL;
@@ -660,8 +662,8 @@ bool computeAABBView(float gauss2view[16], vec3 mean3D_view,
             result_hi = min(result_hi, theta_axis_1);
         }
 
-        float focal_dim = (axis == 0) ? focal_x : focal_y;
-        float dim_size = (axis == 0) ? W : H;
+        precise float focal_dim = (axis == 0) ? focal_x : focal_y;
+        precise float dim_size = (axis == 0) ? W : H;
         bounds_lo[axis] = dim_size / 2.0 + focal_dim * tan(result_lo);
         bounds_hi[axis] = dim_size / 2.0 + focal_dim * tan(result_hi);
     }

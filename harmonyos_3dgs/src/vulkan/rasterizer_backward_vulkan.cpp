@@ -94,6 +94,11 @@ void RasterizerBackwardVulkan::prepare_for_n(int N, int R, int num_tiles, int HW
     dlg2s_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * 16u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    replay_offsets_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(HW_new + 1) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dummy4_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     ubo_buf_   = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(sizeof(RasterizeBackwardUBO)),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -199,10 +204,25 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
         dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
 
+        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        if (use_replay_order) {
+            replay_offsets_buf_->upload(cache.replay_order_offsets,
+                (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
+            if (cache.replay_order_count > buf_replay_count_) {
+                replay_gids_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(cache.replay_order_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                buf_replay_count_ = cache.replay_order_count;
+            }
+            replay_gids_buf_->upload(cache.replay_order_gids,
+                static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+        }
+
         RasterizeBackwardUBO ubo{};
         ubo.W = static_cast<uint32_t>(W);
         ubo.H = static_cast<uint32_t>(H);
         ubo.num_tiles_x = num_tiles_x;
+        ubo._pad = use_replay_order ? 1u : 0u;
         ubo.bg_color[0] = cfg.bg_color[0];
         ubo.bg_color[1] = cfg.bg_color[1];
         ubo.bg_color[2] = cfg.bg_color[2];
@@ -221,6 +241,8 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         rb.dL_dgauss2screen = dlg2s_buf_->handle();
         rb.dL_dopacity = dlopa_buf_->handle();
         rb.dL_dcolors = dlcol_buf_->handle();
+        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
         eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
         eval3d_pass_->dispatch_sync(num_tiles_x, num_tiles_y);
 
@@ -448,10 +470,25 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
         dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
 
+        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        if (use_replay_order) {
+            replay_offsets_buf_->upload(cache.replay_order_offsets,
+                (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
+            if (cache.replay_order_count > buf_replay_count_) {
+                replay_gids_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(cache.replay_order_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                buf_replay_count_ = cache.replay_order_count;
+            }
+            replay_gids_buf_->upload(cache.replay_order_gids,
+                static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+        }
+
         RasterizeBackwardUBO ubo{};
         ubo.W = static_cast<uint32_t>(W);
         ubo.H = static_cast<uint32_t>(H);
         ubo.num_tiles_x = num_tiles_x;
+        ubo._pad = use_replay_order ? 1u : 0u;
         ubo.bg_color[0] = cfg.bg_color[0];
         ubo.bg_color[1] = cfg.bg_color[1];
         ubo.bg_color[2] = cfg.bg_color[2];
@@ -470,6 +507,8 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         rb.dL_dgauss2screen = dlg2s_buf_->handle();
         rb.dL_dopacity = dlopa_buf_->handle();
         rb.dL_dcolors = dlcol_buf_->handle();
+        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
         eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
         eval3d_pass_->record(cmd, num_tiles_x, num_tiles_y);
         return;

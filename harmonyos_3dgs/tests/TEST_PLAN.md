@@ -74,7 +74,7 @@ Current CTest total: **315 tests** (2026-04-30 baseline, 66 .cpp test files)
 | `test_tile_binner_vulkan.cpp` | Vulkan Tile Binner | Tile binning and eval_3D parity-mode keying |
 | `test_sorter_vulkan.cpp` | Vulkan Sorter | Vulkan sorting |
 | `test_vulkan_adam.cpp` | Vulkan Optimizer | GPU Adam update, moment resize, selective zeroing |
-| `test_training_step_vk.cpp` | Vulkan Trainer | VulkanTrainer step, parity, eval_3D guards/gradient parity |
+| `test_training_step_vk.cpp` | Vulkan Trainer | VulkanTrainer step, parity, eval_3D non-parity replay smoke/gradient parity |
 | `test_mcmc_trainer_integration.cpp` | Vulkan Trainer | MCMC densification integration, Adam preservation, opacity reset |
 | `test_vk_vs_cpu_render.cpp` | Vulkan Parity | CPU↔VK render parity |
 | `test_vk_vs_py_reference.cpp` | Vulkan Parity | VK↔Python reference training parity |

@@ -188,7 +188,7 @@ struct VkTrainingConfig {
     float densify_grad_thresh   = 2e-4f;
     float opacity_thresh        = 0.005f;
     int   densify_from_step     = 500;   // 0 = disabled (skips densification entirely)
-    int   densify_until_step    = 15000;
+    int   densify_until_step    = 25000;
     int   densify_interval      = 100;
     float densify_percent_dense = 0.01f;
     int   cap_max               = 0;     // >0 enables AAA-Gaussians MCMC densification
@@ -208,10 +208,8 @@ struct VkTrainingConfig {
     bool  proper_ewa         = false;
 
     // Enable eval_3D path in the forward preprocessor + rasterizer.
-    // eval_3D backward is currently validated only with parity_mode=true, where
-    // rasterize.comp bypasses the Vulkan sub-tile re-sort and replays CUDA-style
-    // per-tile sorted candidates. VulkanTrainer::step rejects eval_3D training
-    // without parity_mode until the default HEAD/sub-tile replay is implemented.
+    // Non-parity training stores the exact per-pixel forward HEAD/sub-tile
+    // contribution order as a replay sideband before rasterizer backward.
     bool  eval_3D            = false;
 
     // Parity mode — disables the per-4x4 sub-tile re-sort inside rasterize.comp's

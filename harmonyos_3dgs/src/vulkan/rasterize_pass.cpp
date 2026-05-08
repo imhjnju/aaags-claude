@@ -1,10 +1,10 @@
 // SP-2 T17: RasterizePass — wraps rasterize.comp (spec §4.8.7).
 //
 // Bindings (mirroring rasterize_bind::):
-//   0..4  read-only SSBOs: values_sorted, tile_ranges, means2D,
-//                          conic_opacity_packed, rgb
-//   5..7  write-only SSBOs: out_image (CHW channel-first), transmittance, n_contrib
-//   8     uniform buffer:   RasterizeUBO (bg_r, bg_g, bg_b, _pad)
+//   0..7   core SSBOs: sorted IDs/ranges, preprocess outputs, image, T, n_contrib
+//   8      uniform buffer: RasterizeUBO (bg_r, bg_g, bg_b, _pad)
+//   9..15  eval_3D/replay SSBOs + UBO: gauss2screen, opacity, cov3D_inv,
+//          mean_offset, RasterEval3DUBO, replay offsets, replay gids
 //
 // Dispatch: one 16x16 workgroup per tile. The shader itself is documented at
 // src/vulkan/shaders/rasterize.comp; this adapter is a pure dispatcher.
@@ -53,8 +53,8 @@ RasterizePass::RasterizePass(VulkanContext& ctx,
     spec_info.dataSize      = sizeof(SpecData);
     spec_info.pData         = &spec_data;
 
-    // --- 3. Descriptor layout: 12 SSBOs + 2 UBOs (bindings 8, 13) ----------
-    std::vector<VkDescriptorType> binding_types(14,
+    // --- 3. Descriptor layout: 14 SSBOs + 2 UBOs (bindings 8, 13) ----------
+    std::vector<VkDescriptorType> binding_types(rasterize_bind::BINDING_COUNT,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[rasterize_bind::RASTER_UBO]        = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding_types[rasterize_bind::RASTER_EVAL3D_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -95,6 +95,8 @@ void RasterizePass::bind_buffers(const Buffers& b) {
                           rasterize_bind::RASTER_EVAL3D_UBO,
                           b.raster_eval3d_ubo,
                           sizeof(RasterEval3DUBO));
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::REPLAY_ORDER_OFFSETS, b.replay_order_offsets);
+    pipeline_->update_ssbo(descriptor_set_, rasterize_bind::REPLAY_ORDER_GIDS,    b.replay_order_gids);
 }
 
 void RasterizePass::dispatch_sync(uint32_t num_gaussians,

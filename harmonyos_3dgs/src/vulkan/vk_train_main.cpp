@@ -421,20 +421,25 @@ struct TrainArgs {
     int save_every = 0;
     int log_every = 100;
     bool eval_3D = false;
+    bool parity_mode = false;
+    bool parity_mode_provided = false;
     bool proper_ewa = false;
     bool require_all_gt = false;
-    float lambda_dssim = 0.0f;
-    float pos_lr_init = 1.6e-4f;
-    float pos_lr_final = 1.6e-4f;
-    float spatial_lr_scale = 1.0f;
-    int sh_degree_warmup = 0;
+    float lambda_dssim = VkTrainingConfig{}.lambda_dssim;
+    float pos_lr_init = VkTrainingConfig{}.pos_lr_init;
+    float pos_lr_final = VkTrainingConfig{}.pos_lr_final;
+    float spatial_lr_scale = VkTrainingConfig{}.spatial_lr_scale;
+    int sh_degree_warmup = VkTrainingConfig{}.sh_degree_warmup;
     bool densify = false;
     int densify_from_step = 500;
-    int densify_until_step = 15000;
+    int densify_until_step = VkTrainingConfig{}.densify_until_step;
     int densify_interval = 100;
     int cap_max = 0;
     bool cap_max_provided = false;
     int opacity_reset_interval = 3000;
+    float opacity_reg = VkTrainingConfig{}.opacity_reg;
+    float scale_reg = VkTrainingConfig{}.scale_reg;
+    float noise_lr = VkTrainingConfig{}.noise_lr;
     std::string parse_error;
 };
 
@@ -513,7 +518,14 @@ static TrainArgs parseArgs(int argc, char** argv) {
             args.cap_max_provided = true;
         }
         else if (strcmp(argv[i], "--opacity_reset_interval") == 0) { if (!parse_int(i, "--opacity_reset_interval", args.opacity_reset_interval)) break; }
+        else if (strcmp(argv[i], "--opacity_reg") == 0) { if (!parse_float(i, "--opacity_reg", args.opacity_reg)) break; }
+        else if (strcmp(argv[i], "--scale_reg") == 0) { if (!parse_float(i, "--scale_reg", args.scale_reg)) break; }
+        else if (strcmp(argv[i], "--noise_lr") == 0) { if (!parse_float(i, "--noise_lr", args.noise_lr)) break; }
         else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
+        else if (strcmp(argv[i], "--parity_mode") == 0) {
+            if (!parse_bool(i, "--parity_mode", args.parity_mode)) break;
+            args.parity_mode_provided = true;
+        }
         else if (strcmp(argv[i], "--proper_ewa") == 0) { if (!parse_bool(i, "--proper_ewa", args.proper_ewa)) break; }
         else if (strcmp(argv[i], "--require_all_gt") == 0) { if (!parse_bool(i, "--require_all_gt", args.require_all_gt)) break; }
         else if (strcmp(argv[i], "--lambda_dssim") == 0) { if (!parse_float(i, "--lambda_dssim", args.lambda_dssim)) break; }
@@ -552,16 +564,20 @@ static void printUsage(const char* prog) {
     printf("  --densify <0|1>       Enable densification schedule; defaults to MCMC growth (default: 0)\n");
     printf("  --cap_max <N>         MCMC Gaussian cap; >0 also enables densification, 0 with --densify 1 selects legacy\n");
     printf("  --densify_from_step <N>   First densification step (default: 500)\n");
-    printf("  --densify_until_step <N>  Last densification step (default: 15000)\n");
+    printf("  --densify_until_step <N>  Last densification step (default: 25000)\n");
     printf("  --densify_interval <N>    Densification interval (default: 100)\n");
     printf("  --opacity_reset_interval <N>  Reset opacity interval when densifying (default: 3000)\n");
+    printf("  --opacity_reg <v>     Opacity regularization weight (default: 0.01)\n");
+    printf("  --scale_reg <v>       Scale regularization weight (default: 0.01)\n");
+    printf("  --noise_lr <v>        Position noise factor after Adam step (default: 5e5)\n");
     printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
+    printf("  --parity_mode <0|1>   Use CUDA-parity eval_3D replay path (default: follows --eval_3d)\n");
     printf("  --proper_ewa <0|1>    Use AAA proper EWA preprocessing during training (default: 0)\n");
-    printf("  --lambda_dssim <v>    DSSIM weight in combined loss, [0,1] (default: 0)\n");
+    printf("  --lambda_dssim <v>    DSSIM weight in combined loss, [0,1] (default: 0.2)\n");
     printf("  --pos_lr_init <v>     Position LR init (default: 1.6e-4)\n");
-    printf("  --pos_lr_final <v>    Position LR final; same as init disables decay (default: 1.6e-4)\n");
+    printf("  --pos_lr_final <v>    Position LR final; same as init disables decay (default: 1.6e-6)\n");
     printf("  --spatial_lr_scale <v>  Position LR spatial scale (default: 1)\n");
-    printf("  --sh_degree_warmup <N>  Steps between SH degree increments; 0 uses full degree from start\n");
+    printf("  --sh_degree_warmup <N>  Steps between SH degree increments (default: 1000)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +652,10 @@ int main(int argc, char** argv) {
         printf("Error: --sh_degree_warmup must be >= 0\n");
         return 1;
     }
+    if (args.opacity_reg < 0.0f || args.scale_reg < 0.0f || args.noise_lr < 0.0f) {
+        printf("Error: --opacity_reg, --scale_reg, and --noise_lr must be >= 0\n");
+        return 1;
+    }
 
     // Init Vulkan
     VulkanContext ctx;
@@ -654,13 +674,15 @@ int main(int argc, char** argv) {
 
     RawGaussianParams raw = initRawFromGaussianData(model.data);
 
+    const bool effective_parity_mode = args.parity_mode_provided ? args.parity_mode : args.eval_3D;
+
     // Render config
     RenderConfig cfg{};
     cfg.bg_color[0] = cfg.bg_color[1] = cfg.bg_color[2] = 0;
     cfg.scale_modifier = 1.0f;
     cfg.training = true;
     cfg.eval_3D = args.eval_3D;
-    cfg.eval_3D_parity_mode = args.eval_3D;
+    cfg.eval_3D_parity_mode = effective_parity_mode;
     cfg.sh_degree = (args.sh_degree >= 0) ? args.sh_degree : raw.sh_degree;
 
     if (args.cap_max_provided && args.cap_max > 0)
@@ -708,16 +730,16 @@ int main(int argc, char** argv) {
     tcfg.cap_max = args.densify ? args.cap_max : 0;
     tcfg.opacity_reset_interval = args.densify ? args.opacity_reset_interval : 0;
     tcfg.lambda_dssim = args.lambda_dssim;
-    tcfg.opacity_reg = 0.0f;      // Disable regularization until CUDA harness exposes matching terms.
-    tcfg.scale_reg = 0.0f;        // Disable regularization until CUDA harness exposes matching terms.
+    tcfg.opacity_reg = args.opacity_reg;
+    tcfg.scale_reg = args.scale_reg;
     tcfg.pos_lr_init = args.pos_lr_init;
     tcfg.pos_lr_final = args.pos_lr_final;
     tcfg.spatial_lr_scale = args.spatial_lr_scale;
     tcfg.sh_degree_max = cfg.sh_degree;
     tcfg.sh_degree_warmup = args.sh_degree_warmup;
-    tcfg.noise_lr = 0.0f;         // Disable position noise until statistical, non-exact comparison is added.
+    tcfg.noise_lr = args.noise_lr;
     tcfg.eval_3D = args.eval_3D;
-    tcfg.parity_mode = args.eval_3D;
+    tcfg.parity_mode = effective_parity_mode;
     tcfg.proper_ewa = args.proper_ewa;
     // Build training views
     std::vector<TrainView> views;
@@ -888,6 +910,7 @@ int main(int argc, char** argv) {
     printf("  SH warmup:   %d\n", tcfg.sh_degree_warmup);
     printf("  lambda_dssim:%.2f\n", tcfg.lambda_dssim);
     printf("  eval_3D:     %s\n", tcfg.eval_3D ? "ON" : "OFF");
+    printf("  parity_mode: %s\n", tcfg.parity_mode ? "ON" : "OFF");
     printf("  proper_ewa:  %s\n", tcfg.proper_ewa ? "ON" : "OFF");
     printf("  densify:     %s", tcfg.densify_from_step > 0 ? "ON" : "OFF");
     if (tcfg.densify_from_step > 0)
@@ -897,14 +920,13 @@ int main(int argc, char** argv) {
                tcfg.opacity_reset_interval);
     printf("\n");
     printf("  save filter_3D: %s\n", save_filter_3D ? "ON" : "OFF");
-    printf("  opacity_reg: %.4f\n", tcfg.opacity_reg);
-    printf("  scale_reg:   %.4f\n", tcfg.scale_reg);
-    printf("  noise_lr:    %.0f\n", tcfg.noise_lr);
+    printf("  opacity_reg: %g\n", tcfg.opacity_reg);
+    printf("  scale_reg:   %g\n", tcfg.scale_reg);
+    printf("  noise_lr:    %g\n", tcfg.noise_lr);
     printf("\n");
 
     auto t_start = std::chrono::high_resolution_clock::now();
     float first_loss = 0, last_loss = 0;
-    int nan_count = 0;
     int last_view_idx = 0;
 
     for (int iter = 0; iter < args.iterations; iter++) {
@@ -937,16 +959,20 @@ int main(int argc, char** argv) {
 
         const bool is_final_iter = (iter == args.iterations - 1);
         // Match CUDA reference training: final forward/backward runs, final Adam update does not.
-        float loss = trainer.step(tv.cam, cfg, tv.gt_image.data(),
-                                  tv.cam.width, tv.cam.height,
-                                  !is_final_iter);
+        float loss = 0.0f;
+        try {
+            loss = trainer.step(tv.cam, cfg, tv.gt_image.data(),
+                                tv.cam.width, tv.cam.height,
+                                !is_final_iter);
+        } catch (const std::exception& e) {
+            printf("Error: %s\n", e.what());
+            return 1;
+        }
 
         if (std::isnan(loss) || std::isinf(loss)) {
-            nan_count++;
-            if (nan_count <= 3)
-                printf("  Warning: %s loss at iter %d\n",
-                       std::isnan(loss) ? "NaN" : "Inf", iter);
-            loss = 0.0f;
+            printf("Error: %s loss at iter %d\n",
+                   std::isnan(loss) ? "NaN" : "Inf", iter);
+            return 1;
         }
 
         if (iter == 0) {
@@ -996,8 +1022,6 @@ int main(int argc, char** argv) {
     printf("  Total time:   %.1f s (%.1f it/s)\n", total_sec, args.iterations / total_sec);
     printf("  First loss:   %.6f\n", first_loss);
     printf("  Final loss:   %.6f\n", last_loss);
-    if (nan_count > 0)
-        printf("  NaN/Inf steps: %d\n", nan_count);
     if (first_loss > 0)
         printf("  Loss ratio:   %.4f (%.1f%% reduction)\n",
                last_loss / first_loss, (1.0f - last_loss / first_loss) * 100.0f);

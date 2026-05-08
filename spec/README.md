@@ -120,6 +120,7 @@ Composites sorted Gaussians tile by tile using front-to-back alpha blending.
 ### Invariants
 - Output pixel color is independent of Gaussian ordering WITHIN the same alpha value (deterministic)
 - Each tile processed independently (no cross-tile state)
+- Training backward replay must use the exact forward compositing order. In eval_3D non-parity mode this includes per-subtile depth permutation and per-pixel HEAD flush order, not just raw tile-sorted IDs.
 
 ---
 

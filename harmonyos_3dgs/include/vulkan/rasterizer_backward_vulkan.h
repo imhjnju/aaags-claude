@@ -9,7 +9,8 @@
 //   bwd.backward(pre, bin, cam, cfg, cache, d_image, rgrad, alloc);
 //
 // Preconditions:
-//   - cache.eval_3D must be false (EVAL_3D=true path is not implemented)
+//   - eval_3D backward uses cache replay sideband when production non-parity
+//     forward order was materialized; parity-mode eval_3D replays raw sorted IDs.
 //   - The output SSBOs are zeroed before dispatch (the adapter handles this)
 //   - rgrad.allocate_and_zero() is called internally
 
@@ -21,6 +22,7 @@
 #include "vulkan/rasterize_backward_pass.h"
 #include "vulkan/rasterize_backward_eval3d_pass.h"
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -47,7 +49,7 @@ public:
     /// \param rgrad         Output gradients (allocated and zeroed internally)
     /// \param alloc         Frame allocator for rgrad arrays
     ///
-    /// \throws std::runtime_error if cache.eval_3D is true (not supported)
+    /// \throws std::runtime_error if required eval_3D inputs or replay buffers are inconsistent.
     void backward(const PreprocessOutput& pre,
                   const BinningOutput& bin,
                   int num_gaussians,
@@ -99,6 +101,7 @@ private:
     int buf_R_         = 0;
     int buf_num_tiles_ = 0;
     int buf_HW_        = 0;
+    size_t buf_replay_count_ = 0;
 
     std::unique_ptr<VulkanBuffer> tr_buf_;     // tile_ranges   [num_tiles*2] u32
     std::unique_ptr<VulkanBuffer> vs_buf_;     // values_sorted [R] u32
@@ -115,6 +118,9 @@ private:
     std::unique_ptr<VulkanBuffer> dlcol_buf_;  // dL_dcolors    [N*3] f32
     std::unique_ptr<VulkanBuffer> g2s_buf_;    // gauss2screen  [N*16] f32, eval_3D
     std::unique_ptr<VulkanBuffer> dlg2s_buf_;  // dL_dgauss2screen [N*16] f32
+    std::unique_ptr<VulkanBuffer> replay_offsets_buf_; // [HW+1] u32 eval_3D exact replay offsets
+    std::unique_ptr<VulkanBuffer> replay_gids_buf_;    // [sum(n_contrib)] u32 eval_3D exact replay gids
+    std::unique_ptr<VulkanBuffer> dummy4_buf_;          // 4-byte dummy for optional replay bindings
     std::unique_ptr<VulkanBuffer> ubo_buf_;    // RasterizeBackwardUBO (32B)
 
     void prepare_for_n(int N, int R, int num_tiles, int HW);

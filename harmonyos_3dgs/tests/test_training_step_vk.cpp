@@ -16,8 +16,8 @@
 //       One eval_3D step with all-zeros target. Assert finite loss and at least
 //       one raw parameter changes.
 //
-//   T-eval3d-guard: VulkanTrainer.Eval3DStepRequiresParityMode
-//       eval_3D training with parity_mode=false throws before running backward.
+//   T-eval3d-nonparity: VulkanTrainer.Eval3DNonParityStepSmoke
+//       eval_3D training with parity_mode=false runs one finite non-parity step.
 //
 //   T-eval3d-grad : VulkanTrainer.Eval3DStep1RawGradientParity
 //       One eval_3D step with all-zeros target. Compare captured raw gradients
@@ -452,10 +452,10 @@ TEST(VulkanTrainer, Eval3DOneStepSmoke) {
 }
 
 // ---------------------------------------------------------------------------
-// T-eval3d-guard : eval_3D training requires parity mode
+// T-eval3d-nonparity : eval_3D training supports exact non-parity replay
 // ---------------------------------------------------------------------------
 
-TEST(VulkanTrainer, Eval3DStepRequiresParityMode) {
+TEST(VulkanTrainer, Eval3DNonParityStepSmoke) {
     VulkanContext ctx;
     if (!ctx.init()) {
         GTEST_SKIP() << "No Vulkan compute device — skipping.";
@@ -476,12 +476,22 @@ TEST(VulkanTrainer, Eval3DStepRequiresParityMode) {
 
     VulkanTrainer trainer(ctx, scene.g, scene.raw,
                           scene.sh_degree, scene.W, scene.H, tcfg);
+    trainer.enable_intermediate_capture(true);
 
     std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
-    EXPECT_THROW(
-        trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H),
-        std::runtime_error);
-    EXPECT_EQ(trainer.step_count(), 0);
+    float loss = 0.0f;
+    ASSERT_NO_THROW(loss = trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H));
+    EXPECT_TRUE(std::isfinite(loss));
+    EXPECT_GE(loss, 0.0f);
+    EXPECT_EQ(trainer.step_count(), 1);
+
+    size_t blended = 0;
+    for (int n : trainer.captured_n_contrib()) {
+        ASSERT_GE(n, 0);
+        blended += static_cast<size_t>(n);
+    }
+    EXPECT_GT(blended, 0u);
+    EXPECT_EQ(trainer.last_replay_order_count_for_test(), blended);
 }
 
 // ---------------------------------------------------------------------------

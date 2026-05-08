@@ -121,6 +121,7 @@
     "rgb_colors.npy": "(N,3) SH-evaluated RGB before clamp-min in kernel",
     "radii.npy": "(N,) int32 per-Gaussian screen-space radius",
     "tiles_touched.npy": "(N,) int32 per-Gaussian tile touch count",
+    "depths.npy": "(N,) float32 per-Gaussian sort depth",
     "T_final.npy": "(H,W) float32 per-pixel final transmittance (accum_alpha)",
     "n_contrib.npy": "(H,W) int32 per-pixel contribution count",
     "sorted_ids_per_tile.npy": "(R,) int32 flattened Gaussian IDs in render order, concatenated per tile.",
