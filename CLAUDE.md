@@ -11,6 +11,11 @@ See `PROJECT.md` for facts. Full workflow: `WORKFLOW.md`.
 
 ---
 
+## Cross-worktree Operational Reminders
+
+- **Long-running training/render logs must flush to file**: Start background training/render commands with `stdbuf -oL -eL` or make the executable call `fflush(stdout)` after progress prints. Do not rely on external force-flush after launch: `gdb attach` can be blocked by ptrace/Yama, and stopping/restarting a training process loses progress unless the user explicitly approves.
+- **CUDA reference checkout for comparisons**: Use the clean CUDA/DGR reference commit `3373529` for CUDA-side AAA-GS comparison and parity harness runs unless the user gives a different reference. See `dev_notes/cuda_reference_3373529.md`.
+
 ## STOP Gates — Read the gate file when triggered
 
 | # | Trigger | Action | Gate File |

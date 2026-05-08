@@ -20,12 +20,24 @@
 #include "vulkan/vk_context.h"
 #include "vulkan/vk_buffer.h"
 #include "vulkan/preprocess_backward_pass.h"
+#include "vulkan/preprocess_backward_eval3d_pass.h"
 
 #include <memory>
+#include <vector>
 
 class PreprocessorBackwardVulkan {
 public:
-    explicit PreprocessorBackwardVulkan(VulkanContext& ctx);
+    /// @param proper_ewa  Must match the value passed to the forward
+    /// PreprocessorVulkan / PreprocessorCPU. Gates the h_conv_scaling chain
+    /// rule in the backward shader (mirrors CUDA backward.cu:215).
+    /// Default true: legacy regression tests (PreprocessorBackwardVulkan.*) pair
+    /// this class with PreprocessorCPU forward, which applies h_conv
+    /// UNCONDITIONALLY — so the default mirrors CPU's "always-on" behavior.
+    /// Callers that drive forward with proper_ewa=false (e.g. VulkanTrainer
+    /// with VkTrainingConfig::proper_ewa=false) MUST pass false explicitly to
+    /// gate the h_conv chain rule off.
+    explicit PreprocessorBackwardVulkan(VulkanContext& ctx,
+                                        bool proper_ewa = true);
     ~PreprocessorBackwardVulkan();
 
     PreprocessorBackwardVulkan(const PreprocessorBackwardVulkan&)            = delete;
@@ -67,16 +79,32 @@ public:
                               VkBuffer d_opacity_gpu,  // from rasterize_bwd dL_dopacity_buf()
                               VkBuffer d_rgb_gpu,      // from rasterize_bwd dL_dcolors_buf()
                               VkBuffer d_means2D_gpu,  // from rasterize_bwd dL_dmeans2D_buf()
-                              const RawGaussianParams& raw);
+                              const RawGaussianParams& raw,
+                              VkBuffer d_gauss2screen_gpu = VK_NULL_HANDLE);
 
     /// Download gradient outputs to CPU after backward_record_into() + submit.
     /// grads is allocated from alloc and filled from persistent GPU output buffers.
     void download_grads(int num_gaussians, int max_coeffs,
                         GradientOutput& grads, FrameAllocator& alloc);
 
+    /// Clear all gradient output buffers to zero before backward pass.
+    /// Critical for correctness: backward shaders only write to active Gaussians,
+    /// so stale data from previous steps would accumulate without clearing.
+    void clear_grad_buffers(VkCommandBuffer cmd);
+
+    void enable_debug_capture(bool enable) { debug_capture_enabled_ = enable; }
+    void download_debug_buffers(int num_gaussians,
+                                std::vector<float>& d_fabc,
+                                std::vector<float>& d_cov3D,
+                                std::vector<float>& d_M,
+                                std::vector<float>& d_scale,
+                                std::vector<float>& d_R,
+                                std::vector<float>& d_qn) const;
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<PreprocessBackwardPass> pass_;
+    std::unique_ptr<PreprocessBackwardEval3DPass> eval3d_pass_;
 
     // Persistent GPU buffers — pre-allocated in prepare_for_n(), reused each
     // backward() call. Eliminates 23 vkDeviceWaitIdle/step from destructors.
@@ -94,6 +122,8 @@ private:
     std::unique_ptr<VulkanBuffer> rot_buf_;        // rotations   [N*4] f32
     std::unique_ptr<VulkanBuffer> drgb_buf_;       // d_rgb       [N*3] f32
     std::unique_ptr<VulkanBuffer> dm2d_buf_;       // d_means2D   [N*2] f32
+    std::unique_ptr<VulkanBuffer> dg2s_buf_;       // d_gauss2screen [N*16] f32
+    std::unique_ptr<VulkanBuffer> f3_buf_;         // filter_3D   [N] f32
     std::unique_ptr<VulkanBuffer> opa_in_buf_;     // opacities   [N] f32
     std::unique_ptr<VulkanBuffer> raw_rot_buf_;    // raw_rotations [N*4] f32
     std::unique_ptr<VulkanBuffer> m2d_cache_buf_;  // means2D_cache [N*2] f32
@@ -108,6 +138,14 @@ private:
     std::unique_ptr<VulkanBuffer> drot_buf_;       // d_rotations [N*4] f32
     std::unique_ptr<VulkanBuffer> d_raw_opa_buf_;  // d_raw_opacities [N] f32
     std::unique_ptr<VulkanBuffer> ubo_buf_;        // PreprocessBackwardUBO (192B)
+
+    bool debug_capture_enabled_ = false;
+    std::unique_ptr<VulkanBuffer> dbg_d_fabc_buf_;   // [N*3] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_cov3D_buf_;  // [N*6] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_M_buf_;      // [N*9] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_scale_buf_;  // [N*3] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_R_buf_;      // [N*9] f32
+    std::unique_ptr<VulkanBuffer> dbg_d_qn_buf_;     // [N*4] f32
 
     void prepare_for_n(int N, int max_coeffs);
 };

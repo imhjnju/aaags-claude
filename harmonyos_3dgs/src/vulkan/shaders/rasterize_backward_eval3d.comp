@@ -1,0 +1,192 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer TileRanges { uint tile_ranges[]; };
+layout(std430, set = 0, binding = 1) readonly buffer ValuesSorted { uint values_sorted[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Gauss2Screen { float gauss2screen[]; };
+layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity { float conic_opacity[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Colors { float colors[]; };
+layout(std430, set = 0, binding = 5) readonly buffer TFinal { float T_final[]; };
+layout(std430, set = 0, binding = 6) readonly buffer NContrib { uint n_contrib[]; };
+layout(std430, set = 0, binding = 7) readonly buffer RenderedImage { float rendered_image[]; };
+layout(std430, set = 0, binding = 8) readonly buffer DLDpixels { float dL_dpixels[]; };
+layout(std430, set = 0, binding = 9) buffer DLDGauss2Screen { float dL_dgauss2screen[]; };
+layout(std430, set = 0, binding = 10) buffer DLDOpacity { float dL_dopacity[]; };
+layout(std430, set = 0, binding = 11) buffer DLDColors { float dL_dcolors[]; };
+layout(std430, set = 0, binding = 13) readonly buffer ReplayOrderOffsets { uint replay_order_offsets[]; };
+layout(std430, set = 0, binding = 14) readonly buffer ReplayOrderGids { uint replay_order_gids[]; };
+
+layout(std140, set = 0, binding = 12) uniform RasterizeBackwardUBO {
+    uint W;
+    uint H;
+    uint num_tiles_x;
+    uint _pad;
+    vec3 bg_color;
+    float _pad2;
+} ubo;
+
+const float ALPHA_THRESHOLD = 1.0 / 255.0;
+
+float maxContribRayPixel(vec4 plane_a, vec4 plane_b, out vec4 max_pos) {
+    float dx = plane_a.y * plane_b.z - plane_a.z * plane_b.y;
+    float dy = plane_a.z * plane_b.x - plane_a.x * plane_b.z;
+    float dz = plane_a.x * plane_b.y - plane_a.y * plane_b.x;
+    float mx = plane_a.w * plane_b.x - plane_a.x * plane_b.w;
+    float my = plane_a.w * plane_b.y - plane_a.y * plane_b.w;
+    float mz = plane_a.w * plane_b.z - plane_a.z * plane_b.w;
+    float dd = dx * dx + dy * dy + dz * dz;
+    if (dd < 1e-8) {
+        max_pos = vec4(0.0, 0.0, 0.0, 1.0);
+        return 0.0;
+    }
+    vec3 m_div_dd = vec3(mx, my, mz) / dd;
+    max_pos = vec4(
+        dy * m_div_dd.z - dz * m_div_dd.y,
+        dz * m_div_dd.x - dx * m_div_dd.z,
+        dx * m_div_dd.y - dy * m_div_dd.x,
+        1.0);
+    return dot(vec3(mx, my, mz), m_div_dd);
+}
+
+vec4 g2s_row(uint gid, uint row) {
+    uint base = gid * 16u + row * 4u;
+    return vec4(gauss2screen[base + 0u],
+                gauss2screen[base + 1u],
+                gauss2screen[base + 2u],
+                gauss2screen[base + 3u]);
+}
+
+void atomicAddG2S(uint gid, uint row, vec4 v) {
+    uint base = gid * 16u + row * 4u;
+    atomicAdd(dL_dgauss2screen[base + 0u], v.x);
+    atomicAdd(dL_dgauss2screen[base + 1u], v.y);
+    atomicAdd(dL_dgauss2screen[base + 3u], v.w);
+}
+
+void main() {
+    uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    if (pixel_x >= ubo.W || pixel_y >= ubo.H) return;
+
+    uint px = pixel_y * ubo.W + pixel_x;
+    uint HW = ubo.W * ubo.H;
+    uint tile_id = gl_WorkGroupID.y * ubo.num_tiles_x + gl_WorkGroupID.x;
+    uint range_start = tile_ranges[tile_id * 2u + 0u];
+    uint range_end = tile_ranges[tile_id * 2u + 1u];
+    uint total = range_end - range_start;
+
+    uint last_contributor = n_contrib[px];
+    if (last_contributor == 0u) return;
+    bool use_replay_order = (ubo._pad != 0u);
+    uint replay_start = use_replay_order ? replay_order_offsets[px] : 0u;
+    total = use_replay_order ? last_contributor : total;
+    uint contributor = total;
+
+    float T = T_final[px];
+    float final_T = T;
+    vec3 dL_dpixel = vec3(dL_dpixels[0u * HW + px],
+                          dL_dpixels[1u * HW + px],
+                          dL_dpixels[2u * HW + px]);
+    vec3 accum_rec = vec3(0.0);
+    vec3 last_color = vec3(0.0);
+    float last_alpha = 0.0;
+    float bg_dot_dpixel = dot(ubo.bg_color, dL_dpixel) + rendered_image[0u * HW + px] * 0.0;
+    vec2 pixf = vec2(float(pixel_x), float(pixel_y));
+
+    for (uint offset = 0u; offset < total; ++offset) {
+        contributor -= 1u;
+        if (!use_replay_order && contributor >= last_contributor) continue;
+        uint gid = use_replay_order
+            ? replay_order_gids[replay_start + contributor]
+            : values_sorted[range_start + contributor];
+        vec4 row0 = g2s_row(gid, 0u);
+        vec4 row1 = g2s_row(gid, 1u);
+        vec4 row2 = g2s_row(gid, 2u);
+        vec4 row3 = g2s_row(gid, 3u);
+
+        vec4 plane_x = row0 - row3 * pixf.x;
+        vec4 plane_y = row1 - row3 * pixf.y;
+        vec4 max_pos;
+        float distance = maxContribRayPixel(plane_x, plane_y, max_pos);
+        float power = -0.5 * distance;
+        if (power > 0.0) continue;
+
+        float G = exp(power);
+        float opacity = conic_opacity[gid * 4u + 3u];
+        float alpha = min(0.99, opacity * G);
+        if (alpha < ALPHA_THRESHOLD) continue;
+
+        float z_ndc = dot(row2, max_pos);
+        float w_ndc = dot(row3, max_pos);
+        if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+        T = T / (1.0 - alpha);
+        float dchannel_dcolor = alpha * T;
+        vec3 color = vec3(colors[gid * 3u + 0u],
+                          colors[gid * 3u + 1u],
+                          colors[gid * 3u + 2u]);
+
+        accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec;
+        float dL_dalpha = dot(color - accum_rec, dL_dpixel);
+        last_color = color;
+
+        atomicAdd(dL_dcolors[gid * 3u + 0u], dchannel_dcolor * dL_dpixel.x);
+        atomicAdd(dL_dcolors[gid * 3u + 1u], dchannel_dcolor * dL_dpixel.y);
+        atomicAdd(dL_dcolors[gid * 3u + 2u], dchannel_dcolor * dL_dpixel.z);
+
+        dL_dalpha *= T;
+        last_alpha = alpha;
+        dL_dalpha += (-final_T / (1.0 - alpha)) * bg_dot_dpixel;
+
+        float dL_dG = opacity * dL_dalpha;
+        vec3 n_x = plane_x.xyz;
+        vec3 n_y = plane_y.xyz;
+        float d_x = plane_x.w;
+        float d_y = plane_y.w;
+        vec3 m = d_x * n_y - d_y * n_x;
+        vec3 d = cross(n_x, n_y);
+        float d_2 = dot(d, d);
+        if (d_2 >= 1e-8) {
+            float m_2 = dot(m, m);
+            float n_x_2 = dot(n_x, n_x);
+            float n_y_2 = dot(n_y, n_y);
+            float n_xy = dot(n_x, n_y);
+            float n_y_m = dot(n_y, m);
+            float n_x_m = dot(n_x, m);
+
+            vec3 dd_dT0 = n_y_2 * n_x - n_xy * n_y;
+            vec3 dd_dT1 = n_x_2 * n_y - n_xy * n_x;
+            vec3 dd_dT3 = n_xy * (pixf.y * n_x + pixf.x * n_y)
+                         - pixf.x * n_y_2 * n_x
+                         - pixf.y * n_x_2 * n_y;
+            vec4 dd_dT_u = vec4(dd_dT0.x, dd_dT1.x, 0.0, dd_dT3.x);
+            vec4 dd_dT_v = vec4(dd_dT0.y, dd_dT1.y, 0.0, dd_dT3.y);
+            vec4 dd_dT_w = vec4(dd_dT0.z, dd_dT1.z, 0.0, dd_dT3.z);
+
+            vec3 dm_dT0 = -d_y * m;
+            vec3 dm_dT1 = d_x * m;
+            vec3 dm_dT3 = (d_y * pixf.x - d_x * pixf.y) * m;
+            vec4 dm_dT_u = vec4(dm_dT0.x, dm_dT1.x, 0.0, dm_dT3.x);
+            vec4 dm_dT_v = vec4(dm_dT0.y, dm_dT1.y, 0.0, dm_dT3.y);
+            vec4 dm_dT_w = vec4(dm_dT0.z, dm_dT1.z, 0.0, dm_dT3.z);
+            vec4 dm_dT_mu = vec4(n_y_m, -n_x_m, 0.0,
+                                  pixf.y * n_x_m - pixf.x * n_y_m);
+
+            float inv_d2 = 1.0 / d_2;
+            float grad_scale = dL_dG * G;
+            vec4 dG_dT_u = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_u - dm_dT_u * inv_d2);
+            vec4 dG_dT_v = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_v - dm_dT_v * inv_d2);
+            vec4 dG_dT_w = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_w - dm_dT_w * inv_d2);
+            vec4 dG_dT_mu = grad_scale * (-dm_dT_mu * inv_d2);
+
+            atomicAddG2S(gid, 0u, dG_dT_u);
+            atomicAddG2S(gid, 1u, dG_dT_v);
+            atomicAddG2S(gid, 2u, dG_dT_w);
+            atomicAddG2S(gid, 3u, dG_dT_mu);
+        }
+
+        atomicAdd(dL_dopacity[gid], G * dL_dalpha);
+    }
+}

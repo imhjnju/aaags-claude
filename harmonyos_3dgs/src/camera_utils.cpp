@@ -16,6 +16,11 @@ void buildLookAt(const float eye[3], const float center[3], const float up[3],
     // Forward = normalize(center - eye)
     float f[3] = {center[0]-eye[0], center[1]-eye[1], center[2]-eye[2]};
     float flen = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    if (flen < 1e-8f) {  // degenerate: eye == center
+        std::fill(view_matrix, view_matrix + 16, 0.0f);
+        view_matrix[0] = view_matrix[5] = view_matrix[10] = view_matrix[15] = 1.0f;
+        return;
+    }
     f[0]/=flen; f[1]/=flen; f[2]/=flen;
 
     // Right = normalize(forward x up)
@@ -25,6 +30,11 @@ void buildLookAt(const float eye[3], const float center[3], const float up[3],
         f[0]*up[1] - f[1]*up[0]
     };
     float rlen = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+    if (rlen < 1e-8f) {  // degenerate: forward parallel to up
+        std::fill(view_matrix, view_matrix + 16, 0.0f);
+        view_matrix[0] = view_matrix[5] = view_matrix[10] = view_matrix[15] = 1.0f;
+        return;
+    }
     r[0]/=rlen; r[1]/=rlen; r[2]/=rlen;
 
     // True up = right x forward
@@ -92,6 +102,7 @@ Camera autoCamera(const GaussianData& g, int width, int height) {
     float span_y = ys[p95] - ys[p5];
     float span_z = zs[p95] - zs[p5];
     float scene_radius = sqrtf(span_x*span_x + span_y*span_y + span_z*span_z) * 0.5f;
+    if (scene_radius < 1e-6f) scene_radius = 1.0f;  // fallback for tiny scenes
 
     printf("Scene center: (%.3f, %.3f, %.3f), radius: %.3f\n", cx, cy, cz, scene_radius);
 

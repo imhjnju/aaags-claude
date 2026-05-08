@@ -97,7 +97,7 @@ float rel_diff(float a, float b) {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny fixture — matches pattern from test_cpu_vk_compare.cpp.
+// Tiny fixture for VK-vs-Python-golden comparison.
 // N=20, SH degree 0, 64x64 image.
 // ---------------------------------------------------------------------------
 
@@ -208,8 +208,26 @@ VkTrainingConfig make_vk_tcfg() {
 //
 // After exactly 1 step, compare:
 //   - Loss against Python dump (< 1% rel_diff)
-//   - Each gradient group L2 norm against Python dump (< 5% rel_diff)
+//   - Each gradient group L2 norm against Python dump (< 0.1% rel_diff)
+//   - Each gradient group per-element max rel_diff (< 0.01%) unless abs_diff is at FP noise floor
 //   - Each param group L2 norm after Adam against Python dump (< 1% rel_diff)
+//
+// Sensitivity rationale (2026-04-25, Phase D.deep tightening):
+//   The previous 5% L2-norm threshold was masking real noise — at step 1,
+//   actual L2-norm rel_diff is ~4e-7 (printed as "0.0000" under %.4f), so
+//   any sub-percent drift slid through silently. Tightening to <1e-3 makes
+//   this bar a real signal: forward loss already matches at <1e-6, so the
+//   backward L2 should match the same magnitude or closer.
+//
+//   Per-element max rel_diff <1e-4 exposes the atomicAdd noise floor in
+//   src/vulkan/shaders/rasterize_backward.comp at lines 252,282,284,297,
+//   299,301,305 (per-Gaussian gradient atomics over tile workers). Near-zero
+//   gradients are judged by abs_diff as well, because sub-5e-9 atomic/cancellation
+//   noise can exceed the relative bar without indicating trajectory drift.
+//
+//   TODO(deterministic-backward): when atomicAdd is replaced with a
+//   deterministic two-phase reduction (per-tile partials + serial reduce),
+//   both the L2-norm and per-element bars should pass at <1e-5.
 // ---------------------------------------------------------------------------
 
 TEST(VkVsPyReference, Step1GradientAndLoss) {
@@ -296,20 +314,63 @@ TEST(VkVsPyReference, Step1GradientAndLoss) {
         { "opacities", py_grad_op,  vk_grad_op  },
     };
 
-    std::cout << "\n[Step 1 Gradient L2 norms]\n";
-    std::cout << "Group       py_norm      vk_norm      rel_diff\n";
-    std::cout << "----------  -----------  -----------  --------\n";
+    // Per-element max rel_diff helper (denominator floor avoids div-by-zero
+    // on near-zero gradients). Returns {worst_rel_diff, worst_idx, worst_abs_diff}
+    // — abs_diff at the worst-rel_diff index lets diagnostics distinguish
+    // FP-floor noise (small abs on near-zero py) from real bugs (large abs).
+    auto max_elem_rel_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+        float worst = 0.0f, worst_abs = 0.0f;
+        size_t worst_idx = 0;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            const float ad = std::fabs(a[i] - b[i]);
+            const float denom = std::max(std::fabs(b[i]), 1e-8f);
+            const float rd = ad / denom;
+            if (rd > worst) { worst = rd; worst_abs = ad; worst_idx = i; }
+        }
+        return std::make_tuple(worst, worst_idx, worst_abs);
+    };
+
+    // Tightened assertion bars (Phase D.deep, 2026-04-25):
+    //   L2-norm rel_diff < 1e-3  — bulk parity bar; forward loss already < 1e-6
+    //   per-element max  < 1e-4  — meaningful per-element parity bar
+    //   abs_diff         < 5e-9   — FP-floor escape hatch for near-zero gradients
+    constexpr float kGradL2Tol         = 1e-3f;
+    constexpr float kGradElemTol       = 1e-4f;
+    constexpr float kGradElemAbsTol    = 5e-9f;
+
+    std::cout << "\n[Step 1 Gradient L2 norms + per-element max rel_diff (with abs_diff)]\n";
+    std::cout << "Group       py_norm        vk_norm        L2_rel_diff   max_elem_rd   abs_at_worst  worst_idx  py[idx]        vk[idx]\n";
+    std::cout << "----------  -------------  -------------  ------------  ------------  ------------  ---------  -------------  -------------\n";
     for (const auto& gg : grad_groups) {
         float pn = l2_norm(gg.py);
         float vn = l2_norm(gg.vk);
         float rd = rel_diff(pn, vn);
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "%-10s  %.6e  %.6e  %.4f %s\n",
-                      gg.name, pn, vn, rd, rd > 0.05f ? "MISMATCH" : "OK");
+        auto [er, ei, ea] = max_elem_rel_diff(gg.vk, gg.py);
+        const float py_at = (ei < gg.py.size()) ? gg.py[ei] : 0.0f;
+        const float vk_at = (ei < gg.vk.size()) ? gg.vk[ei] : 0.0f;
+        const bool norm_ok = (rd < kGradL2Tol);
+        const bool elem_ok = (er < kGradElemTol) || (ea < kGradElemAbsTol);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "%-10s  %.6e  %.6e  %.6e  %.6e  %.6e  %9zu  %+.6e  %+.6e %s%s\n",
+                      gg.name, pn, vn, rd, er, ea, ei, py_at, vk_at,
+                      norm_ok ? "" : " [L2-FAIL]",
+                      elem_ok ? "" : " [ELEM-FAIL]");
         std::cout << buf;
-        EXPECT_LT(rd, 0.05f)
-            << "Gradient " << gg.name << " norm mismatch: py=" << pn
-            << " vk=" << vn << " rel_diff=" << rd;
+
+        EXPECT_LT(rd, kGradL2Tol)
+            << "Gradient " << gg.name << " L2-norm mismatch: py=" << pn
+            << " vk=" << vn << " rel_diff=" << rd
+            << " (threshold=" << kGradL2Tol << ")";
+        EXPECT_TRUE(elem_ok)
+            << "Gradient " << gg.name << " per-element max rel_diff=" << er
+            << " at idx=" << ei
+            << " (py=" << py_at << " vk=" << vk_at
+            << " abs_diff=" << std::fabs(vk_at - py_at) << ")"
+            << " thresholds: rel=" << kGradElemTol << " abs=" << kGradElemAbsTol
+            << " — likely atomicAdd nondeterminism in rasterize_backward.comp;"
+            << " see TODO(deterministic-backward).";
     }
 
     // --- Post-Adam param norm comparison ---
@@ -335,14 +396,14 @@ TEST(VkVsPyReference, Step1GradientAndLoss) {
     };
 
     std::cout << "\n[Step 1 Post-Adam Param L2 norms]\n";
-    std::cout << "Group       py_norm      vk_norm      rel_diff\n";
-    std::cout << "----------  -----------  -----------  --------\n";
+    std::cout << "Group       py_norm        vk_norm        rel_diff\n";
+    std::cout << "----------  -------------  -------------  ------------\n";
     for (const auto& pg : param_groups) {
         float pn = l2_norm(pg.py);
         float vn = l2_norm(pg.vk, pg.n);
         float rd = rel_diff(pn, vn);
         char buf[160];
-        std::snprintf(buf, sizeof(buf), "%-10s  %.6e  %.6e  %.4f %s\n",
+        std::snprintf(buf, sizeof(buf), "%-10s  %.6e  %.6e  %.6e %s\n",
                       pg.name, pn, vn, rd, rd > 0.01f ? "MISMATCH" : "OK");
         std::cout << buf;
         EXPECT_LT(rd, 0.01f)
@@ -768,6 +829,199 @@ TEST(VkVsPyReference, OraclePerStepComparison) {
 }
 
 // ---------------------------------------------------------------------------
+// TEMP DIAGNOSTIC — Phase D.deep step-1 audit
+// Step1ForwardIntermediateAudit
+//
+// Compares VK forward intermediates against Python reference (newly dumped via
+// `python tools/dump_tiny_reference.py --steps 1 --dump-step1-intermediates`).
+//
+// Goal: identify the FIRST forward stage where VK and Python diverge.
+// If all forward intermediates match (sub-ULP), divergence is in backward only,
+// and we can narrow the hunt to backward shaders / activation chain rule.
+// ---------------------------------------------------------------------------
+TEST(VkVsPyReference, Step1ForwardIntermediateAudit) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists()) GTEST_SKIP() << "Python dump missing.";
+    const std::string pr = py_ref_dir();
+    if (!std::filesystem::exists(pr + "/step_0001_int_means2D.npy"))
+        GTEST_SKIP() << "Step-1 intermediates missing — run: "
+                        "python tools/dump_tiny_reference.py --steps 1 --dump-step1-intermediates";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load());
+
+    VkTrainingConfig tcfg = make_vk_tcfg();
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, tcfg);
+    trainer.enable_intermediate_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+    (void)vk_loss;
+
+    // Helpers
+    auto compare_vec = [](const char* name,
+                          const float* vk, const float* py, int n,
+                          float tol_norm = 1e-6f, float tol_elem = 1e-5f) {
+        double vk_norm = 0.0, py_norm = 0.0, diff_norm = 0.0;
+        float worst_rel = 0.0f, worst_abs = 0.0f;
+        int worst_idx = -1;
+        for (int i = 0; i < n; ++i) {
+            const double vd = vk[i], pd = py[i];
+            vk_norm += vd*vd; py_norm += pd*pd;
+            const double d = vd - pd; diff_norm += d*d;
+            const float ad = std::fabs((float)d);
+            const float denom = std::max(std::fabs((float)pd), 1e-8f);
+            const float rd = ad / denom;
+            if (rd > worst_rel) { worst_rel = rd; worst_idx = i; worst_abs = ad; }
+        }
+        const double l2_rel_diff = std::sqrt(diff_norm) / std::max(std::sqrt(py_norm), 1e-12);
+        const bool norm_ok = (l2_rel_diff < tol_norm);
+        const bool elem_ok = (worst_rel  < tol_elem);
+        char buf[300];
+        std::snprintf(buf, sizeof(buf),
+            "%-22s  n=%-7d  l2_rel=%.3e  max_elem_rd=%.3e  worst_idx=%-6d  worst_abs=%.3e  %s%s\n",
+            name, n, l2_rel_diff, worst_rel, worst_idx, worst_abs,
+            norm_ok ? "" : "[NORM-FAIL] ",
+            elem_ok ? "" : "[ELEM-FAIL]");
+        std::cout << buf;
+    };
+
+    std::cout << "\n=== Step-1 Forward Intermediate Audit (VK vs Python) ===\n";
+    std::cout << "Stage                   n         l2_rel       max_elem_rd  worst_idx  worst_abs   flags\n";
+    std::cout << "----------------------  --------  -----------  -----------  ---------  ----------  -----\n";
+
+    const int N = scene.N;
+    const int HW = scene.H * scene.W;
+    const int HW3 = HW * 3;
+
+    // 1. means2D — VK [N*2] vs Python [N,2]
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_means2D.npy"));
+        const auto& vk = trainer.captured_means2D();
+        ASSERT_EQ((int)vk.size(), N*2);
+        compare_vec("means2D", vk.data(), py.data(), N*2);
+    }
+    // 2. RGB
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_rgb.npy"));
+        const auto& vk = trainer.captured_rgb();
+        ASSERT_EQ((int)vk.size(), N*3);
+        compare_vec("rgb", vk.data(), py.data(), N*3);
+    }
+    // 3. conic + opacity packed [N*4] {a,b,c,opacity}; compare a,b,c vs Python conic [N,3]
+    {
+        auto py_conic = npy_to_f32(load_npy(pr + "/step_0001_int_conic.npy"));
+        auto py_opa   = npy_to_f32(load_npy(pr + "/step_0001_int_act_op.npy"));
+        const auto& vk_packed = trainer.captured_conic_opacity();
+        ASSERT_EQ((int)vk_packed.size(), N*4);
+        // Unpack VK conic-only and opacity-only
+        std::vector<float> vk_conic(N*3), vk_opa(N);
+        for (int i = 0; i < N; ++i) {
+            vk_conic[i*3+0] = vk_packed[i*4+0];
+            vk_conic[i*3+1] = vk_packed[i*4+1];
+            vk_conic[i*3+2] = vk_packed[i*4+2];
+            vk_opa[i]       = vk_packed[i*4+3];
+        }
+        compare_vec("conic (a,b,c)", vk_conic.data(), py_conic.data(), N*3);
+        compare_vec("act_opacity (packed)", vk_opa.data(), py_opa.data(), N);
+    }
+    // 4. T_final — VK [H*W] vs Python [H*W]  -- Python is HW already
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_T_final.npy"));
+        const auto& vk = trainer.captured_T_final();
+        if ((int)vk.size() == HW) {
+            compare_vec("T_final", vk.data(), py.data(), HW);
+        } else {
+            std::cout << "T_final: VK size=" << vk.size() << " Python size=" << py.size()
+                      << " — size mismatch, skipping\n";
+        }
+    }
+    // 5. rendered_image — VK CHW vs Python CHW
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_rendered.npy"));
+        const float* vk = trainer.rendered_image();
+        compare_vec("rendered_image (CHW)", vk, py.data(), HW3);
+    }
+    // 6. dL_dimage — analytic: sign(rendered - target) / numel
+    //    Compare VK's internal dL/dpixels (not exposed) — instead compute analytically
+    //    on both sides and confirm they match.
+    {
+        auto py_dL = npy_to_f32(load_npy(pr + "/step_0001_int_dLdimage.npy"));
+        // Compute analytic dL/d(image) from VK rendered_image
+        const float* vk_img = trainer.rendered_image();
+        std::vector<float> vk_dL(HW3);
+        const float numel = static_cast<float>(HW3);
+        for (int i = 0; i < HW3; ++i) {
+            const float d = vk_img[i] - target[i];
+            // mean(|x|) -> dL/dx = sign(x) / numel; sign(0) = 0
+            float s = 0.0f;
+            if (d > 0) s = 1.0f / numel;
+            else if (d < 0) s = -1.0f / numel;
+            vk_dL[i] = s;
+        }
+        compare_vec("dL_dimage (analytic)", vk_dL.data(), py_dL.data(), HW3);
+    }
+
+    // Activation parity (raw -> activated)
+    // 7. act_opacities (sigmoid) — already compared above as "act_opacity (packed)"
+    // 8. act_scales (exp) — VK doesn't expose act_scales_ publicly, compute on test side.
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_act_scales.npy"));
+        std::vector<float> vk_act_sc(N*3);
+        const RawGaussianParams& vp = trainer.raw_params();
+        for (int i = 0; i < N*3; ++i) vk_act_sc[i] = std::exp(vp.raw_scales[i]);
+        // BUT — at this point trainer.raw_params() is POST-Adam-step.
+        // To compare activation, we use the input scene's raw scales (pre-Adam).
+        for (int i = 0; i < N*3; ++i) vk_act_sc[i] = std::exp(scene.raw_scales[i]);
+        compare_vec("act_scales (exp)", vk_act_sc.data(), py.data(), N*3);
+    }
+    // 9. act_rotations (normalize) — use raw_rotations_ pre-Adam
+    {
+        auto py = npy_to_f32(load_npy(pr + "/step_0001_int_act_rotations.npy"));
+        std::vector<float> vk_act_rot(N*4);
+        for (int i = 0; i < N; ++i) {
+            float r = scene.raw_rotations[i*4+0];
+            float x = scene.raw_rotations[i*4+1];
+            float y = scene.raw_rotations[i*4+2];
+            float z = scene.raw_rotations[i*4+3];
+            float len = std::sqrt(r*r + x*x + y*y + z*z);
+            if (len < 1e-12f) len = 1e-12f;
+            vk_act_rot[i*4+0] = r/len; vk_act_rot[i*4+1] = x/len;
+            vk_act_rot[i*4+2] = y/len; vk_act_rot[i*4+3] = z/len;
+        }
+        compare_vec("act_rotations (normalize)", vk_act_rot.data(), py.data(), N*4);
+    }
+
+    // visible mask (int32) — show count of true and any disagreement count.
+    {
+        auto py_vis = load_npy(pr + "/step_0001_int_visible.npy");
+        ASSERT_EQ(py_vis.dtype, NpyDtype::int32);
+        const int32_t* pv = reinterpret_cast<const int32_t*>(py_vis.raw.data());
+        const auto& vk_radii = trainer.captured_radii();
+        int py_visible_count = 0;
+        for (int i = 0; i < N; ++i) py_visible_count += pv[i] ? 1 : 0;
+        int vk_visible_count = 0;
+        for (int i = 0; i < N; ++i) vk_visible_count += (vk_radii[i] > 0) ? 1 : 0;
+        int disagree = 0;
+        for (int i = 0; i < N; ++i) {
+            bool py_v = pv[i] != 0;
+            bool vk_v = vk_radii[i] > 0;
+            if (py_v != vk_v) ++disagree;
+        }
+        std::cout << "visibility:           py_visible=" << py_visible_count
+                  << " vk_visible=" << vk_visible_count
+                  << " disagree=" << disagree << "\n";
+    }
+
+    SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic: element-wise print for worst grot/gpos steps
 // ---------------------------------------------------------------------------
 TEST(VkVsPyReference, DiagnosticElemwiseWorstSteps) {
@@ -868,4 +1122,832 @@ TEST(VkVsPyReference, DiagnosticElemwiseWorstSteps) {
         printf("  max rel_diff=%.4f%% at idx %d\n", max_rd*100.f, worst_i);
     }
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// Test: Step3PostAdamSHParity — regression sentinel for the SH Adam-group
+//       layout bug.
+//
+// HISTORY (Phase D.deep, 2026-04-25):
+//   This test is the graduated form of TempDiag3StepSHCompare, originally
+//   a print-only diagnostic added during the SH bug investigation. The bug
+//   was: SH DC coefficients were fed to the Adam optimizer as a separate
+//   group ("sh_dc") that gets gathered/scattered between the interleaved
+//   [N, K, 3] storage layout and a contiguous [N, 3] DC view; an earlier
+//   version of vulkan_trainer.cpp (sh_gather_dc / sh_scatter_dc, see
+//   src/vulkan_trainer.cpp:45,65,196,309,311,575,644,649,864) had the
+//   stride wrong, which produced raw_sh post-Adam rel_diff up to ~469%
+//   on G[2] DC after step 1.
+//
+//   After the fix, post-Adam SH per-element max rel_diff falls to ~0.015%
+//   (1.5e-4) at steps 1..3 with margin. Threshold below = 1e-3, ~67x the
+//   current observation, comfortably above FP noise but ~3000x below the
+//   pre-fix bug magnitude — so a regression of the gather/scatter stride
+//   bug will trigger this assertion immediately.
+//
+//   Also asserts the SH gradient L2-norm parity (the upstream half of the
+//   same bug class — if the backward gather is wrong, grad L2 drifts).
+//
+// Evidence cited in this comment:
+//   - vulkan_trainer.cpp sh_gather_dc / sh_scatter_dc (lines noted above)
+//   - dev_notes/vk_initial_loss_mismatch_s10.md (root-cause investigation)
+//   - Pre-fix observation: 469% rel_diff at G[2].DC post-Adam
+//   - Post-fix observation (steps 1..3): worst SH per-elem rel_diff <= 1.5e-4
+// ---------------------------------------------------------------------------
+
+TEST(VkVsPyReference, Step3PostAdamSHParity) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists()) GTEST_SKIP() << "Python dump missing.";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load());
+
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, make_vk_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const int N = scene.N;
+    const int MC3 = scene.max_coeffs * 3;
+
+    // worst-element finder that returns BOTH rel_diff AND abs_diff at the
+    // worst-rel_diff index (plus py/vk values), so we can disambiguate
+    // FP-floor noise (small abs_diff on near-zero py value) from real bugs
+    // (large abs_diff). See header comment of struct WorstElem below.
+    auto worst_elem = [](const float* vk, const float* py, int n) {
+        struct R { float rel_diff; float abs_diff; int idx; float py_value; float vk_value; };
+        R w{0.f, 0.f, -1, 0.f, 0.f};
+        for (int i = 0; i < n; ++i) {
+            const float ad = std::fabs(vk[i] - py[i]);
+            const float denom = std::max(std::fabs(py[i]), 1e-8f);
+            const float rd = ad / denom;
+            if (rd > w.rel_diff) { w.rel_diff = rd; w.abs_diff = ad; w.idx = i; w.py_value = py[i]; w.vk_value = vk[i]; }
+        }
+        return w;
+    };
+
+    // Per-step worst rel_diff for post-Adam SH and SH grad — we assert these
+    // after the loop so the print log shows all 3 steps even on failure.
+    float worst_post_rd[3] = {0,0,0};
+    float worst_grad_rd[3] = {0,0,0};
+
+    for (int step = 1; step <= 3; ++step) {
+        char sp[256];
+        std::snprintf(sp, sizeof(sp), "%s/step_%04d", py_ref_dir().c_str(), step);
+        std::string ssp(sp);
+        auto py_grad_sh = npy_to_f32(load_npy(ssp + "_grad_sh.npy"));
+        auto py_raw_sh  = npy_to_f32(load_npy(ssp + "_raw_sh.npy"));
+        float py_loss   = npy_scalar(ssp + "_loss.npy");
+
+        float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+
+        printf("\n=== STEP %d ===\n", step);
+        printf("  loss: py=%.8e vk=%.8e rel_diff=%.4e\n", py_loss, vk_loss,
+               std::fabs(py_loss-vk_loss)/std::max(std::fabs(py_loss),1e-12f));
+
+        const auto& vk_grad_sh = trainer.captured_grad_sh();
+        const auto& vk_raw     = trainer.raw_params();
+        const float* vk_raw_sh = vk_raw.raw_sh_coeffs;
+
+        // Print G[0..3] DC for both grad and post-Adam param.
+        for (int g = 0; g < 4; ++g) {
+            printf("  G[%d] DC: py=%+.6e %+.6e %+.6e | vk=%+.6e %+.6e %+.6e | diff=%+.3e %+.3e %+.3e\n",
+                   g,
+                   py_raw_sh[g*MC3+0], py_raw_sh[g*MC3+1], py_raw_sh[g*MC3+2],
+                   vk_raw_sh[g*MC3+0], vk_raw_sh[g*MC3+1], vk_raw_sh[g*MC3+2],
+                   py_raw_sh[g*MC3+0]-vk_raw_sh[g*MC3+0],
+                   py_raw_sh[g*MC3+1]-vk_raw_sh[g*MC3+1],
+                   py_raw_sh[g*MC3+2]-vk_raw_sh[g*MC3+2]);
+        }
+
+        // post-Adam raw_sh worst element (rel + abs)
+        auto wp = worst_elem(vk_raw_sh, py_raw_sh.data(), N*MC3);
+        printf("  raw_sh   worst rel=%.4e abs=%.4e at idx=%d (G=%d, sh=%d), py=%+.6e vk=%+.6e\n",
+               wp.rel_diff, wp.abs_diff, wp.idx, wp.idx/MC3, wp.idx%MC3,
+               wp.py_value, wp.vk_value);
+
+        // grad_sh worst element (rel + abs)
+        auto wg = worst_elem(vk_grad_sh.data(), py_grad_sh.data(), N*MC3);
+        printf("  grad_sh  worst rel=%.4e abs=%.4e at idx=%d (G=%d, sh=%d), py=%+.6e vk=%+.6e\n",
+               wg.rel_diff, wg.abs_diff, wg.idx, wg.idx/MC3, wg.idx%MC3,
+               wg.py_value, wg.vk_value);
+
+        worst_post_rd[step-1] = wp.rel_diff;
+        worst_grad_rd[step-1] = wg.rel_diff;
+    }
+
+    // Threshold rationale:
+    //   Post-fix observation across steps 1..3: worst per-elem rel_diff
+    //   on post-Adam SH ~1.5e-4, on grad SH ~1e-5. Threshold = 1e-3 gives
+    //   ~7x margin over current observation but is ~3000x tighter than the
+    //   pre-fix 469% bug — sufficient to catch a regression of the SH
+    //   gather/scatter stride bug.
+    constexpr float kSHRelTol = 1e-3f;
+    EXPECT_LT(worst_post_rd[0], kSHRelTol)
+        << "Step-1 post-Adam SH per-elem rel_diff regression — possible SH "
+           "Adam-group layout bug; see vulkan_trainer.cpp sh_gather_dc/scatter_dc.";
+    EXPECT_LT(worst_post_rd[1], kSHRelTol)
+        << "Step-2 post-Adam SH per-elem rel_diff regression — possible SH "
+           "Adam-group layout bug; see vulkan_trainer.cpp sh_gather_dc/scatter_dc.";
+    EXPECT_LT(worst_post_rd[2], kSHRelTol)
+        << "Step-3 post-Adam SH per-elem rel_diff regression — possible SH "
+           "Adam-group layout bug; see vulkan_trainer.cpp sh_gather_dc/scatter_dc.";
+    EXPECT_LT(worst_grad_rd[0], kSHRelTol)
+        << "Step-1 SH gradient per-elem rel_diff regression (backward gather).";
+    EXPECT_LT(worst_grad_rd[1], kSHRelTol)
+        << "Step-2 SH gradient per-elem rel_diff regression.";
+    EXPECT_LT(worst_grad_rd[2], kSHRelTol)
+        << "Step-3 SH gradient per-elem rel_diff regression.";
+}
+
+// ---------------------------------------------------------------------------
+// Test: Step10TrajectoryAllGroups — 10-step trajectory regression sentinel.
+//
+// HISTORY (Phase D.deep, 2026-04-25):
+//   Graduated from TempDiag10StepAllGroups (originally print-only). Captures,
+//   per step (1..10), for all 5 param groups (pos, rot, sca, sh, op):
+//     - VK loss vs Python loss (rel_diff)
+//     - Gradient L2-norm rel_diff + per-element max rel_diff (worst gid+comp)
+//     - Post-Adam param L2-norm rel_diff + per-element max rel_diff
+//   Asserts AT STEP 10 that all groups remain within the calibrated bounds
+//   below — this catches both bounded growth regressions (loss / L2 drift)
+//   and Adam-group layout regressions (per-elem spikes).
+//
+// Threshold rationale (calibrated 2026-04-25 from post-SH-fix run):
+//   loss rel_diff @ step 10        observed 8.82e-6  -> threshold 5e-5  (~5.7x)
+//   gradient L2 rel_diff           observed 7.85e-6  -> threshold 5e-5  (~6.4x)
+//   gradient per-elem max          observed 3.51e-4  -> threshold 1e-3  (~2.8x)
+//                                  (gpos at step 10 — atomicAdd noise floor)
+//   post-Adam L2 rel_diff          observed 9.4e-6   -> threshold 5e-5  (~5.3x)
+//   post-Adam per-elem max         observed 1.75e-3  -> dual gate:
+//                                       abs_diff < 1e-2 OR rel_diff < 5e-3
+//
+//   Why dual gate on post-Adam per-elem max: opacity / SH coefficients can
+//   drift extremely close to zero across 10 Adam steps (Python uses fp32
+//   identically, but division-floor in rel_diff inflates noise on |py| < 1e-4
+//   into ratios that look large). The dual gate uses abs_diff to admit FP-
+//   floor noise but stays tight on real bugs (a layout regression produces
+//   abs_diff in the same magnitude as the value, so abs_diff > 1e-2 trips).
+//
+// Evidence cited:
+//   - Pre-graduation observed values (logged when this test was diagnostic)
+//   - vulkan_trainer.cpp Adam-group dispatch (sh_gather_dc/scatter_dc et al.)
+//   - dev_notes/vk_initial_loss_mismatch_s10.md
+// ---------------------------------------------------------------------------
+
+TEST(VkVsPyReference, Step10TrajectoryAllGroups) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!py_ref_exists()) GTEST_SKIP() << "Python dump missing.";
+
+    TinyScene scene;
+    ASSERT_TRUE(scene.load());
+
+    RenderConfig rcfg = scene.cfg;
+    rcfg.sh_degree = 0;
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H, make_vk_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    const int N   = scene.N;
+    const int MC3 = scene.max_coeffs * 3;
+
+    constexpr int N_STEPS = 10;
+
+    // For each step capture compact summary lines we then dump as tables at the end.
+    // GroupResult now also tracks abs_diff at the worst-rel_diff index, so we
+    // can disambiguate FP-floor noise (small abs on near-zero py) from real
+    // bugs (large abs).
+    struct GroupResult {
+        float py_norm   = 0.f;
+        float vk_norm   = 0.f;
+        float l2_rd     = 0.f;
+        float max_elem  = 0.f;   // worst rel_diff
+        float abs_at    = 0.f;   // abs_diff at the worst-rel_diff index
+        int   worst_idx = -1;
+        int   worst_g   = -1;
+        int   worst_c   = -1;
+        float py_at     = 0.f;
+        float vk_at     = 0.f;
+    };
+    struct StepResult {
+        float py_loss = 0.f, vk_loss = 0.f, loss_rd = 0.f;
+        GroupResult g_pos, g_rot, g_sca, g_sh, g_op;     // grads
+        GroupResult p_pos, p_rot, p_sca, p_sh, p_op;     // post-Adam params
+    };
+
+    auto eval_group = [&](const float* vk, const float* py, int n, int stride) {
+        GroupResult r;
+        // Norms.
+        float pa = 0.f, va = 0.f;
+        for (int i = 0; i < n; ++i) { pa += py[i]*py[i]; va += vk[i]*vk[i]; }
+        r.py_norm = std::sqrt(pa);
+        r.vk_norm = std::sqrt(va);
+        r.l2_rd   = std::fabs(r.py_norm - r.vk_norm) / std::max(r.py_norm, 1e-8f);
+        // Per-element max rel_diff with denom floor (matches Step1GradientAndLoss).
+        // Also retain abs_diff at the worst-rel_diff index for FP-floor disambiguation.
+        float worst = 0.f, worst_abs = 0.f; int worst_i = -1;
+        for (int i = 0; i < n; ++i) {
+            const float ad = std::fabs(vk[i] - py[i]);
+            const float denom = std::max(std::fabs(py[i]), 1e-8f);
+            const float rd = ad / denom;
+            if (rd > worst) { worst = rd; worst_abs = ad; worst_i = i; }
+        }
+        r.max_elem  = worst;
+        r.abs_at    = worst_abs;
+        r.worst_idx = worst_i;
+        if (worst_i >= 0) {
+            r.worst_g = worst_i / stride;
+            r.worst_c = worst_i % stride;
+            r.py_at   = py[worst_i];
+            r.vk_at   = vk[worst_i];
+        }
+        return r;
+    };
+
+    std::vector<StepResult> results(N_STEPS);
+
+    for (int step = 1; step <= N_STEPS; ++step) {
+        // Run 1 VK step (cumulative — preserves Adam state; mirrors Python's training loop).
+        float vk_loss = trainer.step(scene.cam, rcfg, target.data(), scene.W, scene.H);
+        ASSERT_FALSE(std::isnan(vk_loss)) << "VK NaN at step " << step;
+        ASSERT_FALSE(std::isinf(vk_loss)) << "VK Inf at step " << step;
+
+        char sp[256];
+        std::snprintf(sp, sizeof(sp), "%s/step_%04d", py_ref_dir().c_str(), step);
+        std::string ssp(sp);
+
+        float py_loss   = npy_scalar(ssp + "_loss.npy");
+        auto py_g_pos   = npy_to_f32(load_npy(ssp + "_grad_pos.npy"));
+        auto py_g_sca   = npy_to_f32(load_npy(ssp + "_grad_sc.npy"));
+        auto py_g_rot   = npy_to_f32(load_npy(ssp + "_grad_rot.npy"));
+        auto py_g_sh    = npy_to_f32(load_npy(ssp + "_grad_sh.npy"));
+        auto py_g_op    = npy_to_f32(load_npy(ssp + "_grad_op.npy"));
+        auto py_r_pos   = npy_to_f32(load_npy(ssp + "_raw_pos.npy"));
+        auto py_r_sca   = npy_to_f32(load_npy(ssp + "_raw_sc.npy"));
+        auto py_r_rot   = npy_to_f32(load_npy(ssp + "_raw_rot.npy"));
+        auto py_r_sh    = npy_to_f32(load_npy(ssp + "_raw_sh.npy"));
+        auto py_r_op    = npy_to_f32(load_npy(ssp + "_raw_op.npy"));
+
+        const auto& vk_g_pos = trainer.captured_grad_positions();
+        const auto& vk_g_sca = trainer.captured_grad_scales();
+        const auto& vk_g_rot = trainer.captured_grad_rotations();
+        const auto& vk_g_sh  = trainer.captured_grad_sh();
+        const auto& vk_g_op  = trainer.captured_grad_opacities();
+
+        const RawGaussianParams& vk_p = trainer.raw_params();
+
+        StepResult& sr = results[step-1];
+        sr.py_loss = py_loss;
+        sr.vk_loss = vk_loss;
+        sr.loss_rd = std::fabs(py_loss - vk_loss) / std::max(std::fabs(py_loss), 1e-12f);
+
+        sr.g_pos = eval_group(vk_g_pos.data(), py_g_pos.data(), N*3,  3);
+        sr.g_rot = eval_group(vk_g_rot.data(), py_g_rot.data(), N*4,  4);
+        sr.g_sca = eval_group(vk_g_sca.data(), py_g_sca.data(), N*3,  3);
+        sr.g_sh  = eval_group(vk_g_sh.data(),  py_g_sh.data(),  N*MC3, MC3);
+        sr.g_op  = eval_group(vk_g_op.data(),  py_g_op.data(),  N,    1);
+
+        sr.p_pos = eval_group(vk_p.raw_positions, py_r_pos.data(), N*3,  3);
+        sr.p_rot = eval_group(vk_p.raw_rotations, py_r_rot.data(), N*4,  4);
+        sr.p_sca = eval_group(vk_p.raw_scales,    py_r_sca.data(), N*3,  3);
+        sr.p_sh  = eval_group(vk_p.raw_sh_coeffs, py_r_sh.data(),  N*MC3, MC3);
+        sr.p_op  = eval_group(vk_p.raw_opacities, py_r_op.data(),  N,    1);
+    }
+
+    // ---- Print 10-step trajectory tables ----
+    printf("\n=== 10-step trajectory: loss + per-group metrics (L2-norm rel_diff / per-elem max rel_diff) ===\n");
+    printf("\n[GRAD] L2 rel_diff / per-elem max rel_diff per step\n");
+    printf("Step  loss_rd      pos L2 / max         rot L2 / max         sca L2 / max         sh  L2 / max         op  L2 / max\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  %.3e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e\n",
+               s+1, r.loss_rd,
+               r.g_pos.l2_rd, r.g_pos.max_elem,
+               r.g_rot.l2_rd, r.g_rot.max_elem,
+               r.g_sca.l2_rd, r.g_sca.max_elem,
+               r.g_sh.l2_rd,  r.g_sh.max_elem,
+               r.g_op.l2_rd,  r.g_op.max_elem);
+    }
+
+    printf("\n[PARAM-post-Adam] L2 rel_diff / per-elem max rel_diff per step\n");
+    printf("Step  pos L2 / max         rot L2 / max         sca L2 / max         sh  L2 / max         op  L2 / max\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e\n",
+               s+1,
+               r.p_pos.l2_rd, r.p_pos.max_elem,
+               r.p_rot.l2_rd, r.p_rot.max_elem,
+               r.p_sca.l2_rd, r.p_sca.max_elem,
+               r.p_sh.l2_rd,  r.p_sh.max_elem,
+               r.p_op.l2_rd,  r.p_op.max_elem);
+    }
+
+    printf("\n[GRAD worst-gid+component per step] (rel | abs at worst index)\n");
+    printf("Step    pos                       rot                       sca                       sh                          op\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e\n",
+               s+1,
+               r.g_pos.worst_g, r.g_pos.worst_c, r.g_pos.max_elem, r.g_pos.abs_at,
+               r.g_rot.worst_g, r.g_rot.worst_c, r.g_rot.max_elem, r.g_rot.abs_at,
+               r.g_sca.worst_g, r.g_sca.worst_c, r.g_sca.max_elem, r.g_sca.abs_at,
+               r.g_sh.worst_g,  r.g_sh.worst_c,  r.g_sh.max_elem,  r.g_sh.abs_at,
+               r.g_op.worst_g,  r.g_op.worst_c,  r.g_op.max_elem,  r.g_op.abs_at);
+    }
+
+    printf("\n[PARAM worst-gid+component per step] (rel | abs at worst index, py | vk values)\n");
+    printf("Step    pos                       rot                       sca                       sh                          op\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e  G%d.%d r=%.2e a=%.2e\n",
+               s+1,
+               r.p_pos.worst_g, r.p_pos.worst_c, r.p_pos.max_elem, r.p_pos.abs_at,
+               r.p_rot.worst_g, r.p_rot.worst_c, r.p_rot.max_elem, r.p_rot.abs_at,
+               r.p_sca.worst_g, r.p_sca.worst_c, r.p_sca.max_elem, r.p_sca.abs_at,
+               r.p_sh.worst_g,  r.p_sh.worst_c,  r.p_sh.max_elem,  r.p_sh.abs_at,
+               r.p_op.worst_g,  r.p_op.worst_c,  r.p_op.max_elem,  r.p_op.abs_at);
+    }
+
+    // Detailed dump of the suspicious step-6 / step-7 spikes (step indices 5/6
+    // in zero-indexed array). Confirms whether the per-elem peaks are FP-floor
+    // (py ~0, abs tiny) or real bugs.
+    printf("\n[Spike detail step 6 (post-Adam op)]  py=%+.6e vk=%+.6e abs=%.4e rel=%.4e G%d.%d\n",
+           results[5].p_op.py_at, results[5].p_op.vk_at,
+           results[5].p_op.abs_at, results[5].p_op.max_elem,
+           results[5].p_op.worst_g, results[5].p_op.worst_c);
+    printf("[Spike detail step 7 (post-Adam sh)]   py=%+.6e vk=%+.6e abs=%.4e rel=%.4e G%d.%d\n",
+           results[6].p_sh.py_at, results[6].p_sh.vk_at,
+           results[6].p_sh.abs_at, results[6].p_sh.max_elem,
+           results[6].p_sh.worst_g, results[6].p_sh.worst_c);
+
+    // Summary: step 1, step 5, step 10 raw losses for sanity.
+    printf("\n[Summary loss values]\n");
+    for (int s : {1, 5, 10}) {
+        const auto& r = results[s-1];
+        printf("  step %2d: py=%.8e  vk=%.8e  rel_diff=%.4e\n",
+               s, r.py_loss, r.vk_loss, r.loss_rd);
+    }
+
+    // -----------------------------------------------------------------------
+    // ASSERTIONS at step 10 — calibrated thresholds (see test header comment).
+    //
+    // We assert at step 10 (the deepest trajectory point we trace) so that
+    // bugs which only manifest after several Adam updates are caught — a
+    // step-1 assertion misses bugs whose symptom takes a few steps to grow.
+    // -----------------------------------------------------------------------
+    const auto& r10 = results[N_STEPS - 1];
+
+    // Loss at step 10 — bounded growth bar.
+    EXPECT_LT(r10.loss_rd, 5e-5f)
+        << "Step-10 loss rel_diff drift: py=" << r10.py_loss
+        << " vk=" << r10.vk_loss << " rel_diff=" << r10.loss_rd;
+
+    // Gradient L2-norm rel_diff per group (bounded growth, tight bar).
+    constexpr float kGradL2Tol10  = 5e-5f;
+    EXPECT_LT(r10.g_pos.l2_rd, kGradL2Tol10) << "Step-10 grad pos L2 rel_diff drift.";
+    EXPECT_LT(r10.g_rot.l2_rd, kGradL2Tol10) << "Step-10 grad rot L2 rel_diff drift.";
+    EXPECT_LT(r10.g_sca.l2_rd, kGradL2Tol10) << "Step-10 grad sca L2 rel_diff drift.";
+    EXPECT_LT(r10.g_sh.l2_rd,  kGradL2Tol10) << "Step-10 grad sh  L2 rel_diff drift (SH layout sentinel).";
+    EXPECT_LT(r10.g_op.l2_rd,  kGradL2Tol10) << "Step-10 grad op  L2 rel_diff drift.";
+
+    // Gradient per-element max rel_diff at step 10.
+    // Threshold loosened to 1e-3 because gpos hits ~3.5e-4 here — the same
+    // atomicAdd nondeterminism flagged in Step1GradientAndLoss
+    // (rasterize_backward.comp:252,282,284,297,299,301,305).
+    constexpr float kGradElemTol10 = 1e-3f;
+    EXPECT_LT(r10.g_pos.max_elem, kGradElemTol10)
+        << "Step-10 grad pos per-elem rel_diff exceeds atomicAdd noise floor (abs="
+        << r10.g_pos.abs_at << " py=" << r10.g_pos.py_at << " vk=" << r10.g_pos.vk_at << ").";
+    EXPECT_LT(r10.g_rot.max_elem, kGradElemTol10) << "Step-10 grad rot per-elem.";
+    EXPECT_LT(r10.g_sca.max_elem, kGradElemTol10) << "Step-10 grad sca per-elem.";
+    EXPECT_LT(r10.g_sh.max_elem,  kGradElemTol10) << "Step-10 grad sh  per-elem (SH layout sentinel).";
+    EXPECT_LT(r10.g_op.max_elem,  kGradElemTol10) << "Step-10 grad op  per-elem.";
+
+    // Post-Adam param L2-norm rel_diff (bounded growth).
+    constexpr float kParamL2Tol10 = 5e-5f;
+    EXPECT_LT(r10.p_pos.l2_rd, kParamL2Tol10) << "Step-10 post-Adam pos L2 rel_diff drift.";
+    EXPECT_LT(r10.p_rot.l2_rd, kParamL2Tol10) << "Step-10 post-Adam rot L2 rel_diff drift.";
+    EXPECT_LT(r10.p_sca.l2_rd, kParamL2Tol10) << "Step-10 post-Adam sca L2 rel_diff drift.";
+    EXPECT_LT(r10.p_sh.l2_rd,  kParamL2Tol10) << "Step-10 post-Adam sh  L2 rel_diff drift (SH layout sentinel).";
+    EXPECT_LT(r10.p_op.l2_rd,  kParamL2Tol10) << "Step-10 post-Adam op  L2 rel_diff drift.";
+
+    // Post-Adam per-element max — DUAL GATE.
+    //   Pass if (abs_diff < 1e-2) OR (rel_diff < 5e-3).
+    //   Rationale: opacity / SH coefficients drift very close to zero after
+    //   10 Adam steps, so rel_diff is dominated by FP noise on near-zero
+    //   denominators. abs_diff < 1e-2 admits this noise but rejects real
+    //   bugs (a layout regression produces abs_diff comparable to the value
+    //   magnitude, which here is O(1) — abs_diff would be far above 1e-2).
+    auto check_dual = [](const char* name, const GroupResult& r) {
+        const bool ok = (r.abs_at < 1e-2f) || (r.max_elem < 5e-3f);
+        EXPECT_TRUE(ok)
+            << "Step-10 post-Adam " << name << " per-elem dual-gate failed: "
+            << "rel_diff=" << r.max_elem << " abs_diff=" << r.abs_at
+            << " (need abs<1e-2 OR rel<5e-3) "
+            << "py=" << r.py_at << " vk=" << r.vk_at
+            << " G" << r.worst_g << "." << r.worst_c;
+    };
+    check_dual("pos", r10.p_pos);
+    check_dual("rot", r10.p_rot);
+    check_dual("sca", r10.p_sca);
+    check_dual("sh",  r10.p_sh);
+    check_dual("op",  r10.p_op);
+}
+
+// ===========================================================================
+// TEMP DIAGNOSTIC — basketball ply downsampled parity
+//
+// Validates that the recent fixes (SH Adam-group layout, proper_ewa default
+// flip + Gate_P1_Means2D closure, det floor + frustum 1.3x clamp Python
+// alignment) hold at scale on the basketball point cloud (N=2892, sh_degree=3,
+// max_coeffs=16). Prior tiny fixture used N=20, sh_degree=0 only — a 145x
+// scale-up.
+//
+// Resolution: configured by python dumper (default 64x48). FOV is invariant
+// of resolution since the precomputed camera projection uses 1/tan_fovx,
+// 1/tan_fovy, so the same view/viewproj matrices are reused for any W,H.
+//
+// SH-degree-0 lock: forward_render_pytorch only evaluates DC, so we lock VK
+// SH evaluation to degree 0 (sh_degree_max=0, sh_degree_warmup=very large,
+// cfg.sh_degree=0). REST coefficients (k=1..15) are zero-initialized and
+// receive zero gradient on both sides, but the [N, 16, 3] storage layout +
+// Adam two-group split (DC lr=2.5e-3, REST lr=1.25e-4) is exercised
+// end-to-end — this is exactly the path the SH-layout fix at scale needs to
+// validate.
+//
+// Goldens directory: tests/golden/basketball_ds/. Generated by
+// `tools/dump_basketball_ds_reference.py`. The dumper saves:
+//   - input_viewmatrix.npy [16]              column-major view matrix
+//   - input_projmatrix.npy [16]              column-major viewproj matrix
+//   - input_campos.npy [3]                   camera world position
+//   - input_fov_size.npy [4]                 (tan_fovx, tan_fovy, W, H)
+//   - input_meta.npy [4]                     (sh_degree, max_coeffs, H, W)
+//   - init_raw_{pos,sc,rot,op,sh}.npy        initial raw params
+//   - target_image_chw.npy [3, H, W]         downsampled GT (CHW for VK loss)
+//   - step_NNNN_{loss,grad_*,raw_*}.npy      per-step Python autograd dump
+//
+// Test is GTEST_SKIP'd if goldens are not present (run dumper first).
+// ===========================================================================
+
+namespace {
+
+std::string basketball_ds_dir() {
+    return std::string(TEST_DATA_DIR) + "/golden/basketball_ds";
+}
+
+bool basketball_ds_exists() {
+    return std::filesystem::exists(basketball_ds_dir() + "/step_0001_loss.npy")
+        && std::filesystem::exists(basketball_ds_dir() + "/init_raw_pos.npy")
+        && std::filesystem::exists(basketball_ds_dir() + "/target_image_chw.npy");
+}
+
+// BasketballDsScene mirrors TinyScene but loads from the basketball_ds
+// goldens (precomputed init params + camera + downsampled GT).
+struct BasketballDsScene {
+    int N = 0, H = 0, W = 0;
+    int sh_degree = 0, max_coeffs = 0;
+    float tan_fovx = 0.f, tan_fovy = 0.f;
+
+    // Activated arrays (for GaussianData)
+    std::vector<float> act_positions, act_scales, act_rotations, act_opacities, act_sh;
+    // Raw arrays (for RawGaussianParams)
+    std::vector<float> raw_positions, raw_scales, raw_rotations, raw_opacities, raw_sh;
+    // CHW target image
+    std::vector<float> target_chw;
+
+    GaussianData      g{};
+    RawGaussianParams raw{};
+    Camera            cam{};
+    RenderConfig      cfg{};
+
+    bool load() {
+        const std::string root = basketball_ds_dir();
+        try {
+            auto vm  = load_npy(root + "/input_viewmatrix.npy");
+            auto pm  = load_npy(root + "/input_projmatrix.npy");
+            auto cp  = load_npy(root + "/input_campos.npy");
+            auto fov = load_npy(root + "/input_fov_size.npy");
+            auto met = load_npy(root + "/input_meta.npy");
+            auto rp  = load_npy(root + "/init_raw_pos.npy");
+            auto rs  = load_npy(root + "/init_raw_sc.npy");
+            auto rr  = load_npy(root + "/init_raw_rot.npy");
+            auto ro  = load_npy(root + "/init_raw_op.npy");
+            auto rsh = load_npy(root + "/init_raw_sh.npy");
+            auto tgt = load_npy(root + "/target_image_chw.npy");
+
+            sh_degree  = static_cast<int>(met.f32()[0]);
+            max_coeffs = static_cast<int>(met.f32()[1]);
+            H          = static_cast<int>(met.f32()[2]);
+            W          = static_cast<int>(met.f32()[3]);
+            tan_fovx   = fov.f32()[0];
+            tan_fovy   = fov.f32()[1];
+            N          = static_cast<int>(rp.shape[0]);
+
+            raw_positions = npy_to_f32(rp);
+            raw_scales    = npy_to_f32(rs);
+            raw_rotations = npy_to_f32(rr);
+            raw_opacities = npy_to_f32(ro);
+            raw_sh        = npy_to_f32(rsh);
+            target_chw    = npy_to_f32(tgt);
+
+            // Derive activated (positions = identity, scales = exp(raw),
+            // rotations = identity (already unit quat), opacities = sigmoid(raw),
+            // sh = identity).
+            act_positions = raw_positions;
+            act_scales.resize(static_cast<size_t>(N) * 3);
+            for (int i = 0; i < N * 3; ++i)
+                act_scales[static_cast<size_t>(i)] = std::exp(raw_scales[static_cast<size_t>(i)]);
+            act_rotations = raw_rotations;
+            act_opacities.resize(static_cast<size_t>(N));
+            for (int i = 0; i < N; ++i)
+                act_opacities[static_cast<size_t>(i)] =
+                    1.f / (1.f + std::exp(-raw_opacities[static_cast<size_t>(i)]));
+            act_sh = raw_sh;
+
+            g.count      = N;  g.sh_degree  = sh_degree;  g.max_coeffs = max_coeffs;
+            g.positions  = act_positions.data();   g.scales     = act_scales.data();
+            g.rotations  = act_rotations.data();   g.opacities  = act_opacities.data();
+            g.sh_coeffs  = act_sh.data();           g.filter_3D  = nullptr;
+
+            raw.count         = N;  raw.sh_degree  = sh_degree;  raw.max_coeffs = max_coeffs;
+            raw.raw_positions = raw_positions.data();  raw.raw_scales    = raw_scales.data();
+            raw.raw_rotations = raw_rotations.data();  raw.raw_sh_coeffs = raw_sh.data();
+            raw.raw_opacities = raw_opacities.data();
+
+            std::memcpy(cam.view_matrix,     vm.f32(), 16 * sizeof(float));
+            std::memcpy(cam.viewproj_matrix, pm.f32(), 16 * sizeof(float));
+            cam.cam_pos[0] = cp.f32()[0];  cam.cam_pos[1] = cp.f32()[1];
+            cam.cam_pos[2] = cp.f32()[2];
+            cam.tan_fovx   = tan_fovx; cam.tan_fovy   = tan_fovy;
+            cam.width      = W;        cam.height     = H;
+
+            cfg.sh_degree      = 0;       // lock to DC-only at render
+            cfg.training       = true;
+            cfg.eval_3D        = false;
+            cfg.tile_w         = 16;
+            cfg.tile_h         = 16;
+            cfg.antialiasing   = false;
+            cfg.scale_modifier = 1.0f;
+            cfg.bg_color[0] = cfg.bg_color[1] = cfg.bg_color[2] = 0.0f;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+VkTrainingConfig make_basketball_ds_tcfg() {
+    VkTrainingConfig tcfg;
+    tcfg.max_steps         = 30000;
+    tcfg.pos_lr_init       = 1.6e-4f;
+    tcfg.pos_lr_final      = 1.6e-6f;
+    tcfg.sh_degree_max     = 0;          // lock SH to DC-only (matches Python)
+    tcfg.sh_degree_warmup  = 100000;
+    tcfg.lambda_dssim      = 0.0f;       // pure L1
+    tcfg.opacity_reg       = 0.0f;
+    tcfg.scale_reg         = 0.0f;
+    tcfg.noise_lr          = 0.0f;
+    tcfg.densify_from_step = 0;          // no densification
+    tcfg.proper_ewa        = false;      // parity convention (matches Python clamp/det)
+    tcfg.eval_3D           = false;
+    tcfg.parity_mode       = false;
+    tcfg.spatial_lr_scale  = 1.0f;
+    return tcfg;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Test: BasketballDs.Trajectory10Steps
+//
+// Same per-step trajectory comparison as Step10TrajectoryAllGroups but on
+// basketball ply at downsampled resolution. Initially LENIENT thresholds —
+// these will be tightened after the first observation if results are clean.
+// The point is to detect REGRESSION at scale (N=2892), not enforce the same
+// tiny-fixture bounds (atomic noise floor is N-dependent).
+//
+// Initial bounds (will be refined after first run):
+//   loss rel_diff:           < 1e-2 at all steps
+//   grad L2 rel_diff:        < 1e-2
+//   grad per-elem max rd:    < 1e-1   (scale-dependent atomic noise)
+//   post-Adam L2 rel_diff:   < 1e-2
+//   post-Adam per-elem rd:   < 1e-1   (dual-gate with abs<1e-2)
+// ---------------------------------------------------------------------------
+
+TEST(BasketballDs, Trajectory10Steps) {
+    VulkanContext ctx;
+    if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
+    if (!basketball_ds_exists())
+        GTEST_SKIP() << "basketball_ds goldens missing — run "
+                        "tools/dump_basketball_ds_reference.py first.";
+
+    BasketballDsScene scene;
+    ASSERT_TRUE(scene.load()) << "Failed to load basketball_ds goldens.";
+
+    printf("[BasketballDs] N=%d res=%dx%d sh_degree=%d max_coeffs=%d\n",
+           scene.N, scene.W, scene.H, scene.sh_degree, scene.max_coeffs);
+    printf("[BasketballDs] tan_fovx=%.6f tan_fovy=%.6f\n",
+           scene.tan_fovx, scene.tan_fovy);
+
+    VulkanTrainer trainer(ctx, scene.g, scene.raw,
+                          scene.sh_degree, scene.W, scene.H,
+                          make_basketball_ds_tcfg());
+    trainer.enable_gradient_capture(true);
+
+    const int N   = scene.N;
+    const int MC3 = scene.max_coeffs * 3;
+
+    constexpr int N_STEPS = 10;
+
+    struct GroupResult {
+        float py_norm   = 0.f;
+        float vk_norm   = 0.f;
+        float l2_rd     = 0.f;
+        float max_elem  = 0.f;
+        float abs_at    = 0.f;
+        int   worst_idx = -1;
+        int   worst_g   = -1;
+        int   worst_c   = -1;
+        float py_at     = 0.f;
+        float vk_at     = 0.f;
+    };
+    struct StepResult {
+        float py_loss = 0.f, vk_loss = 0.f, loss_rd = 0.f;
+        GroupResult g_pos, g_rot, g_sca, g_sh, g_op;
+        GroupResult p_pos, p_rot, p_sca, p_sh, p_op;
+    };
+
+    auto eval_group = [&](const float* vk, const float* py, int n, int stride) {
+        GroupResult r;
+        float pa = 0.f, va = 0.f;
+        for (int i = 0; i < n; ++i) { pa += py[i]*py[i]; va += vk[i]*vk[i]; }
+        r.py_norm = std::sqrt(pa);
+        r.vk_norm = std::sqrt(va);
+        r.l2_rd   = std::fabs(r.py_norm - r.vk_norm) / std::max(r.py_norm, 1e-8f);
+        float worst = 0.f, worst_abs = 0.f; int worst_i = -1;
+        for (int i = 0; i < n; ++i) {
+            const float ad = std::fabs(vk[i] - py[i]);
+            const float denom = std::max(std::fabs(py[i]), 1e-8f);
+            const float rd = ad / denom;
+            if (rd > worst) { worst = rd; worst_abs = ad; worst_i = i; }
+        }
+        r.max_elem  = worst;
+        r.abs_at    = worst_abs;
+        r.worst_idx = worst_i;
+        if (worst_i >= 0) {
+            r.worst_g = worst_i / stride;
+            r.worst_c = worst_i % stride;
+            r.py_at   = py[worst_i];
+            r.vk_at   = vk[worst_i];
+        }
+        return r;
+    };
+
+    std::vector<StepResult> results(N_STEPS);
+
+    for (int step = 1; step <= N_STEPS; ++step) {
+        float vk_loss = trainer.step(scene.cam, scene.cfg,
+                                     scene.target_chw.data(), scene.W, scene.H);
+        ASSERT_FALSE(std::isnan(vk_loss)) << "VK NaN at step " << step;
+        ASSERT_FALSE(std::isinf(vk_loss)) << "VK Inf at step " << step;
+
+        char sp[256];
+        std::snprintf(sp, sizeof(sp), "%s/step_%04d", basketball_ds_dir().c_str(), step);
+        std::string ssp(sp);
+
+        float py_loss   = npy_scalar(ssp + "_loss.npy");
+        auto py_g_pos   = npy_to_f32(load_npy(ssp + "_grad_pos.npy"));
+        auto py_g_sca   = npy_to_f32(load_npy(ssp + "_grad_sc.npy"));
+        auto py_g_rot   = npy_to_f32(load_npy(ssp + "_grad_rot.npy"));
+        auto py_g_sh    = npy_to_f32(load_npy(ssp + "_grad_sh.npy"));
+        auto py_g_op    = npy_to_f32(load_npy(ssp + "_grad_op.npy"));
+        auto py_r_pos   = npy_to_f32(load_npy(ssp + "_raw_pos.npy"));
+        auto py_r_sca   = npy_to_f32(load_npy(ssp + "_raw_sc.npy"));
+        auto py_r_rot   = npy_to_f32(load_npy(ssp + "_raw_rot.npy"));
+        auto py_r_sh    = npy_to_f32(load_npy(ssp + "_raw_sh.npy"));
+        auto py_r_op    = npy_to_f32(load_npy(ssp + "_raw_op.npy"));
+
+        const auto& vk_g_pos = trainer.captured_grad_positions();
+        const auto& vk_g_sca = trainer.captured_grad_scales();
+        const auto& vk_g_rot = trainer.captured_grad_rotations();
+        const auto& vk_g_sh  = trainer.captured_grad_sh();
+        const auto& vk_g_op  = trainer.captured_grad_opacities();
+
+        const RawGaussianParams& vk_p = trainer.raw_params();
+
+        StepResult& sr = results[step-1];
+        sr.py_loss = py_loss;
+        sr.vk_loss = vk_loss;
+        sr.loss_rd = std::fabs(py_loss - vk_loss) / std::max(std::fabs(py_loss), 1e-12f);
+
+        sr.g_pos = eval_group(vk_g_pos.data(), py_g_pos.data(), N*3,  3);
+        sr.g_rot = eval_group(vk_g_rot.data(), py_g_rot.data(), N*4,  4);
+        sr.g_sca = eval_group(vk_g_sca.data(), py_g_sca.data(), N*3,  3);
+        sr.g_sh  = eval_group(vk_g_sh.data(),  py_g_sh.data(),  N*MC3, MC3);
+        sr.g_op  = eval_group(vk_g_op.data(),  py_g_op.data(),  N,    1);
+
+        sr.p_pos = eval_group(vk_p.raw_positions, py_r_pos.data(), N*3,  3);
+        sr.p_rot = eval_group(vk_p.raw_rotations, py_r_rot.data(), N*4,  4);
+        sr.p_sca = eval_group(vk_p.raw_scales,    py_r_sca.data(), N*3,  3);
+        sr.p_sh  = eval_group(vk_p.raw_sh_coeffs, py_r_sh.data(),  N*MC3, MC3);
+        sr.p_op  = eval_group(vk_p.raw_opacities, py_r_op.data(),  N,    1);
+    }
+
+    // ---------- Print 10-step trajectory tables (grad + post-Adam) ----------
+    printf("\n=== BasketballDs 10-step trajectory ===\n");
+    printf("\n[GRAD] L2 rel_diff / per-elem max rel_diff per step\n");
+    printf("Step  loss_rd      pos L2 / max         rot L2 / max         sca L2 / max         sh  L2 / max         op  L2 / max\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  %.3e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e\n",
+               s+1, r.loss_rd,
+               r.g_pos.l2_rd, r.g_pos.max_elem,
+               r.g_rot.l2_rd, r.g_rot.max_elem,
+               r.g_sca.l2_rd, r.g_sca.max_elem,
+               r.g_sh.l2_rd,  r.g_sh.max_elem,
+               r.g_op.l2_rd,  r.g_op.max_elem);
+    }
+    printf("\n[PARAM-post-Adam] L2 rel_diff / per-elem max rel_diff per step\n");
+    printf("Step  pos L2 / max         rot L2 / max         sca L2 / max         sh  L2 / max         op  L2 / max\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e   %.2e/%.2e\n",
+               s+1,
+               r.p_pos.l2_rd, r.p_pos.max_elem,
+               r.p_rot.l2_rd, r.p_rot.max_elem,
+               r.p_sca.l2_rd, r.p_sca.max_elem,
+               r.p_sh.l2_rd,  r.p_sh.max_elem,
+               r.p_op.l2_rd,  r.p_op.max_elem);
+    }
+    printf("\n[GRAD worst-gid+component per step] (rel | abs at worst index | py | vk)\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  pos G%d.%d r=%.2e a=%.2e py=%+.3e vk=%+.3e | rot G%d.%d r=%.2e a=%.2e | sca G%d.%d r=%.2e a=%.2e | sh G%d.%d r=%.2e a=%.2e py=%+.3e vk=%+.3e | op G%d.%d r=%.2e a=%.2e\n",
+               s+1,
+               r.g_pos.worst_g, r.g_pos.worst_c, r.g_pos.max_elem, r.g_pos.abs_at, r.g_pos.py_at, r.g_pos.vk_at,
+               r.g_rot.worst_g, r.g_rot.worst_c, r.g_rot.max_elem, r.g_rot.abs_at,
+               r.g_sca.worst_g, r.g_sca.worst_c, r.g_sca.max_elem, r.g_sca.abs_at,
+               r.g_sh.worst_g,  r.g_sh.worst_c,  r.g_sh.max_elem,  r.g_sh.abs_at,  r.g_sh.py_at,  r.g_sh.vk_at,
+               r.g_op.worst_g,  r.g_op.worst_c,  r.g_op.max_elem,  r.g_op.abs_at);
+    }
+    printf("\n[PARAM worst-gid+component per step] (rel | abs at worst index | py | vk)\n");
+    for (int s = 0; s < N_STEPS; ++s) {
+        const auto& r = results[s];
+        printf("%4d  pos G%d.%d r=%.2e a=%.2e | rot G%d.%d r=%.2e a=%.2e | sca G%d.%d r=%.2e a=%.2e | sh G%d.%d r=%.2e a=%.2e py=%+.3e vk=%+.3e | op G%d.%d r=%.2e a=%.2e\n",
+               s+1,
+               r.p_pos.worst_g, r.p_pos.worst_c, r.p_pos.max_elem, r.p_pos.abs_at,
+               r.p_rot.worst_g, r.p_rot.worst_c, r.p_rot.max_elem, r.p_rot.abs_at,
+               r.p_sca.worst_g, r.p_sca.worst_c, r.p_sca.max_elem, r.p_sca.abs_at,
+               r.p_sh.worst_g,  r.p_sh.worst_c,  r.p_sh.max_elem,  r.p_sh.abs_at, r.p_sh.py_at, r.p_sh.vk_at,
+               r.p_op.worst_g,  r.p_op.worst_c,  r.p_op.max_elem,  r.p_op.abs_at);
+    }
+    printf("\n[Loss summary]\n");
+    for (int s : {1, 5, 10}) {
+        const auto& r = results[s-1];
+        printf("  step %2d: py=%.8e  vk=%.8e  rel_diff=%.4e\n",
+               s, r.py_loss, r.vk_loss, r.loss_rd);
+    }
+
+    // ---------- Lenient assertions (will tighten once observed) ----------
+    // Use step 10 as the strictest sentinel.
+    const auto& r10 = results[N_STEPS - 1];
+    EXPECT_LT(r10.loss_rd, 1e-2f) << "Step-10 loss rel_diff drift at scale.";
+
+    constexpr float kGradL2Tol  = 1e-2f;
+    EXPECT_LT(r10.g_pos.l2_rd, kGradL2Tol) << "Step-10 grad pos L2 rel_diff (basketball ds).";
+    EXPECT_LT(r10.g_rot.l2_rd, kGradL2Tol) << "Step-10 grad rot L2 rel_diff.";
+    EXPECT_LT(r10.g_sca.l2_rd, kGradL2Tol) << "Step-10 grad sca L2 rel_diff.";
+    EXPECT_LT(r10.g_sh.l2_rd,  kGradL2Tol) << "Step-10 grad sh  L2 rel_diff (SH layout sentinel at N=2892).";
+    EXPECT_LT(r10.g_op.l2_rd,  kGradL2Tol) << "Step-10 grad op  L2 rel_diff.";
+
+    constexpr float kParamL2Tol = 1e-2f;
+    EXPECT_LT(r10.p_pos.l2_rd, kParamL2Tol) << "Step-10 post-Adam pos L2 rel_diff.";
+    EXPECT_LT(r10.p_rot.l2_rd, kParamL2Tol) << "Step-10 post-Adam rot L2 rel_diff.";
+    EXPECT_LT(r10.p_sca.l2_rd, kParamL2Tol) << "Step-10 post-Adam sca L2 rel_diff.";
+    EXPECT_LT(r10.p_sh.l2_rd,  kParamL2Tol) << "Step-10 post-Adam sh  L2 rel_diff (SH layout sentinel at N=2892).";
+    EXPECT_LT(r10.p_op.l2_rd,  kParamL2Tol) << "Step-10 post-Adam op  L2 rel_diff.";
+
+    // Per-element gates intentionally lenient — will tighten after observation.
+    auto check_dual = [](const char* name, const GroupResult& r,
+                         float abs_tol, float rel_tol) {
+        const bool ok = (r.abs_at < abs_tol) || (r.max_elem < rel_tol);
+        EXPECT_TRUE(ok)
+            << "Step-10 post-Adam " << name << " per-elem dual-gate failed: "
+            << "rel_diff=" << r.max_elem << " abs_diff=" << r.abs_at
+            << " (need abs<" << abs_tol << " OR rel<" << rel_tol << ") "
+            << "py=" << r.py_at << " vk=" << r.vk_at
+            << " G" << r.worst_g << "." << r.worst_c;
+    };
+    check_dual("pos", r10.p_pos, 1e-1f, 1e-1f);
+    check_dual("rot", r10.p_rot, 1e-1f, 1e-1f);
+    check_dual("sca", r10.p_sca, 1e-1f, 1e-1f);
+    check_dual("sh",  r10.p_sh,  1e-1f, 1e-1f);
+    check_dual("op",  r10.p_op,  1e-1f, 1e-1f);
 }

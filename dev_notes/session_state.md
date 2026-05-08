@@ -1,150 +1,81 @@
 # Session State
 
-## Current Phase
-**VK↔CUDA cascade sort equivalence harness** (active S10, 2026-04-23). Plan i: build per-level trace comparator before attempting the VK 3-level port. Ultimate target unchanged: VK eval_3D ≡ CUDA, closing the 17.2 dB PSNR gap.
+## Current Phase (merge-training-master — 2026-05-08)
+Training/profiling sync into the master cascade/config line is integrated in isolated branch `worktree-merge-training-master`. Training-priority non-parity `eval_3D` replay-order support has now been ported and validated while preserving master `SplattingSettings`, cascade trace/config validation, rasterize specialization IDs, and the non-trace HEAD_W=8 fallback. Current test inventory is **327 tests / 73 .cpp files**.
 
-## Test Counts
-- Baseline: 243 passing + 1 VK-vs-CUDA basketball (PSNR=42.8 dB, baseline=42.1 dB) as of S8 2026-04-21.
-- Added this session: `DumpCascadeFixtures.Basket_Cam0` (runs VK pre/binner/sorter, dumps .npy fixtures for CUDA+VK shared input).
+## Training Replay-Order Sync (2026-05-08)
+- Ported training's exact non-parity `eval_3D` replay sideband: `ForwardCache` owns replay offsets/GIDs, `RasterizerVulkan` materializes replay order with a second forward sideband dispatch, and eval_3D backward uploads/consumes replay order when present.
+- Binding policy changed after user decision: replay-order owns forward rasterize bindings **14/15**; cascade trace shifted to **16..32** instead of blocking training. Rasterize specialization IDs remain `EVAL_3D=0`, `TRACE_ENABLED=1`, `SORT_MODE=2`, `EVAL3D_RAW_REPLAY=3`.
+- Removed the non-parity `eval_3D` trainer rejection and replaced the guard test with `VulkanTrainer.Eval3DNonParityRecordsReplayOrder`, which verifies a non-parity eval_3D step succeeds and replay count matches captured blended contributions.
+- Validation: shader build PASS; full build PASS; focused eval_3D replay tests **6/6 PASS**; trainer/backward focus **33/33 PASS**; trace focus **4/4 PASS** with existing skips; `VkVsPyReference` **8/8 PASS**; `VkVsCudaFirstLoss` **12/12 PASS**; basketball/VK-CUDA focus **7/7 PASS** with existing skips; full CTest **327/327 PASS** in **2674.18s**.
+- Review/audit: +2 subagent review found no binding/replay blockers; stale parity-guard comments were corrected. Known limitation: the new smoke asserts replay count, not replay GID order content.
 
-## Cascade Equivalence Harness — Task Status (S10)
-| Phase | Task | Status | Artifact |
-|-------|------|--------|----------|
-| 1  | VK preprocess dump gtest             | DONE | `tests/test_dump_cascade_fixtures.cpp`, `tests/golden/npy_writer.h` — passing, 44 MB fixture in `build/cascade_trace/` |
-| 2a | CUDA trace header (NoOp + Device)    | DONE | `AAA-Gaussians/.../stopthepop/cascade_trace.h` |
-| 2a | Patch `hierarchical_render.cuh`       | DONE | 6 edits: `#include`, default `TraceT=NoOp` template arg + arg, HEAD_BLEND + HEAD_INS + MID + TAIL snapshots, new `sortGaussiansRayHierarchicalCUDA_forward_traced` kernel |
-| 2b | CUDA pybind entry + setup.py         | DONE | new `rasterize_hier_traced.cu`, `rasterize_points.h` decl, `ext.cpp` `m.def("rasterize_hierarchical_traced", ...)`, `setup.py` source list — compiling |
-| 2c | `dump_cuda_cascade_trace.py`         | DONE | `AAA-Gaussians/.../tools/dump_cuda_cascade_trace.py` — awaiting successful build to test |
-| 2d | CUDA-vs-CUDA sanity (mechanism)      | DONE | `SelfCompare_Cuda_vs_Cuda` passes: TAIL 688 non-empty snapshots match, HEAD_INS 969/1024 pixels match, HEAD_BLEND 969/1024 match, zero gid/depth/alpha deltas |
-| 3  | Comparator gtest skeleton            | DONE | `tests/test_cascade_equivalence.cpp` — compiles in VK test binary, Self/VsCuda both SKIP until CUDA trace + VK trace produced |
-| 4A | VK trace SSBO plumbing + dispatch + test | DONE | 17 SSBOs at set=0 bindings 14..30, `spec_trace_enabled=constant_id 1`, `rasterize_traced()` method, `DumpVkCascadeTrace.Basket_Cam0` passes, `Vk_vs_Cuda` FAILs with expected all-zero pattern |
-| 4B | VK TAIL fill + bitonic64 + trace hook | PARTIAL | 79 exact match; cadence off — state machine needed, merged into 4B+C |
-| 4B+C | VK TAIL+MID state machine (cadence correct, snap 0 matches) | DONE (partial gid_mm) | tail_wcur match; TAIL gid_mm=20049 / MID gid_mm=40816 pending HEAD — architectural coupling found |
-| 4D+E+flush | VK HEAD state machine (front4OneFromMid + blend_one + MID-drain-thru-HEAD + end-flush) | IN PROGRESS | combines plan §6 D/E/F after analysis showed CUDA cascade is single state machine, not layerable |
-| 4G-I | PSNR validation / Maleoon / perf | FUTURE | — |
+## Training Follow-up Sync (2026-05-08)
+- Added training-side diagnostic tools `tools/diagnose_l1b_mid_replay.py` and `tools/compare_basketball_eval3d_proper_mcmc.py`; adapted the cam0 benchmark script path base to the merge worktree layout.
+- Synced 2D saved-PLY render flags in `tools/compare_vk_cuda_2000step.py` and `tools/compare_vk_cuda_fair.py` so they pass `--eval_3d 0 --proper_ewa 0` explicitly.
+- Narrowly ported the `VulkanTrainer::run_forward_and_loss` CPU-arena sizing improvement, then bounded first-frame tile-fanout headroom to avoid unbounded multi-GB allocation before actual `R` is observed.
+- Validation: `python3 -m py_compile` for updated/new Python tools PASS; `cmake --build build` PASS; `VkVsPyReference` focused tests **8/8 PASS**; `VulkanTrainer`/`McmcDensify`/`VulkanAdam`/`Densification` focused tests **27/27 PASS**; `ctest -N` still reports **327 tests**.
+- Review: independent diff review found the initial unbounded first-frame fanout allocation blocker; bounded follow-up review cleared it. Remaining warning is only that first-frame actual `R/N > 512` can still fail boundedly before `last_bin_R_` is learned.
+- Deferred: training replay-order forward/backward shader sideband remains non-mechanical because forward bindings 14/15 conflict with merge trace bindings and specialization IDs; CMake/test/default changes that remove master cascade/config/Fuchsia surfaces remain intentional non-ports.
 
-## Path A — Defensive Config Unification (S10, 2026-04-25)
+## Training/Profiling Sync Validation (2026-05-06)
+- Build: `cmake -B build -DBUILD_TESTS=ON && cmake --build build` PASS after final training/profiling reconciliation.
+- Full CTest: **327/327 PASS**, total **2538.11s**. Expected fixture-dependent skips: `BasketballDs.Trajectory10Steps`, `VkVsCudaBasketball.Cam0_TableSubset`, `CascadeEquivalence.SelfCompare_Cuda_vs_Cuda`, `CascadeEquivalence.Vk_vs_Cuda`.
+- Focused first-loss gates: **12/12 PASS**, including newly active `Gate_P7_RenderedImage` and `Gate_L1_L1Loss`; long gates remained bounded (`Gate_P5` **1195.72s**, `Gate_P6` **1197.67s** in full CTest).
+- Post-test external audit: PASS, no blockers; confirmed `tests/TEST_PLAN.md` count matches CTest and `.cpp` inventory.
+- Apples-to-apples benchmark uses the isolated CUDA reference extension at `diff-gaussian-rasterization` commit `3373529` in `harmonyos_3dgs/build/cuda_ext/dgr-3373529`; the shared AAA-Gaussians checkout remains untouched.
+- Final benchmark artifact: `build/compare_runs/matrix_baseline_1000_merge_after_full_integration`; 1000 steps / 76 views / eval_3D / proper_ewa / MCMC / L1 baseline PASSed with final counts **3513/3513**, CUDA final loss **0.082237**, VK final loss **0.079905**, CUDA events `[(600,2892,3036,144,9),(700,3036,3187,151,8),(800,3187,3346,159,13),(900,3346,3513,167,12)]`, VK saved vs CUDA **28.58 dB**, CUDA vs GT **17.44 dB**, VK saved vs GT **17.38 dB**, gate PASS.
+- Final benchmark timing with CUDA `3373529`: CUDA train **196.27s**, VK train CLI **363.55s**, CUDA all-view render **5.22s**, VK all-view render **50.88s**, total CUDA **201.50s** vs VK **414.43s** (**0.49x** CUDA/VK ratio).
+- Key final syncs: `gs3d_vk_train` exposes parity/proper-EWA/loss/LR/SH/view-schedule controls with fail-fast validation; `VulkanTrainer` scale regularization now uses the `[N,3]` mean denominator; `dump_cuda_training_step.py` is synced with training diagnostic artifacts; first-loss P7/L1 gates are active.
+- Intentional remaining deferrals: training replay-order forward/backward shader binding changes conflict with merge trace binding IDs 14/15 and specialization contract; profiling GPU-resident/Fuchsia paths remain opt-in and are not default-enabled.
 
-VK now reads `configs/aaa.json` via `splatting::SplattingSettings` and asserts
-that every JSON value matches the value the VK shaders are hard-coded against.
-Mismatches throw at `RasterizerVulkan` construction; VK refuses configs it has
-not implemented rather than silently rendering with the wrong behaviour.
+## Baseline Before Merge
+- Master build: OK.
+- Master CTest: **262/262 PASS** in `harmonyos_3dgs/build`.
+- Hooks: workflow hook syntax OK.
+- Worktree: merge performed only in isolated `.claude/worktrees/merge-training-master`; original master worktree remains dirty and untouched.
 
-**Unified (JSON value == VK hard-coded value, asserted):**
-- `sort_settings.sort_mode = HIERARCHICAL` (the only path; cascade rasterizer)
-- `sort_settings.sort_order = PER_TILE_DEPTH_MAXPOS` (matches scatter.comp eval_3D depth-along-ray key)
-- `sort_settings.queue_sizes = {per_pixel:4, tile_2x2:8, tile_4x4:64}` (matches `HEAD_W=4`, `s_mid_depth[16*4*8]`, `TAIL_SLOTS=64`)
-- `culling_settings.{rect_bounding,tight_opacity_bounding,tile_based_culling,hierarchical_4x4_culling} = true` (all baked into preprocess.comp / scatter.comp / rasterize.comp without runtime gates)
-- `load_balancing = true` (VK tile-binner + scatter expand each Gaussian over touched tiles unconditionally)
-- `proper_ewa_scaling = true` (preprocess.comp scales opacity by dilation_factor unconditionally)
-- `new_aabb = true` (compute_aabb_screen path is dead code in VK — see preprocess.comp:1030 comment, gotchas.md)
+## Merge Status
+- `git merge worktree-training` produced expected conflicts in CMake, rasterizer API/shader, `train_pytorch_reference.py`, `test_e2e_basketball.cpp`, this session state file, and `tests/golden/tiny/py_ref/*.npy`.
+- Resolution policy:
+  - Keep master `SplattingSettings` validation and cascade/trace plumbing.
+  - Keep specialization constants `TRACE_ENABLED=1` and `SORT_MODE=2`.
+  - Add `EVAL3D_RAW_REPLAY=3` for training parity raw replay instead of reusing constant id 1.
+  - Regenerate `tiny/py_ref` 1000-step goldens with the merged Py reference and sync training-side tiny/basketball CUDA fixtures needed by the merged tests.
 
-**Runtime-honoured (no assertion; pipeline reacts to JSON value):**
-- `eval_3D` — drives `spec_eval_3D` specialization constant + `RasterizerVulkan(ctx, eval_3D=…)` plumbing.
-- `near_clipping` — preprocess.comp 2D path gates the `p_view.z<=0.2` cull on this flag (master merge 1b02ca2).
+## Validation Result After Conflict Resolution
+- Build: `cmake -B build -DBUILD_TESTS=ON && cmake --build build` PASS.
+- Targeted validation: **93/93 PASS** for config/cascade/VkVsPyReference/VkVsCudaBasketball/eval_3D/MCMC/densification/VulkanAdam coverage; latest parity-sync focused tests **11/11 PASS**.
+- Full CTest: **319/319 PASS** in `harmonyos_3dgs/build`.
+- Key merge fix: restored 2D rasterizer `n_contrib` to CUDA-style last-candidate-position semantics so backward replay boundaries match `rasterize_backward.comp`.
+- Latest parity sync: added final-step `apply_update=false` support plus train/render `--proper_ewa` CLI controls.
+- Latest full-dataset sync: added `gs3d_vk_train --view_schedule`, `--require_all_gt`, CLI LR/loss/SH controls, mixed-resolution guard, and `tools/compare_basketball_eval3d_proper_mcmc_full.py`.
+- Post-sync validation: build PASS; focused training parity **23/23 PASS**; full CTest **319/319 PASS**.
+- Gate 6 isolated test audit: initial gap found in `StepCanSkipAdamUpdate`, fixed with Adam moment invariance assertions; re-audit PASS; final full-CTest log audit PASS.
 
-**Still hard-coded (not yet config-driven; would need shader changes to vary):**
-- All four queue-size constants are baked as literals + `shared` array sizes in `rasterize.comp`. Changing them needs spec constants + dynamic shared-mem sizing.
-- Sort mode/order other than HIERARCHICAL/PER_TILE_DEPTH_MAXPOS would require a different rasterize shader entirely (stopthepop's GLOBAL/PER_PIXEL_FULL/PER_PIXEL_KBUFFER paths are not ported).
+## Baseline Test/Profile Snapshot (2026-05-01)
+- Build: `cmake --build build` PASS.
+- Full CTest: **319/319 PASS**, 11 explicit skips, total **82.22s**; Gate 6 log audit PASS.
+- Slowest tests: `VkVsCpuRender.FullFramePSNR` **24.07s**, `VkVsPyReference.OraclePerStepComparison` **13.47s**, `VkVsCudaBasketball100Step.PerStepParity` **4.99s**, `Basketball.Training2000Steps` **4.39s**.
+- Tiny render profiling (`build/profile_runs/profile_summary.json`, 5 runs each): 2D no-EWA mean **9.88ms**, eval_3D proper mean **9.64ms**, eval_3D parity/proper mean **9.66ms**; CLI wall is ~300ms, so tiny runs are process/setup dominated.
+- Tiny training profiling: 100-step 2D **89.6 it/s**, 100-step eval_3D **86.9 it/s**; 1000-step 2D **88.9 it/s**, 1000-step eval_3D **92.9 it/s**.
+- Synthetic `gs3d_train_compare --iters 500 --N 10 --sh 1 --res 32`: wall **0.269s**; final loss around **3.8e-4**.
 
-**Files (added):** `include/splatting_settings.h`, `src/splatting_settings.cpp`, `tests/test_config_loader.cpp`, `tests/test_data/aaa.json` (vendored fallback for worktrees without the AAA submodule).
+## Full-Dataset Smoke/Profile Snapshot
+- Dependency/build gate: basketball init PLY, selected camera JSON/images, AAA-Gaussians tree, `gs3d_vk_train`, `gs3d_vk_render`, conda, and python all present; `cmake --build build` PASS before harness runs.
+- Smoke harness (`build/profile_runs/smoke_eval3d_mcmc_s3_v2`): 3 steps / 2 views, eval_3D + proper_ewa, densification disabled by out-of-range gates; CUDA final N **2892**, VK final N **2892**, VK saved vs CUDA **103.41 dB**, VK saved vs train-final **61.74 dB**, gate PASS; timing CUDA train **0.32s**, VK train CLI **0.65s**, total train+render CUDA **0.54s** vs VK **1.49s**.
+- Extended harness (`build/profile_runs/extended_eval3d_mcmc_s900_v8`): 900 steps / 8 views, MCMC at steps 600/700/800; CUDA final N **3346**, VK final N **3346**, CUDA events `[(600,2892,3036,144,63),(700,3036,3187,151,13),(800,3187,3346,159,11)]`, VK saved vs CUDA **31.09 dB**, VK saved vs train-final **58.99 dB**, CUDA vs GT **19.47 dB**, VK saved vs GT **19.50 dB**, gate PASS.
+- Extended performance: VK training CLI **95.42s** / **9.5 it/s** vs CUDA train loop **33.64s**; VK all-view render **3.68s** vs CUDA all-view render **1.15s**; total train+render CUDA **34.79s** vs VK **99.10s** (**0.35x** CUDA/VK ratio as reported by harness).
 
-**Files (modified):** `CMakeLists.txt` (move nlohmann_json fetch to global scope; add splatting_settings.cpp; register test), `include/vulkan/rasterizer_vulkan.h` (new SplattingSettings ctor), `src/vulkan/rasterizer_vulkan.cpp` (impl).
+## Latest Training Work Being Merged
+- MCMC densification: `VkTrainingConfig::cap_max > 0` selects MCMC relocate/add; `cap_max <= 0` keeps legacy clone/split/prune.
+- Adam state resize: untouched slots preserve moments; MCMC-modified source/destination slots are zeroed across parameter groups.
+- Opacity reset: raw `logit(0.01)` plus opacity Adam moment reset.
+- `filter_3D`: propagated through owned raw params, legacy densification, MCMC relocation/add, VulkanTrainer reallocation, and saved PLY output.
+- eval_3D training: supported for parity-mode raw replay; non-parity eval_3D training remains guarded until default HEAD/sub-tile backward replay is implemented.
+- CLI: `gs3d_vk_train` defaults remain no densification; `--densify 1` defaults to MCMC when `--cap_max` is omitted; `--densify 1 --cap_max 0` selects legacy densification.
 
-**Tests:** 12 new ConfigLoader tests pass; 4 reference tests still pass (`VkVsCudaBasketball.Cam0_PsnrAtLeastBaseline`, `RasterizerVulkan.Rasterize_TinyFixture`, `CascadeEquivalence.SelfCompare_Cuda_vs_Cuda`, `DumpVkCascadeTrace.Basket_Cam0`); 169 gs3d_tests pass.
-
-**Limitations:** legacy `RasterizerVulkan(ctx, bool eval_3D)` ctor is preserved and bypasses the validator — call sites that have not migrated still rely on VK's hard-coded behaviour matching aaa.json. Migration of train/main entry points to the SplattingSettings ctor is a follow-up.
-
-## Design Decisions (S10, user-confirmed)
-- **Trace granularity**: 细 — 4-level (TAIL-post-merge, MID-post-merge, HEAD-insert, HEAD-blend).
-- **Input scale**: 中等 — 4 tiles from basket-aaa cam0, pair count 300-2000.
-- **Comparison**: 精确 — gid sequence bit-exact, depth ε=1e-5, alpha ε=1e-6.
-- **Equal-depth tie**: unordered (CUDA `batcherSort<32>` has no secondary key → tie is hardware-dependent).
-- **Submodule policy**: patch `diff-gaussian-rasterization`; guard with default template arg + `NoOpCascadeTrace` so existing callers zero-cost-compatible.
-- **Shared input**: VK preprocess output drives both sides (.npy in `${CMAKE_BINARY_DIR}/cascade_trace/`).
-
-## Milestones
-
-## Milestones
-| Milestone | Status | Sessions | Summary |
-|-----------|--------|----------|---------|
-| SP-0: CUDA golden infra | DONE | — | CPU reference + FD test harness |
-| SP-1: Vulkan infra | DONE | S2 | VulkanContext/Buffer/Shader/Pipeline; TDD gate |
-| SP-2: Vulkan forward pipeline | DONE | S2 | preprocess.comp + sort + rasterize.comp |
-| SP-3: Vulkan backward pipeline | DONE | S3 | rasterize_backward.comp + preprocess_backward.comp |
-| SP-4: Training integration | DONE | S4 | ForwardCache caching, GPU Adam skeleton (CpuAdam), VulkanTrainer, 216 tests |
-| SP-5: GPU optimizer + hyperparams | DONE | S5 | GPU Adam kernel, LR+SH schedules, DSSIM, MCMC densification, basketball E2E smoke test, 229 tests |
-| SP-6: Training gaps closed | DONE | S7 | T1-T5 done; 243/243 + basketball loss-decrease pass |
-| VK-CUDA parity (PSNR≥60dB) | IN PROGRESS | S8 | 25.3→42.8 dB; proper_ewa, tile_culling, sub-tile sort done. Need persistent TAIL buffer |
-| M0: Foundation | IN PROGRESS | — | Interleaved with Vulkan migration |
-
-## VK-CUDA Parity Task Status (Session 8)
-| Task | Status | PSNR Impact | Commit |
-|------|--------|-------------|--------|
-| Harness (render_single.py + gtest) | DONE | baseline=25.3 | a4dc240, fa6adc9 |
-| proper_ewa_scaling (eval_3D + 2D) | DONE | +11.6 dB | ed303bd |
-| rect_bounding + tight_opacity_bounding | DONE | 0 dB | 6ff257b |
-| tile_based_culling (INVALID sentinel) | DONE | +3.4 dB | 83ca5b1 |
-| Hierarchical sub-tile TAIL re-sort | DONE | +2.3 dB | b4cd239 |
-| HEAD_W=8, subtile_cx+2.0, z/w key | DONE | +0.2 dB | 72bd4bf |
-| Persistent cross-batch TAIL buffer | TODO | ? | — |
-| Verify ≥60 dB + lock baseline | TODO | — | — |
-
-## Python → C++ Gaps Closed (SP-6)
-1. **Opacity reg**: `dL/d_raw_opacity += (0.01/N)*sig*(1-sig)` — after backward, before Adam upload
-2. **Scale reg**: `dL/d_raw_scale += (0.01/N)*exp(raw_sc)` — per-component
-3. **Position noise**: `Sigma @ N(0,1) * op_sigmoid(1-opacity) * noise_lr * pos_lr` — after Adam download
-4. **Spatial LR**: `pos_lr = spatial_lr_scale * lr_schedule(...)` — default scale=1.0
-
-## Latest Sessions
-
-### S10 — 2026-04-23 → 2026-04-24 (current)
-- Opened cascade sort equivalence harness (design ratified with user as Plan i).
-- Phase 1 DONE: `DumpCascadeFixtures.Basket_Cam0` passes on Tegra. Dump = 44 MB (N=400k, 2700 tiles; 4 selected tile IDs: 680 719 720 721; counts 301-366). Fixture at `harmonyos_3dgs/build/cascade_trace/`.
-- Phase 2a DONE: `cascade_trace.h` (NoOp + Device trace writers, per-level claim/snapshot helpers with correct NoOp fallback) + 6 edits to `hierarchical_render.cuh` — `#include`, default `TraceT=NoOp` template arg, HEAD_BLEND / HEAD_INS / MID / TAIL snapshots, new `sortGaussiansRayHierarchicalCUDA_forward_traced` kernel. Existing callers untouched (zero behavior change).
-- Phase 2b DONE: `rasterize_hier_traced.cu` (new, bypasses CUDA preprocess; takes VK-preprocessed tensors directly), `rasterize_points.h` decl, `ext.cpp` pybind (`rasterize_hierarchical_traced`), `setup.py` source list. Python rebuild iterating on compile fixes (include order, `using namespace CudaRasterizer`, constexpr int64_t locals instead of through-instance constants).
-- Phase 2c DONE: `tools/dump_cuda_cascade_trace.py` — loads fixture, casts u32→int32 for binding, calls `_C.rasterize_hierarchical_traced`, saves 15 trace tensors + output color + final_T to `cuda/` subdir.
-- Phase 3 DONE (skeleton): `test_cascade_equivalence.cpp` + `tests/golden/npy_writer.h` already in CMake. Self-compare (CUDA vs CUDA) and Vk-vs-Cuda tests both gated on fixture presence → SKIP if traces missing.
-- REMAINING this session: (a) green the CUDA build (4th attempt in flight), (b) run Python script end-to-end to verify trace generation, (c) run SelfCompare gtest to validate comparator.
-- FUTURE: Phase 4 VK 3-level cascade port itself — expected to consume this harness.
-
-### S8 — 2026-04-20 (current)
-- SP-7 T1-T5 complete (CB chaining, persistent buffers): 248 tests pass
-- Basketball test: changed to 100 steps (no densification) PSNR=5.61 dB, finite+positive assertion
-- VK vs Python gradient comparison: 3 new tests implemented (task 54-56)
-  - `VkVsPyReference.Step1GradientAndLoss`: loss rel_diff=3.6e-7, all grad norms 0.0000 diff
-  - `VkVsPyReference.ConvergenceTable100Steps`: both converge 0.042→0.002 (100 steps)
-- **BUG FIXED**: rasterize.comp writes CHW but loss/backward expect HWC — fixed in vulkan_trainer.cpp
-  - Gradient norms were 45-60% below Python reference before fix
-  - See gotchas.md for full details
-- Python reference dump: tools/dump_tiny_reference.py + tests/golden/tiny/py_ref/ (1000 files)
-- VulkanTrainer gradient capture: enable_gradient_capture() + captured_grad_*() accessors
-
-### S7 — 2026-04-19
-- SP-6 T1-T4 complete via subagent-driven development
-- 243 tests pass (non-basketball)
-- Basketball 100-step loss-decrease validated
-
-### S6 — 2026-04-19
-- SP-5 Task 6 (basketball E2E) completed and committed
-- 229/229 tests pass
-- Basketball 100-step background validation PASSED (248.7s, loss decreased)
-
-### S5 — 2026-04-18 to 2026-04-19
-- SP-5 Tasks 1-6 complete via subagent-driven development
-- GPU Adam (adam_step.comp + VulkanAdam), LR schedule, SH warmup, DSSIM analytical gradient, MCMC densification, basketball smoke test
-- Key perf finding: ~2.5 s/step on Tegra due to sync-per-dispatch; SP-7 will chain CBs
-
-### S4 — 2026-04-18
-- SP-4 all 8 tasks complete + extra cov2D/Part C bug fix
-- 216/216 tests passing
-
-### S3 — 2026-04-17 to 2026-04-18
-- SP-3 complete: rasterize_backward.comp + preprocess_backward.comp
-- All 208 SP-3 tests passing before SP-4
-
-### S2 — 2026-04-17
-- SP-1 complete (Vulkan infra) + SP-2 complete (forward pipeline)
-
-### S1 — 2026-04-16
-- Installed dev harness (CLAUDE.md, WORKFLOW.md, PROJECT.md, skills, hooks, memory)
+## Latest Cascade/Config Work Preserved From Master
+- `RasterizerVulkan(ctx, SplattingSettings)` validates CUDA-shared `configs/aaa.json` behavior via `splatting::validate_vk_supported`.
+- `rasterize.comp` preserves 3-stage cascade TAIL/MID/HEAD trace path and the non-trace HEAD_W=8 fallback.
+- Config tests, cascade fixture dump, VK cascade trace dump, and cascade equivalence skeleton remain in `gs3d_vk_tests`.

@@ -3,7 +3,8 @@
 
 Loads the tiny fixture inputs, runs the AAA-Gaussians CUDA rasterizer with
 eval_3D=True and filter3D from the fixture, and saves the rendered image as
-rasterize_image_eval3d.npy in [3,H,W] CHW float32 format.
+rasterize_image_eval3d.npy in [3,H,W] CHW float32 format. With
+--dump-backward, also saves one-step L1-to-zero raw-gradient goldens.
 
 Usage:
     /home/robota/miniconda3/envs/aaa-gs/bin/python3.10 tools/dump_eval3d_golden.py \
@@ -25,12 +26,12 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, '/home/robota/h00813233/Graph/AAA-Gaussians/submodules/diff-gaussian-rasterization')
+sys.path.insert(0, '/home/robota/h00813233/Graph/aaags-claude/AAA-Gaussians/submodules/diff-gaussian-rasterization')
 
 import numpy as np
 import torch
 from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings, GaussianRasterizer, ExtendedSettings
+    _C, GaussianRasterizationSettings, GaussianRasterizer, ExtendedSettings
 )
 
 
@@ -86,32 +87,33 @@ def load_fixture(fixture_dir: str) -> dict:
     )
 
 
-def render_with_eval3d(data: dict) -> np.ndarray:
-    """Run the CUDA rasterizer with eval_3D=True. Returns [3, H, W] float32 CHW image."""
-    device = "cuda"
-
-    # Move everything to CUDA tensors
-    means3D   = torch.tensor(data["positions"],  dtype=torch.float32, device=device)   # [N, 3]
-    scales_t  = torch.tensor(data["scales"],     dtype=torch.float32, device=device)   # [N, 3]
-    rots_t    = torch.tensor(data["rotations"],  dtype=torch.float32, device=device)   # [N, 4]
-    opacs_t   = torch.tensor(data["opacities"],  dtype=torch.float32, device=device)   # [N, 1]
-    shs_t     = torch.tensor(data["sh_coeffs"],  dtype=torch.float32, device=device)   # [N, 16, 3]
-    # filter_3D: the CUDA rasterizer expects [N, 1] or [N]
-    filter3d_t = torch.tensor(
-        data["filter_3D"].reshape(-1, 1), dtype=torch.float32, device=device          # [N, 1]
-    )
-
-    # Camera tensors — pass as-is from fixture (already in world_view_transform / full_proj form)
+def make_rasterizer(data: dict, device: str):
     viewmatrix_t  = torch.tensor(data["viewmatrix"],         dtype=torch.float32, device=device)
     projmatrix_t  = torch.tensor(data["projmatrix"],         dtype=torch.float32, device=device)
     inv_vp_t      = torch.tensor(data["inv_viewprojmatrix"], dtype=torch.float32, device=device)
     campos_t      = torch.tensor(data["campos"],             dtype=torch.float32, device=device)
-
     bg = torch.zeros(3, dtype=torch.float32, device=device)
 
-    # ExtendedSettings with eval_3D=True
-    splat_args = ExtendedSettings()
-    splat_args.eval_3D = True
+    splat_args = ExtendedSettings.from_dict({
+        "eval_3D": True,
+        "sort_settings": {
+            "sort_mode": 0,
+            "sort_order": 0,
+            "queue_sizes": {
+                "tile_4x4": 64,
+                "tile_2x2": 8,
+                "per_pixel": 4,
+            },
+        },
+        "culling_settings": {
+            "rect_bounding": False,
+            "tight_opacity_bounding": False,
+            "tile_based_culling": False,
+            "hierarchical_4x4_culling": False,
+        },
+        "load_balancing": False,
+        "proper_ewa_scaling": False,
+    })
 
     raster_settings = GaussianRasterizationSettings(
         image_height=data["H"],
@@ -130,10 +132,20 @@ def render_with_eval3d(data: dict) -> np.ndarray:
         render_depth=False,
         debug=False,
     )
+    return GaussianRasterizer(raster_settings=raster_settings)
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    # means2D must have requires_grad=True (gradient hook needed by the autograd function)
+def render_with_eval3d(data: dict) -> np.ndarray:
+    """Run the CUDA rasterizer with eval_3D=True. Returns [3, H, W] float32 CHW image."""
+    device = "cuda"
+    means3D   = torch.tensor(data["positions"],  dtype=torch.float32, device=device)
+    scales_t  = torch.tensor(data["scales"],     dtype=torch.float32, device=device)
+    rots_t    = torch.tensor(data["rotations"],  dtype=torch.float32, device=device)
+    opacs_t   = torch.tensor(data["opacities"],  dtype=torch.float32, device=device)
+    shs_t     = torch.tensor(data["sh_coeffs"],  dtype=torch.float32, device=device)
+    filter3d_t = torch.tensor(data["filter_3D"].reshape(-1, 1), dtype=torch.float32, device=device)
+
+    rasterizer = make_rasterizer(data, device)
     means2D = torch.zeros_like(means3D, requires_grad=True)
 
     with torch.no_grad():
@@ -149,8 +161,135 @@ def render_with_eval3d(data: dict) -> np.ndarray:
             cov3D_precomp=None,
         )
 
-    # rendered: [3, H, W] float32 tensor
     return rendered.detach().cpu().numpy()
+
+
+def dump_eval3d_backward_intermediates(data: dict, output_dir: str) -> None:
+    device = "cuda"
+    means3D = torch.tensor(data["positions"], dtype=torch.float32, device=device)
+    scales = torch.tensor(data["scales"], dtype=torch.float32, device=device)
+    rotations = torch.tensor(data["rotations"], dtype=torch.float32, device=device)
+    opacities = torch.tensor(data["opacities"], dtype=torch.float32, device=device)
+    shs = torch.tensor(data["sh_coeffs"], dtype=torch.float32, device=device)
+    filter3d_t = torch.tensor(data["filter_3D"].reshape(-1, 1), dtype=torch.float32, device=device)
+    colors_precomp = torch.empty(0, dtype=torch.float32, device=device)
+    cov3d_precomp = torch.empty(0, dtype=torch.float32, device=device)
+
+    raster_settings = make_rasterizer(data, device).raster_settings
+    forward_args = (
+        raster_settings.bg,
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        filter3d_t,
+        raster_settings.scale_modifier,
+        cov3d_precomp,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.inv_viewprojmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        shs,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        raster_settings.prefiltered,
+        raster_settings.settings.to_dict(),
+        raster_settings.render_depth,
+        raster_settings.debug,
+    )
+    num_rendered, color, radii, geom_buffer, binning_buffer, img_buffer = _C.rasterize_gaussians(*forward_args)
+    dL_dout = torch.sign(color) / color.numel()
+
+    backward_args = (
+        raster_settings.bg,
+        means3D,
+        radii,
+        opacities,
+        colors_precomp,
+        scales,
+        rotations,
+        raster_settings.scale_modifier,
+        cov3d_precomp,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.inv_viewprojmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        color,
+        dL_dout,
+        shs,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        geom_buffer,
+        num_rendered,
+        binning_buffer,
+        img_buffer,
+        raster_settings.settings.to_dict(),
+        raster_settings.debug,
+    )
+    if not hasattr(_C, "rasterize_gaussians_backward_dump_g2s"):
+        raise RuntimeError(
+            "CUDA extension lacks rasterize_gaussians_backward_dump_g2s; "
+            "rebuild diff-gaussian-rasterization before dumping eval_3D backward goldens")
+    backward_out = _C.rasterize_gaussians_backward_dump_g2s(*backward_args)
+    if len(backward_out) != 10:
+        raise RuntimeError(f"Unexpected CUDA backward output count: {len(backward_out)}")
+
+    _, d_rgb, d_opacity, _, _, _, _, _ = backward_out[:8]
+    os.makedirs(output_dir, exist_ok=True)
+    np.save(os.path.join(output_dir, "eval3d_bwd_d_rgb.npy"), d_rgb.detach().cpu().numpy().astype(np.float32))
+    np.save(os.path.join(output_dir, "eval3d_bwd_d_opacity.npy"), d_opacity.detach().cpu().numpy().astype(np.float32).reshape(-1))
+    d_gauss2screen = backward_out[9]
+    np.save(os.path.join(output_dir, "eval3d_bwd_d_gauss2screen.npy"),
+            d_gauss2screen.detach().cpu().numpy().astype(np.float32))
+
+
+def dump_eval3d_backward(data: dict, output_dir: str) -> None:
+    device = "cuda"
+    raw_positions = torch.tensor(data["positions"], dtype=torch.float32, device=device, requires_grad=True)
+    raw_scales = torch.tensor(np.log(data["scales"]), dtype=torch.float32, device=device, requires_grad=True)
+    raw_rotations = torch.tensor(data["rotations"], dtype=torch.float32, device=device, requires_grad=True)
+    raw_opacities_np = np.log(np.clip(data["opacities"], 1e-6, 1.0 - 1e-6) / np.clip(1.0 - data["opacities"], 1e-6, 1.0))
+    raw_opacities = torch.tensor(raw_opacities_np, dtype=torch.float32, device=device, requires_grad=True)
+    raw_sh = torch.tensor(data["sh_coeffs"], dtype=torch.float32, device=device, requires_grad=True)
+    filter3d_t = torch.tensor(data["filter_3D"].reshape(-1, 1), dtype=torch.float32, device=device)
+
+    scales = torch.exp(raw_scales)
+    rotations = raw_rotations / torch.norm(raw_rotations, dim=-1, keepdim=True)
+    opacities = torch.sigmoid(raw_opacities)
+    rasterizer = make_rasterizer(data, device)
+    means2D = torch.zeros_like(raw_positions, requires_grad=True)
+
+    rendered, radii = rasterizer(
+        means3D=raw_positions,
+        means2D=means2D,
+        shs=raw_sh,
+        colors_precomp=None,
+        opacities=opacities,
+        scales=scales,
+        rotations=rotations,
+        filter3D=filter3d_t,
+        cov3D_precomp=None,
+    )
+    loss = torch.abs(rendered).mean()
+    loss.backward()
+    torch.cuda.synchronize()
+
+    dump_eval3d_backward_intermediates(data, output_dir)
+
+    os.makedirs(output_dir, exist_ok=True)
+    np.save(os.path.join(output_dir, "eval3d_loss.npy"), np.array([float(loss.item())], dtype=np.float32))
+    np.save(os.path.join(output_dir, "eval3d_grad_pos.npy"), raw_positions.grad.detach().cpu().numpy().astype(np.float32))
+    np.save(os.path.join(output_dir, "eval3d_grad_sca.npy"), raw_scales.grad.detach().cpu().numpy().astype(np.float32))
+    np.save(os.path.join(output_dir, "eval3d_grad_rot.npy"), raw_rotations.grad.detach().cpu().numpy().astype(np.float32))
+    np.save(os.path.join(output_dir, "eval3d_grad_sh.npy"), raw_sh.grad.detach().cpu().numpy().astype(np.float32))
+    np.save(os.path.join(output_dir, "eval3d_grad_op.npy"), raw_opacities.grad.detach().cpu().numpy().astype(np.float32).reshape(-1))
+    print(f"  eval_3D backward loss={float(loss.item()):.8f}")
+    print(f"  Saved eval_3D backward goldens to: {output_dir}")
 
 
 def main():
@@ -170,6 +309,14 @@ def main():
     parser.add_argument(
         "--output", default=default_output,
         help=f"Output npy path (default: {default_output})"
+    )
+    parser.add_argument(
+        "--dump-backward", action="store_true",
+        help="Also dump eval_3D one-step L1-to-zero raw gradients"
+    )
+    parser.add_argument(
+        "--backward-output-dir", default=None,
+        help="Directory for backward goldens (default: fixture dir)"
     )
     args = parser.parse_args()
 
@@ -201,6 +348,11 @@ def main():
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     np.save(args.output, rendered)
     print(f"\nSaved to: {args.output}")
+
+    if args.dump_backward:
+        backward_dir = args.backward_output_dir or args.fixture_dir
+        print("\nRunning CUDA eval_3D backward against zero target ...")
+        dump_eval3d_backward(data, backward_dir)
 
 
 if __name__ == "__main__":

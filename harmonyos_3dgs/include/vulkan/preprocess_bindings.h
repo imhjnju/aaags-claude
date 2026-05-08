@@ -44,8 +44,9 @@ static_assert(sizeof(PreprocessPushConstants) == 24,
 
 // Specialization constant IDs (spec §4.5)
 namespace preprocess_spec {
-constexpr uint32_t TRAINING = 0;  // spec_training: 1=training (no clamp), 0=inference (clamp)
-constexpr uint32_t EVAL_3D  = 1;  // spec_eval_3D: 0=2D conic path, 1=3D evaluation path
+constexpr uint32_t TRAINING    = 0;  // spec_training: 1=training (no clamp), 0=inference (clamp)
+constexpr uint32_t EVAL_3D     = 1;  // spec_eval_3D: 0=2D conic path, 1=3D evaluation path
+constexpr uint32_t PROPER_EWA  = 2;  // spec_proper_ewa: 1=AAA proper_ewa_scaling+tight_opacity_bounding+rect_bounding
 }  // namespace preprocess_spec
 
 // --- prefix_sum.comp bindings (spec §4.8.2) ---
@@ -144,6 +145,8 @@ constexpr uint32_t OPACITIES_2D      = 10; // RO float[N]    pre-dilated opacity
 constexpr uint32_t COV3D_INV         = 11; // RO float[N*6]  inverse 3D covariance
 constexpr uint32_t MEAN_OFFSET       = 12; // RO float[N*3]  world-space offset
 constexpr uint32_t RASTER_EVAL3D_UBO = 13; // UB  RasterEval3DUBO (inverse_vp + cam info)
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 14; // RO uint[H*W+1] exact eval_3D replay offsets
+constexpr uint32_t REPLAY_ORDER_GIDS    = 15; // WO uint[sum(n_contrib)] exact replay Gaussian IDs
 }
 struct RasterizePushConstants {
     uint32_t num_gaussians;
@@ -171,9 +174,10 @@ struct alignas(16) RasterEval3DUBO {
 static_assert(sizeof(RasterEval3DUBO) == 96, "RasterEval3DUBO must be 96 bytes (std140)");
 
 namespace rasterize_spec {
-constexpr uint32_t EVAL_3D       = 0;  // 1 = eval_3D k-buffer path, 0 = 2D conic path
-constexpr uint32_t TRACE_ENABLED = 1;  // 1 = emit cascade trace (Phase 4 VK port)
-constexpr uint32_t SORT_MODE     = 2;  // CUDA SortMode enum (Y1 routing — see below)
+constexpr uint32_t EVAL_3D            = 0;  // 1 = eval_3D path, 0 = 2D conic path
+constexpr uint32_t TRACE_ENABLED      = 1;  // 1 = emit cascade trace (Phase 4 VK port)
+constexpr uint32_t SORT_MODE          = 2;  // CUDA SortMode enum (Y1 routing — see below)
+constexpr uint32_t EVAL3D_RAW_REPLAY  = 3;  // 1 = eval_3D raw replay for training parity
 
 // Sort-mode values that the Y1 routing currently understands. Other CUDA
 // SortMode values (PER_PIXEL_FULL=1, PER_PIXEL_KBUFFER=2) are NOT implemented
@@ -183,31 +187,26 @@ constexpr uint32_t SORT_MODE_HIERARCHICAL = 3u;  // 3-stage cascade (TAIL/MID/HE
 }  // namespace rasterize_spec
 
 // --- rasterize.comp CASCADE TRACE bindings (Phase 4 / Milestone A) -----------
-// 17 additional bindings (14..30) declared in rasterize.comp behind the
-// spec_trace_enabled specialization constant. See
-// dev_notes/phase4_vk_cascade_port_plan.md §5.2 for layout rationale and
-// per-buffer element counts. The shader body never writes these in Milestone
-// A — only the declarations exist so the descriptor-set layout is stable for
-// Milestones B..F.
+// Trace bindings are shifted after replay-order bindings 14..15.
 namespace rasterize_trace_bind {
-constexpr uint32_t TRACE_META         = 14;  // UBO TraceMetaUBO { K, num_tiles, ... }
-constexpr uint32_t SLOT_LOOKUP        = 15;  // SSBO int[num_tiles]
-constexpr uint32_t TAIL_DEPTHS        = 16;  // SSBO float[K*512*16*64]
-constexpr uint32_t TAIL_IDS           = 17;  // SSBO int  [K*512*16*64]
-constexpr uint32_t TAIL_WCUR          = 18;  // SSBO uint [K]
-constexpr uint32_t MID_DEPTHS         = 19;  // SSBO float[K*1024*16*4*8]
-constexpr uint32_t MID_IDS            = 20;  // SSBO int  [K*1024*16*4*8]
-constexpr uint32_t MID_WCUR           = 21;  // SSBO uint [K]
-constexpr uint32_t HEAD_INS_DEPTH     = 22;  // SSBO float[K*256*4096]
-constexpr uint32_t HEAD_INS_ALPHA     = 23;  // SSBO float[K*256*4096]
-constexpr uint32_t HEAD_INS_GID       = 24;  // SSBO int  [K*256*4096]
-constexpr uint32_t HEAD_INS_CURSOR    = 25;  // SSBO uint [K*256]
-constexpr uint32_t HEAD_BLEND_DEPTH   = 26;  // SSBO float[K*256*4096]
-constexpr uint32_t HEAD_BLEND_ALPHA   = 27;  // SSBO float[K*256*4096]
-constexpr uint32_t HEAD_BLEND_T       = 28;  // SSBO float[K*256*4096]
-constexpr uint32_t HEAD_BLEND_GID     = 29;  // SSBO int  [K*256*4096]
-constexpr uint32_t HEAD_BLEND_CURSOR  = 30;  // SSBO uint [K*256]
-constexpr uint32_t BINDING_COUNT      = 31;  // total bindings (0..30)
+constexpr uint32_t TRACE_META         = 16;  // UBO TraceMetaUBO { K, num_tiles, ... }
+constexpr uint32_t SLOT_LOOKUP        = 17;  // SSBO int[num_tiles]
+constexpr uint32_t TAIL_DEPTHS        = 18;  // SSBO float[K*512*16*64]
+constexpr uint32_t TAIL_IDS           = 19;  // SSBO int  [K*512*16*64]
+constexpr uint32_t TAIL_WCUR          = 20;  // SSBO uint [K]
+constexpr uint32_t MID_DEPTHS         = 21;  // SSBO float[K*1024*16*4*8]
+constexpr uint32_t MID_IDS            = 22;  // SSBO int  [K*1024*16*4*8]
+constexpr uint32_t MID_WCUR           = 23;  // SSBO uint [K]
+constexpr uint32_t HEAD_INS_DEPTH     = 24;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_INS_ALPHA     = 25;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_INS_GID       = 26;  // SSBO int  [K*256*4096]
+constexpr uint32_t HEAD_INS_CURSOR    = 27;  // SSBO uint [K*256]
+constexpr uint32_t HEAD_BLEND_DEPTH   = 28;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_ALPHA   = 29;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_T       = 30;  // SSBO float[K*256*4096]
+constexpr uint32_t HEAD_BLEND_GID     = 31;  // SSBO int  [K*256*4096]
+constexpr uint32_t HEAD_BLEND_CURSOR  = 32;  // SSBO uint [K*256]
+constexpr uint32_t BINDING_COUNT      = 33;  // total bindings (0..32)
 }  // namespace rasterize_trace_bind
 
 // TraceMetaUBO (std140) — 32 bytes, matches the shader's TraceMetaUBO block.

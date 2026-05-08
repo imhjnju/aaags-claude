@@ -27,6 +27,7 @@ struct RasterGradOutput {
     float* d_conics;        // [N*3]
     float* d_rgb;           // [N*3]
     float* d_opacities_2d;  // [N]
+    float* d_gauss2screen;  // [N*16] eval_3D only
 
     void allocate_and_zero(FrameAllocator& alloc, int N);
 };
@@ -91,6 +92,7 @@ struct OwnedRawParams {
     std::vector<float> rotations;    // [N*4]
     std::vector<float> sh_coeffs;    // [N*max_coeffs*3]
     std::vector<float> opacities;    // [N]
+    std::vector<float> filter_3D;    // [N], optional activated eval_3D filter
 
     int count() const { return (int)opacities.size(); }
 
@@ -102,17 +104,23 @@ struct OwnedRawParams {
         rotations.resize(N * 4, 0.0f);
         sh_coeffs.resize(N * mc3, 0.0f);
         opacities.resize(N, 0.0f);
+        if (!filter_3D.empty()) filter_3D.resize(N, 0.0f);
     }
 
     // Append one Gaussian (copies from src arrays at index src_i)
     void append(const float* src_pos, const float* src_sc, const float* src_rot,
-                const float* src_sh, float src_op) {
+                const float* src_sh, float src_op, const float* src_filter_3D = nullptr) {
+        const int old_N = count();
         int mc3 = max_coeffs * 3;
+        if (src_filter_3D && filter_3D.empty() && old_N > 0) filter_3D.resize(old_N, 0.0f);
         for (int j = 0; j < 3; j++) positions.push_back(src_pos[j]);
         for (int j = 0; j < 3; j++) scales.push_back(src_sc[j]);
         for (int j = 0; j < 4; j++) rotations.push_back(src_rot[j]);
         for (int j = 0; j < mc3; j++) sh_coeffs.push_back(src_sh[j]);
         opacities.push_back(src_op);
+        if (!filter_3D.empty() || src_filter_3D) {
+            filter_3D.push_back(src_filter_3D ? *src_filter_3D : 0.0f);
+        }
     }
 
     // Remove Gaussians where mask[i] == true. Compact arrays in-place.
@@ -128,6 +136,7 @@ struct OwnedRawParams {
                 std::memcpy(&rotations[dst*4], &rotations[src*4], 4*sizeof(float));
                 std::memcpy(&sh_coeffs[dst*mc3], &sh_coeffs[src*mc3], mc3*sizeof(float));
                 opacities[dst] = opacities[src];
+                if (!filter_3D.empty()) filter_3D[dst] = filter_3D[src];
             }
             dst++;
         }
@@ -159,6 +168,7 @@ struct OwnedRawParams {
         rotations.assign(r.raw_rotations, r.raw_rotations + N*4);
         sh_coeffs.assign(r.raw_sh_coeffs, r.raw_sh_coeffs + N*mc3);
         opacities.assign(r.raw_opacities, r.raw_opacities + N);
+        filter_3D.clear();
     }
 };
 
@@ -181,6 +191,8 @@ struct VkTrainingConfig {
     int   densify_until_step    = 15000;
     int   densify_interval      = 100;
     float densify_percent_dense = 0.01f;
+    int   cap_max               = 0;     // >0 enables AAA-Gaussians MCMC densification
+    int   opacity_reset_interval = 3000;
 
     // SP-6: regularization loss coefficients (match Python reference defaults)
     float opacity_reg        = 0.01f;   // weight on mean(|sigmoid(raw_opacity)|)
@@ -191,4 +203,15 @@ struct VkTrainingConfig {
 
     // SP-6: spatial LR scale (cameras_extent from COLMAP; 1.0 = no scaling)
     float spatial_lr_scale   = 1.0f;
+
+    // AAA-Gaussians proper EWA scaling + tight opacity bounding + rect bounding
+    bool  proper_ewa         = false;
+
+    // Enable eval_3D path in the forward preprocessor + rasterizer.
+    // Non-parity training records the forward blend order and replays it in backward.
+    bool  eval_3D            = false;
+
+    // Parity mode — disables the per-4x4 sub-tile re-sort inside rasterize.comp's
+    // eval_3D path so the Vulkan rasterizer's behaviour matches CUDA sort_mode=0.
+    bool  parity_mode        = false;
 };

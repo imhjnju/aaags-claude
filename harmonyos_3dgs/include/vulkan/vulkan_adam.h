@@ -52,6 +52,21 @@ public:
     // Zero all m/v moment buffers for all groups (for oracle testing).
     void zero_moments();
 
+    // Extend group `group_idx` by `added_floats` zero-initialized elements.
+    // Existing m/v data is preserved.
+    void extend_group(int group_idx, uint32_t added_floats);
+
+    // Shrink group `group_idx` to exactly `new_n` elements, preserving the prefix.
+    void shrink_group(int group_idx, uint32_t new_n);
+
+    // Zero m/v moments for specific float indices within one group.
+    void zero_moment_floats(int group_idx, const std::vector<uint32_t>& float_indices);
+
+    void download_moments(int idx, std::vector<float>& out_m, std::vector<float>& out_v) const;
+    void download_group_moments(int group_idx,
+                                std::vector<float>& m_out,
+                                std::vector<float>& v_out) const;
+
     // Dispatch one Adam step for group `idx` synchronously (submit+wait).
     // params_buf: GPU buffer of grp.n floats — updated in-place.
     // grad_buf:   GPU buffer of grp.n floats — gradient (read-only).

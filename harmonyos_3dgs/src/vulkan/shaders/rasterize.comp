@@ -23,7 +23,7 @@
 //       float power = -0.5f*(con_o.x*d.x*d.x + con_o.z*d.y*d.y)
 //                     - con_o.y*d.x*d.y;
 //   - power > 0 skip     : Gaussian evaluated behind its own peak — skip.
-//   - n_contrib          : count of Gaussians actually blended into C
+//   - n_contrib          : 1-based position of the last candidate blended into C
 //                          (those passing both alpha >= 1/255 AND test_T >= T_MIN).
 //                          The Gaussian that first trips T < T_MIN is NOT counted.
 //   - output layout      : CHW. out_image[ch*H*W + y*W + x]  (channel-first, matches CUDA/PyTorch).
@@ -110,10 +110,16 @@ layout(constant_id = 1) const uint spec_trace_enabled = 0u;
 // default 3 preserves pre-Y1 behavior for callers that don't set it.
 layout(constant_id = 2) const uint spec_sort_mode = 3u;
 
+// Training parity override: eval_3D raw replay in tile-sorted order.
+layout(constant_id = 3) const uint spec_eval3d_raw_replay = 0u;
+
+layout(std430, set = 0, binding = 14) readonly buffer ReplayOrderOffsets { uint replay_order_offsets[]; };
+layout(std430, set = 0, binding = 15) buffer ReplayOrderGids { uint replay_order_gids[]; };
+
 // Per-run trace metadata (UBO, 32 B). `K` is the number of selected tiles.
 // `num_tiles` matches push-constant num_tiles_x * num_tiles_y — kept in the
 // UBO so the shader does not have to multiply push-constants.
-layout(std140, set = 0, binding = 14) uniform TraceMetaUBO {
+layout(std140, set = 0, binding = 16) uniform TraceMetaUBO {
     uint K;
     uint num_tiles;
     uint _pad0;
@@ -122,32 +128,32 @@ layout(std140, set = 0, binding = 14) uniform TraceMetaUBO {
 } trace_meta;
 
 // Per-tile slot lookup: -1 for unselected tiles, 0..K-1 for selected tiles.
-layout(std430, set = 0, binding = 15) readonly buffer TraceSlotLookup {
+layout(std430, set = 0, binding = 17) readonly buffer TraceSlotLookup {
     int slot_lookup[];
 };
 
 // TAIL trace buffers: flat [K, MAX_TAIL=512, 16 subtiles, 64 slots].
-layout(std430, set = 0, binding = 16) buffer TraceTailDepths { float tail_depths[]; };
-layout(std430, set = 0, binding = 17) buffer TraceTailIds    { int   tail_ids[];    };
-layout(std430, set = 0, binding = 18) buffer TraceTailWcur   { uint  tail_wcur[];   };
+layout(std430, set = 0, binding = 18) buffer TraceTailDepths { float tail_depths[]; };
+layout(std430, set = 0, binding = 19) buffer TraceTailIds    { int   tail_ids[];    };
+layout(std430, set = 0, binding = 20) buffer TraceTailWcur   { uint  tail_wcur[];   };
 
 // MID trace buffers: flat [K, MAX_MID=1024, 16 subtiles, 4 quadrants, 8 slots].
-layout(std430, set = 0, binding = 19) buffer TraceMidDepths  { float mid_depths[]; };
-layout(std430, set = 0, binding = 20) buffer TraceMidIds     { int   mid_ids[];    };
-layout(std430, set = 0, binding = 21) buffer TraceMidWcur    { uint  mid_wcur[];   };
+layout(std430, set = 0, binding = 21) buffer TraceMidDepths  { float mid_depths[]; };
+layout(std430, set = 0, binding = 22) buffer TraceMidIds     { int   mid_ids[];    };
+layout(std430, set = 0, binding = 23) buffer TraceMidWcur    { uint  mid_wcur[];   };
 
 // HEAD insert trace: flat [K, 256 pixels, MAX_HEAD_INS=4096].
-layout(std430, set = 0, binding = 22) buffer TraceHeadInsDepth  { float head_ins_depth[];  };
-layout(std430, set = 0, binding = 23) buffer TraceHeadInsAlpha  { float head_ins_alpha[];  };
-layout(std430, set = 0, binding = 24) buffer TraceHeadInsGid    { int   head_ins_gid[];    };
-layout(std430, set = 0, binding = 25) buffer TraceHeadInsCursor { uint  head_ins_cursor[]; };
+layout(std430, set = 0, binding = 24) buffer TraceHeadInsDepth  { float head_ins_depth[];  };
+layout(std430, set = 0, binding = 25) buffer TraceHeadInsAlpha  { float head_ins_alpha[];  };
+layout(std430, set = 0, binding = 26) buffer TraceHeadInsGid    { int   head_ins_gid[];    };
+layout(std430, set = 0, binding = 27) buffer TraceHeadInsCursor { uint  head_ins_cursor[]; };
 
 // HEAD blend trace: flat [K, 256 pixels, MAX_HEAD_BLEND=4096].
-layout(std430, set = 0, binding = 26) buffer TraceHeadBlendDepth  { float head_blend_depth[];  };
-layout(std430, set = 0, binding = 27) buffer TraceHeadBlendAlpha  { float head_blend_alpha[];  };
-layout(std430, set = 0, binding = 28) buffer TraceHeadBlendT      { float head_blend_T[];      };
-layout(std430, set = 0, binding = 29) buffer TraceHeadBlendGid    { int   head_blend_gid[];    };
-layout(std430, set = 0, binding = 30) buffer TraceHeadBlendCursor { uint  head_blend_cursor[]; };
+layout(std430, set = 0, binding = 28) buffer TraceHeadBlendDepth  { float head_blend_depth[];  };
+layout(std430, set = 0, binding = 29) buffer TraceHeadBlendAlpha  { float head_blend_alpha[];  };
+layout(std430, set = 0, binding = 30) buffer TraceHeadBlendT      { float head_blend_T[];      };
+layout(std430, set = 0, binding = 31) buffer TraceHeadBlendGid    { int   head_blend_gid[];    };
+layout(std430, set = 0, binding = 32) buffer TraceHeadBlendCursor { uint  head_blend_cursor[]; };
 
 // RasterizePushConstants — 20 bytes (spec §4.8.7).
 layout(push_constant) uniform PC {
@@ -245,6 +251,16 @@ const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
 const uint  TAIL_SLOTS      = 64u;          // per-subtile TAIL capacity (matches CUDA).
 const float Z_NEAR          = -1.0;         // AAA rasterizer.h:27
 const float Z_FAR           = 1.0;          // AAA rasterizer.h:28
+
+bool replayOrderEnabled() {
+    return eval3d_ubo.img_size_pad.z != 0.0;
+}
+
+void writeReplayOrder(uint px, uint local_slot, uint gid) {
+    if (replayOrderEnabled()) {
+        replay_order_gids[replay_order_offsets[px] + local_slot] = gid;
+    }
+}
 
 // --- eval_3D helper functions ------------------------------------------------
 
@@ -701,6 +717,7 @@ void main() {
     // --- Per-pixel coordinates ---
     uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
     uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    uint pixel_linear = pixel_y * pc.image_width + pixel_x;
     bool valid_pixel = (pixel_x < pc.image_width) && (pixel_y < pc.image_height);
 
     // Linear index into shared cache for cooperative loads (0..255).
@@ -710,6 +727,7 @@ void main() {
     float T = 1.0;
     vec3  C = vec3(0.0);
     uint  n = 0u;
+    uint  contributor_pos = 0u;
     // Pixels outside the image still participate in cooperative loads/barriers
     // but contribute nothing; treat them as already-done for the blending loop.
     bool pixel_done = !valid_pixel;
@@ -722,6 +740,75 @@ void main() {
     // CUDA reference: hierarchical_render.cuh blend_one() lines 393-424,
     // front4OneFromMid() lines 428-591.
     // =================================================================
+
+    if (spec_eval3d_raw_replay == 1u) {
+        for (uint batch_start = range_start; batch_start < range_end; batch_start += BATCH_SIZE) {
+            uint load_idx = batch_start + local_idx;
+            if (load_idx < range_end) {
+                uint gid = values_sorted[load_idx];
+                s_gid[local_idx] = gid;
+                for (int j = 0; j < 4; j++) {
+                    s_g2s[local_idx * 16u + uint(j)]       = gauss2screen[gid * 16u + 0u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 4u + uint(j)]  = gauss2screen[gid * 16u + 1u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 8u + uint(j)]  = gauss2screen[gid * 16u + 2u * 4u + uint(j)];
+                    s_g2s[local_idx * 16u + 12u + uint(j)] = gauss2screen[gid * 16u + 3u * 4u + uint(j)];
+                }
+                s_opa[local_idx]   = conic_opacity[gid * 4u + 3u];
+                s_rgb_r[local_idx] = rgb[gid * 3u + 0u];
+                s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
+                s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
+            }
+            barrier();
+
+            uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+            if (!pixel_done) {
+                float fpx = float(pixel_x);
+                float fpy = float(pixel_y);
+                for (uint k = 0u; k < batch_size; ++k) {
+                    contributor_pos += 1u;
+
+                    float plane_x[4], plane_y[4];
+                    buildRayPlanes(k, fpx, fpy, plane_x, plane_y);
+                    float max_pos[4];
+                    float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
+                    if (power > 0.0) continue;
+
+                    float alpha = min(0.99, s_opa[k] * exp(power));
+                    if (alpha < ALPHA_THRESHOLD) continue;
+
+                    float w_ndc = 0.0, z_ndc = 0.0;
+                    for (int j = 0; j < 4; j++) {
+                        w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
+                        z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                    }
+                    if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+                    float test_T = T * (1.0 - alpha);
+                    if (test_T < T_MIN) {
+                        pixel_done = true;
+                        break;
+                    }
+                    C.r += s_rgb_r[k] * alpha * T;
+                    C.g += s_rgb_g[k] * alpha * T;
+                    C.b += s_rgb_b[k] * alpha * T;
+                    T = test_T;
+                    n = contributor_pos;
+                }
+            }
+            barrier();
+        }
+
+        if (valid_pixel) {
+            uint px = pixel_y * pc.image_width + pixel_x;
+            uint HW = pc.image_width * pc.image_height;
+            out_image[0u * HW + px] = C.r + T * bg_color.x;
+            out_image[1u * HW + px] = C.g + T * bg_color.y;
+            out_image[2u * HW + px] = C.b + T * bg_color.z;
+            transmittance[px] = T;
+            n_contrib[px]     = n;
+        }
+        return;
+    }
 
     // CUDA HEAD register state (hierarchical_render.cuh:283-288):
     //   float head_depths[4]; int head_ids[4]; float head_stores[4];
@@ -758,11 +845,13 @@ void main() {
     float fb_kbuf_r[FB_HEAD_W];
     float fb_kbuf_g[FB_HEAD_W];
     float fb_kbuf_b[FB_HEAD_W];
+    uint  fb_kbuf_gid[FB_HEAD_W];
     int   fb_kbuf_size = 0;
     for (int i = 0; i < FB_HEAD_W; i++) {
         fb_kbuf_depth[i] = 1e30;
         fb_kbuf_alpha[i] = 0.0;
         fb_kbuf_r[i] = 0.0; fb_kbuf_g[i] = 0.0; fb_kbuf_b[i] = 0.0;
+        fb_kbuf_gid[i] = 0u;
     }
 
     // --- Subtile / quadrant / in-subtile identity ------------------------
@@ -1247,6 +1336,7 @@ void main() {
                                             C.r += head_color_r[0] * a0_h * T_before_h;
                                             C.g += head_color_g[0] * a0_h * T_before_h;
                                             C.b += head_color_b[0] * a0_h * T_before_h;
+                                            writeReplayOrder(pixel_linear, n, uint(head_ids[0]));
                                             T = T_before_h * (1.0 - a0_h);
                                             n += 1u;
                                             for (int i = 1; i < HEAD_W; ++i) {
@@ -1452,18 +1542,21 @@ void main() {
                     C.r += fb_kbuf_r[0] * a0 * T;
                     C.g += fb_kbuf_g[0] * a0 * T;
                     C.b += fb_kbuf_b[0] * a0 * T;
+                    writeReplayOrder(pixel_linear, n, fb_kbuf_gid[0]);
                     T = test_T0; n += 1u;
                     for (int i = 1; i < FB_HEAD_W; i++) {
                         fb_kbuf_depth[i-1] = fb_kbuf_depth[i]; fb_kbuf_alpha[i-1] = fb_kbuf_alpha[i];
                         fb_kbuf_r[i-1] = fb_kbuf_r[i]; fb_kbuf_g[i-1] = fb_kbuf_g[i]; fb_kbuf_b[i-1] = fb_kbuf_b[i];
+                        fb_kbuf_gid[i-1] = fb_kbuf_gid[i];
                     }
-                    fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
+                    fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_gid[FB_HEAD_W-1] = 0u; fb_kbuf_size -= 1;
                 }
                 if (pixel_done) break;
 
                 // Insertion-sort into HEAD (ascending per-pixel depth).
                 float id = sort_depth, ia = alpha;
                 float ir = s_rgb_r[k], ig = s_rgb_g[k], ib = s_rgb_b[k];
+                uint igid = s_gid[k];
                 for (int i = 0; i < FB_HEAD_W; i++) {
                     if (id < fb_kbuf_depth[i]) {
                         float td = fb_kbuf_depth[i]; fb_kbuf_depth[i] = id; id = td;
@@ -1471,6 +1564,7 @@ void main() {
                         float tr = fb_kbuf_r[i]; fb_kbuf_r[i] = ir; ir = tr;
                         float tg = fb_kbuf_g[i]; fb_kbuf_g[i] = ig; ig = tg;
                         float tb = fb_kbuf_b[i]; fb_kbuf_b[i] = ib; ib = tb;
+                        uint tgid = fb_kbuf_gid[i]; fb_kbuf_gid[i] = igid; igid = tgid;
                     }
                 }
                 fb_kbuf_size += 1;
@@ -1644,6 +1738,7 @@ void main() {
                                 C.r += head_color_r[0] * a0f * Tb_f;
                                 C.g += head_color_g[0] * a0f * Tb_f;
                                 C.b += head_color_b[0] * a0f * Tb_f;
+                                writeReplayOrder(pixel_linear, n, uint(head_ids[0]));
                                 T = Tb_f * (1.0 - a0f);
                                 n += 1u;
                                 for (int i = 1; i < HEAD_W; ++i) {
@@ -1810,6 +1905,7 @@ void main() {
                         C.r += head_color_r[0] * a0m * Tb_m;
                         C.g += head_color_g[0] * a0m * Tb_m;
                         C.b += head_color_b[0] * a0m * Tb_m;
+                        writeReplayOrder(pixel_linear, n, uint(head_ids[0]));
                         T = Tb_m * (1.0 - a0m);
                         n += 1u;
                         for (int i = 1; i < HEAD_W; ++i) {
@@ -1887,12 +1983,14 @@ void main() {
             C.r += fb_kbuf_r[0] * a0 * T;
             C.g += fb_kbuf_g[0] * a0 * T;
             C.b += fb_kbuf_b[0] * a0 * T;
+            writeReplayOrder(pixel_linear, n, fb_kbuf_gid[0]);
             T = test_T0; n += 1u;
             for (int j = 1; j < FB_HEAD_W; j++) {
                 fb_kbuf_depth[j-1] = fb_kbuf_depth[j]; fb_kbuf_alpha[j-1] = fb_kbuf_alpha[j];
                 fb_kbuf_r[j-1] = fb_kbuf_r[j]; fb_kbuf_g[j-1] = fb_kbuf_g[j]; fb_kbuf_b[j-1] = fb_kbuf_b[j];
+                fb_kbuf_gid[j-1] = fb_kbuf_gid[j];
             }
-            fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_size -= 1;
+            fb_kbuf_depth[FB_HEAD_W-1] = 1e30; fb_kbuf_gid[FB_HEAD_W-1] = 0u; fb_kbuf_size -= 1;
         }
     }
 
@@ -1921,6 +2019,7 @@ void main() {
             C.r += head_color_r[0] * a0 * T_before;
             C.g += head_color_g[0] * a0 * T_before;
             C.b += head_color_b[0] * a0 * T_before;
+            writeReplayOrder(pixel_linear, n, uint(head_ids[0]));
             T = test_T0; n += 1u;
 
             for (int j = 1; j < HEAD_W; ++j) {
@@ -1976,6 +2075,8 @@ void main() {
         uint batch_size = min(BATCH_SIZE, range_end - batch_start);
         if (!pixel_done) {
             for (uint k = 0u; k < batch_size; ++k) {
+                // Backward replay expects candidate position — spec/README.md §6 + investigations/n_contrib_backward_contract.md.
+                contributor_pos += 1u;
                 float dx = float(pixel_x) - s_mean_x[k];
                 float dy = float(pixel_y) - s_mean_y[k];
                 float power = -0.5 * (s_conic_a[k] * dx * dx
@@ -1997,7 +2098,7 @@ void main() {
                 C.g += s_rgb_g[k] * alpha * T;
                 C.b += s_rgb_b[k] * alpha * T;
                 T = test_T;
-                n += 1u;
+                n = contributor_pos;
             }
         }
         barrier();

@@ -34,17 +34,18 @@ class VulkanBuffer;
 
 class RasterizerVulkan : public Rasterizer {
 public:
-    // Legacy ctor — eval_3D bool only. eval_3D=true assumes the canonical
-    // aaa.json settings; the assertions in `splatting::validate_vk_supported`
-    // are not run in this path. New code should prefer the SplattingSettings
-    // overload below so that any drift from aaa.json is caught at construction
-    // time instead of producing silently-wrong renders.
-    explicit RasterizerVulkan(VulkanContext& ctx, bool eval_3D = false);
+    // Legacy ctor. eval_3D=true assumes the canonical aaa.json settings; the
+    // assertions in `splatting::validate_vk_supported` are not run in this path.
+    explicit RasterizerVulkan(VulkanContext& ctx,
+                              bool eval_3D = false,
+                              bool eval3d_raw_replay = false);
 
     // Defensive ctor (Path A) — runs `splatting::validate_vk_supported(s)` and
     // throws std::runtime_error if `s` requests behaviour the VK port has not
     // implemented. eval_3D is taken from `s.eval_3D`.
-    RasterizerVulkan(VulkanContext& ctx, const splatting::SplattingSettings& s);
+    RasterizerVulkan(VulkanContext& ctx,
+                     const splatting::SplattingSettings& s,
+                     bool eval3d_raw_replay = false);
     ~RasterizerVulkan() override;
 
     RasterizerVulkan(const RasterizerVulkan&)            = delete;
@@ -144,6 +145,7 @@ public:
 private:
     VulkanContext& ctx_;
     bool eval_3D_ = false;
+    bool eval3d_raw_replay_ = false;
     // Y1: spec constant value passed to the rasterize pipeline.
     //   0 = GLOBAL          (HEAD_W=8 fallback path)
     //   3 = HIERARCHICAL    (cascade; default for back-compat / legacy ctor)

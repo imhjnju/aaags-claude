@@ -1,0 +1,15 @@
+{
+  "case": "add_only_5_percent",
+  "source": "aaa_gaussians_cuda_compute_relocation",
+  "uses_torch_multinomial": true,
+  "mirrored_reference": false,
+  "N_input": 100,
+  "N_final": 105,
+  "max_coeffs": 3,
+  "opacity_thresh": 0.005,
+  "cap_max": 200,
+  "seeds": {
+    "relocate": null,
+    "add": 1234
+  }
+}

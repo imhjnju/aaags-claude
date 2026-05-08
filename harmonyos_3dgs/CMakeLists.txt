@@ -52,6 +52,8 @@ add_library(gs3d_core
     src/cpu_adam.cpp
     src/dssim.cpp
     src/densification.cpp
+    src/relocation.cpp
+    src/mcmc_densification.cpp
     src/train_utils.cpp
     src/camera_utils.cpp
     src/splatting_settings.cpp
@@ -116,6 +118,9 @@ if(BUILD_TESTS)
         tests/test_cpu_adam.cpp
         tests/test_dssim.cpp
         tests/test_training_gap_sp6.cpp
+        tests/test_relocation.cpp
+        tests/test_mcmc_densification.cpp
+        tests/test_mcmc_cuda_golden.cpp
     )
     if(ENABLE_OPENCL)
         target_sources(gs3d_tests PRIVATE
@@ -161,6 +166,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
     find_program(GLSLANG_VALIDATOR
         NAMES glslangValidator
         HINTS $ENV{VULKAN_SDK}/bin ~/.local/bin REQUIRED)
+
+    add_subdirectory(third_party/fuchsia_vk_radix_sort EXCLUDE_FROM_ALL)
 
     if(Vulkan_FOUND AND GLSLANG_VALIDATOR)
         set(_vk_shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -215,10 +222,18 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(tile_range _hdr_tile_range)
         gs3d_compile_glsl(rasterize _spv_rasterize)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
+        gs3d_compile_glsl(rasterize_hierarchical _spv_rasterize_hierarchical)
+        gs3d_embed_spirv(rasterize_hierarchical _hdr_rasterize_hierarchical)
+        gs3d_compile_glsl(rasterize_cascade_trace _spv_rasterize_cascade_trace)
+        gs3d_embed_spirv(rasterize_cascade_trace _hdr_rasterize_cascade_trace)
         gs3d_compile_glsl(rasterize_backward _spv_rasterize_backward)
         gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
+        gs3d_compile_glsl(rasterize_backward_eval3d _spv_rasterize_backward_eval3d)
+        gs3d_embed_spirv(rasterize_backward_eval3d _hdr_rasterize_backward_eval3d)
         gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
         gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
+        gs3d_compile_glsl(preprocess_backward_eval3d _spv_preprocess_backward_eval3d)
+        gs3d_embed_spirv(preprocess_backward_eval3d _hdr_preprocess_backward_eval3d)
         gs3d_compile_glsl(adam_step _spv_adam_step)
         gs3d_embed_spirv(adam_step _hdr_adam_step)
         add_custom_target(gs3d_vulkan_shaders
@@ -231,14 +246,19 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
                     ${_spv_tile_range} ${_hdr_tile_range}
                     ${_spv_rasterize} ${_hdr_rasterize}
+                    ${_spv_rasterize_hierarchical} ${_hdr_rasterize_hierarchical}
+                    ${_spv_rasterize_cascade_trace} ${_hdr_rasterize_cascade_trace}
                     ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
+                    ${_spv_rasterize_backward_eval3d} ${_hdr_rasterize_backward_eval3d}
                     ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
+                    ${_spv_preprocess_backward_eval3d} ${_hdr_preprocess_backward_eval3d}
                     ${_spv_adam_step} ${_hdr_adam_step})
 
         add_library(gs3d_vk_core STATIC
             src/vulkan/vk_context.cpp
             src/vulkan/vk_capabilities.cpp
             src/vulkan/vk_buffer.cpp
+            src/vulkan/vk_aligned_buffer.cpp
             src/vulkan/vk_shader.cpp
             src/vulkan/vk_pipeline.cpp
             src/vulkan/preprocess_pass.cpp
@@ -252,19 +272,25 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/rasterize_pass.cpp
             src/vulkan/rasterizer_vulkan.cpp
             src/vulkan/rasterize_backward_pass.cpp
+            src/vulkan/rasterize_backward_eval3d_pass.cpp
             src/vulkan/rasterizer_backward_vulkan.cpp
             src/vulkan/preprocess_backward_pass.cpp
+            src/vulkan/preprocess_backward_eval3d_pass.cpp
             src/vulkan/preprocessor_backward_vulkan.cpp
             src/vulkan/vulkan_adam.cpp
+            src/vulkan/radix_sort_fuchsia.cpp
             src/vulkan_trainer.cpp)
         add_dependencies(gs3d_vk_core gs3d_vulkan_shaders)
         target_include_directories(gs3d_vk_core PUBLIC include)
         # preprocess_pass.cpp #includes the xxd-embedded preprocess_spv.h
         # produced into ${_vk_shader_dir}.
         target_include_directories(gs3d_vk_core PRIVATE ${_vk_shader_dir})
+        if(BUILD_TESTS)
+            target_compile_definitions(gs3d_vk_core PRIVATE GS3D_TESTING=1)
+        endif()
         # gs3d_vk_core depends on gs3d_core for CPU helpers (math_utils, types).
         # PreprocessorVulkan::process() uses invertMatrix4x4 from math_utils.cpp.
-        target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan gs3d_core)
+        target_link_libraries(gs3d_vk_core PUBLIC Vulkan::Vulkan gs3d_core PRIVATE vk-radix-sort)
 
         add_executable(gs3d_vulkan_hello src/vulkan/hello_vulkan_main.cpp)
         add_dependencies(gs3d_vulkan_hello gs3d_vulkan_shaders)
@@ -275,6 +301,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         add_executable(gs3d_vk_render src/vulkan/vk_render_main.cpp)
         add_dependencies(gs3d_vk_render gs3d_vulkan_shaders)
         target_link_libraries(gs3d_vk_render PRIVATE gs3d_vk_core gs3d_core)
+
+        add_executable(gs3d_vk_train src/vulkan/vk_train_main.cpp)
+        add_dependencies(gs3d_vk_train gs3d_vulkan_shaders)
+        target_link_libraries(gs3d_vk_train PRIVATE gs3d_vk_core gs3d_core)
 
         if(BUILD_TESTS)
             add_executable(gs3d_vk_tests
@@ -301,19 +331,25 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_training_step_vk.cpp
                 tests/test_vulkan_adam.cpp
                 tests/test_densification.cpp
+                tests/test_mcmc_trainer_integration.cpp
                 tests/test_e2e_basketball.cpp
-                tests/test_cpu_vk_compare.cpp
                 tests/test_vk_vs_py_reference.cpp
                 tests/test_vk_vs_cpu_render.cpp
                 tests/test_vk_vs_cuda_basketball.cpp
                 tests/test_dump_cascade_fixtures.cpp
                 tests/test_dump_vk_cascade_trace.cpp
                 tests/test_cascade_equivalence.cpp
-                tests/test_config_loader.cpp)
+                tests/test_config_loader.cpp
+                tests/test_vk_vs_cuda_first_loss.cpp
+                tests/test_vk_vs_cuda_10step.cpp
+                tests/test_vk_vs_cuda_100step.cpp
+                tests/test_fuchsia_link.cpp
+                tests/test_fuchsia_radix_wrapper.cpp
+                tests/test_fuchsia_radix_e2e_vk.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE
-                gs3d_vk_core gs3d_core GTest::gtest_main)
+                gs3d_vk_core gs3d_core GTest::gtest_main vk-radix-sort)
             target_include_directories(gs3d_vk_tests PRIVATE
                 ${_vk_shader_dir}   # xxd-embedded headers (hello_spv.h etc.)
                 tests
@@ -323,6 +359,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             # CMAKE_BINARY_DIR is needed by test_vk_vs_cuda_basketball.cpp to
             # write the diff heatmap PPM next to the build artifacts.
             target_compile_definitions(gs3d_vk_tests PRIVATE
+                GS3D_TESTING=1
                 ADD_ONE_SPV_PATH="${_spv_add_one}"
                 SHADER_DIR="${_vk_shader_dir}"
                 TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"

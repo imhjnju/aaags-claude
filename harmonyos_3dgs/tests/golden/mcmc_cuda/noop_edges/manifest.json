@@ -1,0 +1,15 @@
+{
+  "case": "noop_edges",
+  "source": "aaa_gaussians_cuda_compute_relocation",
+  "uses_torch_multinomial": true,
+  "mirrored_reference": false,
+  "N_input": 10,
+  "N_final": 10,
+  "max_coeffs": 2,
+  "opacity_thresh": 0.005,
+  "cap_max": 10,
+  "seeds": {
+    "relocate": null,
+    "add": null
+  }
+}

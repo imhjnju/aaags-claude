@@ -41,6 +41,46 @@ struct alignas(16) RasterizeBackwardUBO {
 static_assert(sizeof(RasterizeBackwardUBO) == 32,
               "RasterizeBackwardUBO must be 32 bytes (std140)");
 
+namespace rasterize_backward_eval3d_bind {
+constexpr uint32_t TILE_RANGES      = 0;
+constexpr uint32_t VALUES_SORTED    = 1;
+constexpr uint32_t GAUSS2SCREEN     = 2;   // RO float[N*16], row-major
+constexpr uint32_t CONIC_OPACITY    = 3;   // RO float[N*4], opacity in .w
+constexpr uint32_t COLORS           = 4;   // RO float[N*3]
+constexpr uint32_t T_FINAL          = 5;   // RO float[H*W]
+constexpr uint32_t N_CONTRIB        = 6;   // RO uint[H*W], eval_3D blended count
+constexpr uint32_t RENDERED_IMAGE   = 7;   // RO float[3*H*W], CHW
+constexpr uint32_t DL_DPIXELS       = 8;   // RO float[3*H*W], CHW
+constexpr uint32_t DL_DGAUSS2SCREEN = 9;   // RW float[N*16], atomicAdd
+constexpr uint32_t DL_DOPACITY      = 10;  // RW float[N], atomicAdd
+constexpr uint32_t DL_DCOLORS       = 11;  // RW float[N*3], atomicAdd
+constexpr uint32_t BACKWARD_UBO     = 12;
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 13;  // RO uint[H*W+1]
+constexpr uint32_t REPLAY_ORDER_GIDS    = 14;  // RO uint[sum(n_contrib)]
+constexpr uint32_t BINDING_COUNT        = 15;
+}  // namespace rasterize_backward_eval3d_bind
+
+namespace preprocess_backward_eval3d_bind {
+constexpr uint32_t POSITIONS        = 0;
+constexpr uint32_t RADII            = 1;
+constexpr uint32_t SH_COEFFS        = 2;
+constexpr uint32_t SCALES           = 3;
+constexpr uint32_t ROTATIONS        = 4;
+constexpr uint32_t D_RGB            = 5;
+constexpr uint32_t D_OPACITY        = 6;
+constexpr uint32_t D_GAUSS2SCREEN   = 7;
+constexpr uint32_t D_MEANS3D        = 8;
+constexpr uint32_t D_SH             = 9;
+constexpr uint32_t D_SCALES         = 10;
+constexpr uint32_t D_ROTATIONS      = 11;
+constexpr uint32_t OPACITIES        = 12;
+constexpr uint32_t D_RAW_OPACITIES  = 13;
+constexpr uint32_t RAW_ROTATIONS    = 14;
+constexpr uint32_t PREPROCESS_BACKWARD_UBO = 15;
+constexpr uint32_t FILTER_3D        = 16;
+constexpr uint32_t BINDING_COUNT    = 17;
+}  // namespace preprocess_backward_eval3d_bind
+
 // ---- preprocess_backward.comp binding layout (23 total: 22 SSBOs + 1 UBO) ----
 //
 // Binding layout:
@@ -54,6 +94,7 @@ static_assert(sizeof(RasterizeBackwardUBO) == 32,
 //   20     read-only SSBO: cov2D_cache_in (dilated cov2D from forward)
 //   21     read-only SSBO: cov2D_det_cache_in (det from forward)
 //   22     read-only SSBO: p_hom_w_cache_in (p_hom.w from forward — for inv_w in Part D)
+//   23..28 debug-only write SSBOs for scale/rotation chain diagnostics
 namespace preprocess_backward_bind {
 constexpr uint32_t POSITIONS        = 0;   // RO float[N*3]          world-space xyz
 constexpr uint32_t RADII            = 1;   // RO int[N]              int-ceiled radius; 0=culled
@@ -78,6 +119,13 @@ constexpr uint32_t P_VIEW_CACHE_IN    = 19;  // RO float[N*3]  unclamped p_view 
 constexpr uint32_t COV2D_CACHE_IN     = 20;  // RO float[N*3]  (fa, fb, fc) dilated cov2D from forward
 constexpr uint32_t COV2D_DET_CACHE_IN = 21;  // RO float[N]    det = fa*fc - fb*fb from forward
 constexpr uint32_t P_HOM_W_CACHE_IN  = 22;  // RO float[N]    p_hom.w from forward (for inv_w in Part D)
+constexpr uint32_t DEBUG_D_FABC      = 23;  // WO float[N*3]  d_fa,d_fb,d_fc after h_conv chain
+constexpr uint32_t DEBUG_D_COV3D     = 24;  // WO float[N*6]  upper-triangle d_cov3D
+constexpr uint32_t DEBUG_D_M         = 25;  // WO float[N*9]  row-major d_M
+constexpr uint32_t DEBUG_D_SCALE     = 26;  // WO float[N*3]  activated-scale gradient before exp chain
+constexpr uint32_t DEBUG_D_R         = 27;  // WO float[N*9]  row-major d_R
+constexpr uint32_t DEBUG_D_QN        = 28;  // WO float[N*4]  normalized-quaternion gradient
+constexpr uint32_t BINDING_COUNT     = 29;
 }  // namespace preprocess_backward_bind
 
 // PreprocessBackwardUBO (std140).
@@ -97,7 +145,7 @@ constexpr uint32_t P_HOM_W_CACHE_IN  = 22;  // RO float[N]    p_hom.w from forwa
 //   uint32_t training        → 4 bytes  (offset 176)
 //   uint32_t cam_width       → 4 bytes  (offset 180)  pixel width  (previously _pad2[0])
 //   uint32_t cam_height      → 4 bytes  (offset 184)  pixel height (previously _pad2[1])
-//   uint32_t _pad2           → 4 bytes  (offset 188)
+//   uint32_t debug_capture   → 4 bytes  (offset 188)
 // Total: 192 bytes
 struct alignas(16) PreprocessBackwardUBO {
     float    view_matrix[16]  = {};  // column-major 4x4
@@ -115,7 +163,7 @@ struct alignas(16) PreprocessBackwardUBO {
     uint32_t training         = 1;   // 1=training (no clamp mask), 0=inference
     uint32_t cam_width        = 0;   // pixel width  — used by shader for ndc2Pix backward
     uint32_t cam_height       = 0;   // pixel height — used by shader for ndc2Pix backward
-    uint32_t _pad2            = 0;
+    uint32_t debug_capture    = 0;
 };
 static_assert(sizeof(PreprocessBackwardUBO) == 192,
               "PreprocessBackwardUBO must be 192 bytes (std140)");

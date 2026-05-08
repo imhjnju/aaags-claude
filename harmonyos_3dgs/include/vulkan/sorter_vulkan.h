@@ -20,6 +20,8 @@
 #include <memory>
 
 class VulkanBuffer;
+class VulkanAlignedBuffer;
+class RadixSortFuchsia;
 
 class SorterVulkan : public Sorter {
 public:
@@ -62,10 +64,25 @@ public:
     VkBuffer values_sorted_buf() const;
     VkBuffer tile_ranges_buf()   const;
 
+    static bool fuchsia_sort_enabled();
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RadixSortPass> sort_pass_;
     std::unique_ptr<TileRangePass> range_pass_;
+
+    std::unique_ptr<RadixSortFuchsia>      fuchsia_;
+    uint32_t                                fuchsia_max_keyvals_ = 0;
+    std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_even_;
+    std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_scratch_;
+    std::unique_ptr<VulkanAlignedBuffer>    f_internal_scratch_;
+    std::unique_ptr<VulkanBuffer>           f_tile_ranges_;
+    uint32_t                                f_keyvals_capacity_ = 0;
+    uint32_t                                f_internal_capacity_ = 0;
+    uint32_t                                f_tile_ranges_capacity_ = 0;
+    VkBuffer                                f_last_sorted_ = VK_NULL_HANDLE;
+
+    bool sort_via_fuchsia_gpu(BinningOutput& binning, FrameAllocator& allocator);
 
     // Layer-2 persistent buffers. "A" handles are external (not owned);
     // "B" + histograms + tile_ranges are owned by this adapter.

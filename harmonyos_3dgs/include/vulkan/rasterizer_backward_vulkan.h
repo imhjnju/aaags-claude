@@ -19,8 +19,11 @@
 #include "vulkan/vk_context.h"
 #include "vulkan/vk_buffer.h"
 #include "vulkan/rasterize_backward_pass.h"
+#include "vulkan/rasterize_backward_eval3d_pass.h"
 
+#include <cstddef>
 #include <memory>
+#include <vector>
 
 class RasterizerBackwardVulkan {
 public:
@@ -54,7 +57,8 @@ public:
                   const ForwardCache& cache,
                   const float* dL_dpixels,
                   RasterGradOutput& rgrad,
-                  FrameAllocator& alloc);
+                  FrameAllocator& alloc,
+                  const float* rendered_image = nullptr);
 
     /// GPU output buffer handles for rasterize_bwd (valid after backward() or backward_record_into()).
     /// Used for GPU-to-GPU chaining with PreprocessorBackwardVulkan::backward_record_into().
@@ -62,6 +66,14 @@ public:
     VkBuffer dL_dconics_buf()  const { return dlcon_buf_ ? dlcon_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dopacity_buf() const { return dlopa_buf_ ? dlopa_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dcolors_buf()  const { return dlcol_buf_ ? dlcol_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer dL_dgauss2screen_buf() const { return dlg2s_buf_ ? dlg2s_buf_->handle() : VK_NULL_HANDLE; }
+
+    void download_outputs(int num_gaussians,
+                          std::vector<float>& d_means2D,
+                          std::vector<float>& d_conics,
+                          std::vector<float>& d_opacity,
+                          std::vector<float>& d_rgb,
+                          std::vector<float>* d_gauss2screen = nullptr) const;
 
     /// Record backward pass into cmd (no submit, no download).
     /// Uploads inputs to persistent GPU buffers, calls pass_->record().
@@ -74,11 +86,13 @@ public:
                               const Camera& cam,
                               const RenderConfig& cfg,
                               const ForwardCache& cache,
-                              const float* dL_dpixels);
+                              const float* dL_dpixels,
+                              const float* rendered_image = nullptr);
 
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RasterizeBackwardPass> pass_;
+    std::unique_ptr<RasterizeBackwardEval3DPass> eval3d_pass_;
 
     // Persistent GPU buffers — pre-allocated in prepare_for_n(), reused each
     // backward() call. Eliminates 13 vkDeviceWaitIdle/step from destructors.
@@ -86,6 +100,7 @@ private:
     int buf_R_         = 0;
     int buf_num_tiles_ = 0;
     int buf_HW_        = 0;
+    size_t buf_replay_count_ = 0;
 
     std::unique_ptr<VulkanBuffer> tr_buf_;     // tile_ranges   [num_tiles*2] u32
     std::unique_ptr<VulkanBuffer> vs_buf_;     // values_sorted [R] u32
@@ -95,10 +110,16 @@ private:
     std::unique_ptr<VulkanBuffer> tf_buf_;     // T_final       [HW] f32
     std::unique_ptr<VulkanBuffer> nc_buf_;     // n_contrib      [HW] u32
     std::unique_ptr<VulkanBuffer> dlpix_buf_;  // dL_dpixels    [HW*3] f32
+    std::unique_ptr<VulkanBuffer> img_buf_;    // rendered image [HW*3] f32, eval_3D
     std::unique_ptr<VulkanBuffer> dlm2d_buf_;  // dL_dmeans2D   [N*2] f32
     std::unique_ptr<VulkanBuffer> dlcon_buf_;  // dL_dconics    [N*3] f32
     std::unique_ptr<VulkanBuffer> dlopa_buf_;  // dL_dopacity   [N] f32
     std::unique_ptr<VulkanBuffer> dlcol_buf_;  // dL_dcolors    [N*3] f32
+    std::unique_ptr<VulkanBuffer> g2s_buf_;    // gauss2screen  [N*16] f32, eval_3D
+    std::unique_ptr<VulkanBuffer> dlg2s_buf_;  // dL_dgauss2screen [N*16] f32
+    std::unique_ptr<VulkanBuffer> replay_offsets_buf_; // [HW+1] u32 eval_3D exact replay offsets
+    std::unique_ptr<VulkanBuffer> replay_gids_buf_;    // [sum(n_contrib)] u32 eval_3D exact replay gids
+    std::unique_ptr<VulkanBuffer> dummy4_buf_;          // 4-byte dummy for optional replay bindings
     std::unique_ptr<VulkanBuffer> ubo_buf_;    // RasterizeBackwardUBO (32B)
 
     void prepare_for_n(int N, int R, int num_tiles, int HW);

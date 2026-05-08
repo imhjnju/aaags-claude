@@ -86,13 +86,11 @@ TEST(RegularizationGrad, OpacityGradAtRawZero) {
 }
 
 TEST(RegularizationGrad, ScaleGradAtRawLogScale) {
-    // At raw_sc=log(0.03): exp(raw_sc)=act_sc=0.03
-    // grad=(scale_reg/N)*act_sc = 0.01*0.03=0.0003 for N=1
     const float raw_sc = std::log(0.03f);
-    const float act_sc = std::exp(raw_sc);  // call the actual formula
-    const float grad = (0.01f / 1.f) * act_sc;
+    const float act_sc = std::exp(raw_sc);
+    const float grad = (0.01f / 3.f) * act_sc;
     EXPECT_NEAR(act_sc, 0.03f, 1e-6f);
-    EXPECT_NEAR(grad, 0.0003f, 1e-6f);
+    EXPECT_NEAR(grad, 0.0001f, 1e-6f);
 }
 
 TEST(RegularizationGrad, OpacityGradNonNeg) {

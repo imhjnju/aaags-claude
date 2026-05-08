@@ -148,7 +148,8 @@ void main() {
         dL_dpix.z = dL_dpixels[2u * HW + pix];
     }
 
-    int  toDo = int(range_end - range_start);
+    int  total_toDo = int(range_end - range_start);
+    int  toDo = total_toDo;
     int  rounds = (toDo + int(BLOCK_SIZE) - 1) / int(BLOCK_SIZE);
 
     // Running state for backward accumulation.
@@ -157,16 +158,10 @@ void main() {
     float last_alpha = 0.0;
     vec3  last_color = vec3(0.0);
 
-    // Whether this pixel is active for gradient accumulation.
-    // Pixels with no contributions (last_contrib == 0) skip gradient work.
-    // This uses count-based n_contrib (our CPU and Vulkan forward convention):
-    // n_contrib[pix] = number of Gaussians that actually blended into this pixel.
-    // (Different from CUDA's last_contributor position convention — see forward.cu:429.)
-    // We process ALL Gaussians in the tile range and use alpha/power checks to
-    // identify and skip non-contributing Gaussians, matching the CPU backward's
-    // forward-replay approach.
+    // n_contrib stores CUDA's 1-based last-contributor position in the tile
+    // traversal, not the count of blended Gaussians. Walk backward over the
+    // same candidate positions and ignore candidates behind that position.
     bool pix_active = inside && (last_contrib > 0u);
-    uint  contributor = 0u;   // count of blending Gaussians replayed back-to-front
 
     // No viewport scaling here — our CPU backward does NOT apply the 0.5*W/H
     // factor that appears in the CUDA reference. The CUDA factor accounts for
@@ -204,6 +199,10 @@ void main() {
             if (!pix_active)
                 continue;
 
+            uint candidate_pos = uint(total_toDo - (i * int(BLOCK_SIZE) + j));
+            if (candidate_pos > last_contrib)
+                continue;
+
             vec4 con_o = s_conic_o[j];
             vec2 xy    = s_xy[j];
             vec2 d     = xy - vec2(float(pixel_x), float(pixel_y));
@@ -219,14 +218,6 @@ void main() {
             float alpha     = min(0.99, raw_alpha);
             if (alpha < ALPHA_THRESHOLD)
                 continue;
-
-            // Stop replaying if we've processed all contributors from the forward.
-            // n_contrib[pix] is a COUNT of blended Gaussians (count-based, not position).
-            if (contributor >= last_contrib) {
-                pix_active = false;
-                break;
-            }
-            contributor++;
 
             // Recover transmittance T_i (before this Gaussian) by dividing out
             // the (1-alpha) factor. T started at T_final and we walk backward.

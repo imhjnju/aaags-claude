@@ -34,30 +34,40 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
 
-RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx, bool eval_3D)
-    : ctx_(ctx), eval_3D_(eval_3D), sort_mode_(3u /* HIERARCHICAL */) {
-    // Legacy ctor: default to HIERARCHICAL for back-compat. Callers that need
-    // GLOBAL must use the SplattingSettings overload below.
+RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
+                                   bool eval_3D,
+                                   bool eval3d_raw_replay)
+    : ctx_(ctx),
+      eval_3D_(eval_3D),
+      eval3d_raw_replay_(eval3d_raw_replay),
+      sort_mode_(rasterize_spec::SORT_MODE_HIERARCHICAL) {
     pass_ = std::make_unique<RasterizePass>(
-        ctx_, eval_3D ? 1u : 0u, /*spec_trace_enabled=*/0u, sort_mode_);
+        ctx_,
+        eval_3D ? 1u : 0u,
+        /*spec_trace_enabled=*/0u,
+        sort_mode_,
+        eval3d_raw_replay_ ? 1u : 0u);
 }
 
 RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
-                                   const splatting::SplattingSettings& s)
-    : ctx_(ctx), eval_3D_(s.eval_3D),
+                                   const splatting::SplattingSettings& s,
+                                   bool eval3d_raw_replay)
+    : ctx_(ctx),
+      eval_3D_(s.eval_3D),
+      eval3d_raw_replay_(eval3d_raw_replay),
       sort_mode_(static_cast<uint32_t>(s.sort_settings.sort_mode)) {
-    // Path A: refuse configs the VK shaders have not ported. Throws on
-    // mismatch — no silent fallback to "VK's hard-coded value".
     splatting::validate_vk_supported(s);
-    // Y1: thread sort_mode through to the rasterize pipeline as a spec
-    // constant. validate_vk_supported() guarantees sort_mode ∈ {GLOBAL=0,
-    // HIERARCHICAL=3}; the shader routes accordingly.
     pass_ = std::make_unique<RasterizePass>(
-        ctx_, eval_3D_ ? 1u : 0u, /*spec_trace_enabled=*/0u, sort_mode_);
+        ctx_,
+        eval_3D_ ? 1u : 0u,
+        /*spec_trace_enabled=*/0u,
+        sort_mode_,
+        eval3d_raw_replay_ ? 1u : 0u);
 }
 
 // Out-of-line so unique_ptr<RasterizePass> can see the complete type from
@@ -105,6 +115,11 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
             if (cache->n_contrib) {
                 for (int px = 0; px < HW; ++px) cache->n_contrib[px] = 0;
             }
+            cache->replay_order_offsets_storage.clear();
+            cache->replay_order_gids_storage.clear();
+            cache->replay_order_offsets = nullptr;
+            cache->replay_order_gids = nullptr;
+            cache->replay_order_count = 0u;
         }
         return;
     }
@@ -184,8 +199,10 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // -------------------------------------------------------------------
     vs_buf ->upload(binning.values_sorted,
                     static_cast<std::size_t>(bytes_vs));
-    tr_buf ->upload(binning.tile_ranges,
-                    static_cast<std::size_t>(bytes_tr));
+    if (binning.tile_ranges_gpu == nullptr) {
+        tr_buf->upload(binning.tile_ranges,
+                       static_cast<std::size_t>(bytes_tr));
+    }
     m2d_buf->upload(preprocess.means2D,
                     static_cast<std::size_t>(bytes_m2d));
     co_buf ->upload(conic_opacity_packed.data(),
@@ -254,13 +271,19 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     eval3d_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
         sizeof(RasterEval3DUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
+    auto replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // -------------------------------------------------------------------
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizePass::Buffers rb{};
     rb.values_sorted        = vs_buf ->handle();
-    rb.tile_ranges          = tr_buf ->handle();
+    rb.tile_ranges          = binning.tile_ranges_gpu
+        ? static_cast<VkBuffer>(binning.tile_ranges_gpu)
+        : tr_buf->handle();
     rb.means2D              = m2d_buf->handle();
     rb.conic_opacity_packed = co_buf ->handle();
     rb.rgb                  = rgb_buf->handle();
@@ -273,6 +296,8 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     rb.cov3D_inv            = r_cov3d_buf->handle();
     rb.mean_offset          = r_mo_buf->handle();
     rb.raster_eval3d_ubo    = eval3d_ubo_buf->handle();
+    rb.replay_order_offsets = replay_offsets_buf->handle();
+    rb.replay_order_gids    = replay_gids_buf->handle();
     pass_->bind_buffers(rb);
     pass_->dispatch_sync(N_eff,
                          static_cast<uint32_t>(W), static_cast<uint32_t>(H),
@@ -294,6 +319,60 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
             // because counts fit well under 2^31.
             nc_buf->download(cache->n_contrib,
                              static_cast<std::size_t>(bytes_ncontrib));
+        }
+
+        cache->replay_order_offsets_storage.clear();
+        cache->replay_order_gids_storage.clear();
+        cache->replay_order_offsets = nullptr;
+        cache->replay_order_gids = nullptr;
+        cache->replay_order_count = 0u;
+
+        if (eval_3D_ && !eval3d_raw_replay_ && cache->n_contrib) {
+            const size_t HW_size = static_cast<size_t>(HW);
+            cache->replay_order_offsets_storage.assign(HW_size + 1u, 0u);
+            cache->replay_order_offsets = cache->replay_order_offsets_storage.data();
+
+            uint64_t total_replay = 0u;
+            for (size_t px = 0; px < HW_size; ++px) {
+                const int n_px = cache->n_contrib[px];
+                if (n_px < 0) {
+                    throw std::runtime_error("RasterizerVulkan::rasterize: negative n_contrib");
+                }
+                total_replay += static_cast<uint32_t>(n_px);
+                if (total_replay > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                    throw std::runtime_error("RasterizerVulkan::rasterize: eval_3D replay order exceeds uint32 capacity");
+                }
+                cache->replay_order_offsets[px + 1u] = static_cast<uint32_t>(total_replay);
+            }
+
+            cache->replay_order_count = static_cast<size_t>(total_replay);
+            cache->replay_order_gids_storage.resize(cache->replay_order_count);
+            cache->replay_order_gids = cache->replay_order_gids_storage.empty()
+                ? nullptr
+                : cache->replay_order_gids_storage.data();
+
+            replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(HW_size + 1u) * sizeof(uint32_t),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            replay_offsets_buf->upload(cache->replay_order_offsets,
+                (HW_size + 1u) * sizeof(uint32_t));
+            replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(cache->replay_order_count == 0u ? 4u : cache->replay_order_count * sizeof(uint32_t)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+            eubo.img_size[2] = 1.0f;
+            eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
+            rb.raster_eval3d_ubo = eval3d_ubo_buf->handle();
+            rb.replay_order_offsets = replay_offsets_buf->handle();
+            rb.replay_order_gids = replay_gids_buf->handle();
+            pass_->bind_buffers(rb);
+            pass_->dispatch_sync(N_eff,
+                                 static_cast<uint32_t>(W), static_cast<uint32_t>(H),
+                                 num_tiles_x, num_tiles_y);
+            if (cache->replay_order_count > 0u) {
+                replay_gids_buf->download(cache->replay_order_gids,
+                    cache->replay_order_count * sizeof(uint32_t));
+            }
         }
     }
 }
@@ -383,6 +462,10 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
         cov_h = r_dummy4_->handle();
         mo_h  = r_dummy4_->handle();
     }
+    if (!r_dummy4_) {
+        r_dummy4_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
 
     RasterizePass::Buffers rb{};
     rb.values_sorted        = values_sorted;
@@ -399,6 +482,8 @@ void RasterizerVulkan::prepare_record(uint32_t W, uint32_t H,
     rb.cov3D_inv            = cov_h;
     rb.mean_offset          = mo_h;
     rb.raster_eval3d_ubo    = r_eval3d_ubo_->handle();
+    rb.replay_order_offsets = r_dummy4_->handle();
+    rb.replay_order_gids    = r_dummy4_->handle();
     pass_->bind_buffers(rb);
 
     r_W_   = W;
@@ -701,6 +786,9 @@ RasterizerVulkan::TraceDump RasterizerVulkan::rasterize_traced(
         slot_lookup_buf->upload(sl.data(), sl.size() * sizeof(int32_t));
     }
 
+    auto replay_dummy_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
     // ---- Bind + dispatch -------------------------------------------------
     RasterizePass::Buffers rb{};
     rb.values_sorted        = vs_buf   ->handle();
@@ -717,6 +805,8 @@ RasterizerVulkan::TraceDump RasterizerVulkan::rasterize_traced(
     rb.cov3D_inv            = cov3i_buf->handle();
     rb.mean_offset          = mo_buf   ->handle();
     rb.raster_eval3d_ubo    = e3d_ubo_buf->handle();
+    rb.replay_order_offsets = replay_dummy_buf->handle();
+    rb.replay_order_gids    = replay_dummy_buf->handle();
     traced_pass_->bind_buffers(rb);
 
     RasterizePass::TraceBuffers tb{};

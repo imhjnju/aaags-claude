@@ -28,7 +28,7 @@
 
 class RasterizePass {
 public:
-    /// All buffers wired to bindings 0..13. Names mirror rasterize_bind::.
+    /// All buffers wired to bindings 0..15. Names mirror rasterize_bind::.
     struct Buffers {
         VkBuffer values_sorted;         // RO uint[R]
         VkBuffer tile_ranges;           // RO uint[num_tiles*2] (flat pairs)
@@ -44,45 +44,39 @@ public:
         VkBuffer cov3D_inv;             // RO float[N*6]   (binding 11, eval_3D only)
         VkBuffer mean_offset;           // RO float[N*3]   (binding 12, eval_3D only)
         VkBuffer raster_eval3d_ubo;     // UB  96 bytes    (binding 13, eval_3D only)
+        VkBuffer replay_order_offsets;  // RO uint[H*W+1]  (binding 14, eval_3D replay capture)
+        VkBuffer replay_order_gids;     // WO uint[sum(n_contrib)] (binding 15, eval_3D replay capture)
     };
 
     /// Cascade trace buffers — only consumed when the pass was constructed
-    /// with `spec_trace_enabled=1`. Bindings 14..30 follow the layout in
-    /// dev_notes/phase4_vk_cascade_port_plan.md §5.2 and must match
+    /// with `spec_trace_enabled=1`. Bindings 16..32 must match
     /// rasterize_trace_bind:: in preprocess_bindings.h.
     struct TraceBuffers {
-        VkBuffer trace_meta_ubo;    // UB 32 B TraceMetaUBO (binding 14)
-        VkBuffer slot_lookup;       // SSBO int[num_tiles]           (15)
-        VkBuffer tail_depths;       // SSBO float[K*512*16*64]       (16)
-        VkBuffer tail_ids;          // SSBO int  [K*512*16*64]       (17)
-        VkBuffer tail_wcur;         // SSBO uint [K]                 (18)
-        VkBuffer mid_depths;        // SSBO float[K*1024*16*4*8]     (19)
-        VkBuffer mid_ids;           // SSBO int  [K*1024*16*4*8]     (20)
-        VkBuffer mid_wcur;          // SSBO uint [K]                 (21)
-        VkBuffer head_ins_depth;    // SSBO float[K*256*4096]        (22)
-        VkBuffer head_ins_alpha;    // SSBO float[K*256*4096]        (23)
-        VkBuffer head_ins_gid;      // SSBO int  [K*256*4096]        (24)
-        VkBuffer head_ins_cursor;   // SSBO uint [K*256]             (25)
-        VkBuffer head_blend_depth;  // SSBO float[K*256*4096]        (26)
-        VkBuffer head_blend_alpha;  // SSBO float[K*256*4096]        (27)
-        VkBuffer head_blend_T;      // SSBO float[K*256*4096]        (28)
-        VkBuffer head_blend_gid;    // SSBO int  [K*256*4096]        (29)
-        VkBuffer head_blend_cursor; // SSBO uint [K*256]             (30)
+        VkBuffer trace_meta_ubo;    // UB 32 B TraceMetaUBO (binding 16)
+        VkBuffer slot_lookup;       // SSBO int[num_tiles]           (17)
+        VkBuffer tail_depths;       // SSBO float[K*512*16*64]       (18)
+        VkBuffer tail_ids;          // SSBO int  [K*512*16*64]       (19)
+        VkBuffer tail_wcur;         // SSBO uint [K]                 (20)
+        VkBuffer mid_depths;        // SSBO float[K*1024*16*4*8]     (21)
+        VkBuffer mid_ids;           // SSBO int  [K*1024*16*4*8]     (22)
+        VkBuffer mid_wcur;          // SSBO uint [K]                 (23)
+        VkBuffer head_ins_depth;    // SSBO float[K*256*4096]        (24)
+        VkBuffer head_ins_alpha;    // SSBO float[K*256*4096]        (25)
+        VkBuffer head_ins_gid;      // SSBO int  [K*256*4096]        (26)
+        VkBuffer head_ins_cursor;   // SSBO uint [K*256]             (27)
+        VkBuffer head_blend_depth;  // SSBO float[K*256*4096]        (28)
+        VkBuffer head_blend_alpha;  // SSBO float[K*256*4096]        (29)
+        VkBuffer head_blend_T;      // SSBO float[K*256*4096]        (30)
+        VkBuffer head_blend_gid;    // SSBO int  [K*256*4096]        (31)
+        VkBuffer head_blend_cursor; // SSBO uint [K*256]             (32)
     };
 
-    /// Construct a pass with the three specialization constants fixed at
-    /// build-time.
-    /// `spec_eval_3D`       : 0 = 2D conic path, 1 = eval_3D k-buffer path.
-    /// `spec_trace_enabled` : 0 = trace OFF (14-binding DSL), 1 = trace ON
-    ///                        (31-binding DSL; caller must also supply
-    ///                        TraceBuffers via bind_trace_buffers()).
-    /// `spec_sort_mode`     : Y1 — CUDA SortMode enum routing.
-    ///                        0 = GLOBAL (HEAD_W=8 fallback path)
-    ///                        3 = HIERARCHICAL (cascade; default for back-compat)
+    /// Construct a pass with specialization constants fixed at build-time.
     explicit RasterizePass(VulkanContext& ctx,
                            uint32_t spec_eval_3D = 0u,
                            uint32_t spec_trace_enabled = 0u,
-                           uint32_t spec_sort_mode = 3u);
+                           uint32_t spec_sort_mode = 3u,
+                           uint32_t spec_eval3d_raw_replay = 0u);
     ~RasterizePass() = default;
 
     RasterizePass(const RasterizePass&)            = delete;

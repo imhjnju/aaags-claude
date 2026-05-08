@@ -216,7 +216,8 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
     std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
     std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf;
-    if (cfg.eval_3D && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
+    const bool use_eval3d_tile_binning = cfg.eval_3D && !cfg.eval_3D_parity_mode;
+    if (use_eval3d_tile_binning && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
         bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
             static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -297,7 +298,7 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
                                  num_tiles_y,
-                                 cfg.eval_3D);
+                                 use_eval3d_tile_binning);
 
     // -------------------------------------------------------------------
     // 5. Download R valid pairs into FrameAllocator-backed output.

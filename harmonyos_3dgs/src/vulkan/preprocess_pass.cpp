@@ -19,7 +19,8 @@ constexpr uint32_t kPreprocessLocalSize = 256;
 
 PreprocessPass::PreprocessPass(VulkanContext& ctx,
                                uint32_t spec_training,
-                               uint32_t spec_eval_3D)
+                               uint32_t spec_eval_3D,
+                               uint32_t spec_proper_ewa)
     : ctx_(ctx) {
     // --- 1. Load SPIR-V module from embedded bytes ------------------------
     shader_ = std::make_unique<VulkanShader>(
@@ -28,23 +29,22 @@ PreprocessPass::PreprocessPass(VulkanContext& ctx,
         static_cast<std::size_t>(preprocess_spv_len));
 
     // --- 2. Specialization constants (spec §4.5) --------------------------
-    // constant_id 0 = spec_training, constant_id 1 = spec_eval_3D.
-    // Both are uint32 values embedded into a contiguous data blob.
+    // constant_id 0 = spec_training, 1 = spec_eval_3D, 2 = spec_proper_ewa.
     struct SpecData {
         uint32_t training;
         uint32_t eval_3D;
+        uint32_t proper_ewa;
     };
-    // Keep SpecData, entries, and spec_info alive across vkCreateComputePipelines.
-    // We hold them on the stack during the VulkanComputePipeline constructor
-    // call; Vulkan copies specialization data at pipeline creation so local
-    // lifetimes are sufficient.
-    SpecData spec_data{spec_training, spec_eval_3D};
-    std::array<VkSpecializationMapEntry, 2> spec_entries{{
+    SpecData spec_data{spec_training, spec_eval_3D, spec_proper_ewa};
+    std::array<VkSpecializationMapEntry, 3> spec_entries{{
         {preprocess_spec::TRAINING,
          static_cast<uint32_t>(offsetof(SpecData, training)),
          sizeof(uint32_t)},
         {preprocess_spec::EVAL_3D,
          static_cast<uint32_t>(offsetof(SpecData, eval_3D)),
+         sizeof(uint32_t)},
+        {2u,  // constant_id for spec_proper_ewa
+         static_cast<uint32_t>(offsetof(SpecData, proper_ewa)),
          sizeof(uint32_t)},
     }};
     VkSpecializationInfo spec_info{};

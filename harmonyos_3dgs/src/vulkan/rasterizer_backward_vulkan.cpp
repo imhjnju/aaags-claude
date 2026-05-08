@@ -35,6 +35,7 @@
 RasterizerBackwardVulkan::RasterizerBackwardVulkan(VulkanContext& ctx)
     : ctx_(ctx) {
     pass_ = std::make_unique<RasterizeBackwardPass>(ctx_);
+    eval3d_pass_ = std::make_unique<RasterizeBackwardEval3DPass>(ctx_);
 }
 
 RasterizerBackwardVulkan::~RasterizerBackwardVulkan() = default;
@@ -72,6 +73,9 @@ void RasterizerBackwardVulkan::prepare_for_n(int N, int R, int num_tiles, int HW
     dlpix_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(HW_new) * 3u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    img_buf_   = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(HW_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     dlm2d_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * 2u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -83,6 +87,17 @@ void RasterizerBackwardVulkan::prepare_for_n(int N, int R, int num_tiles, int HW
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     dlcol_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(N_new) * 3u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    g2s_buf_   = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 16u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dlg2s_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(N_new) * 16u * sizeof(float),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    replay_offsets_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        (static_cast<VkDeviceSize>(HW_new) + 1u) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dummy4_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     ubo_buf_   = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(sizeof(RasterizeBackwardUBO)),
@@ -100,12 +115,8 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                                          const ForwardCache& cache,
                                          const float* dL_dpixels,
                                          RasterGradOutput& rgrad,
-                                         FrameAllocator& alloc) {
-    // --- Guard: eval_3D path not implemented -------------------------------
-    if (pre.eval_3D)
-        throw std::runtime_error(
-            "RasterizerBackwardVulkan::backward: eval_3D=true is not supported");
-
+                                         FrameAllocator& alloc,
+                                         const float* rendered_image) {
     const int W  = cam.width;
     const int H  = cam.height;
     if (W <= 0 || H <= 0) return;
@@ -162,6 +173,88 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         static_cast<VkDeviceSize>(N) * sizeof(float);
     const VkDeviceSize bytes_dL_col =
         static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_dL_g2s =
+        static_cast<VkDeviceSize>(N) * 16u * sizeof(float);
+
+    if (pre.eval_3D) {
+        if (!pre.gauss2screen)
+            throw std::runtime_error("RasterizerBackwardVulkan::backward: missing eval_3D gauss2screen");
+        if (!rendered_image)
+            throw std::runtime_error("RasterizerBackwardVulkan::backward: eval_3D requires rendered_image");
+
+        if (bin.tile_ranges_gpu == nullptr) {
+            tr_buf_->upload(bin.tile_ranges, static_cast<std::size_t>(bytes_tile_ranges));
+        }
+        vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
+        g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
+        col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
+        tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
+        nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
+        img_buf_->upload(rendered_image, static_cast<std::size_t>(bytes_dL_dpix));
+        dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
+
+        std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
+        for (int i = 0; i < N; ++i) {
+            conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+        }
+        co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+
+        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
+        const std::vector<float> zeros_col(static_cast<std::size_t>(N) * 3u, 0.0f);
+        const std::vector<float> zeros_g2s(static_cast<std::size_t>(N) * 16u, 0.0f);
+        dlopa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_dL_opa));
+        dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
+        dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
+
+        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        if (use_replay_order) {
+            replay_offsets_buf_->upload(cache.replay_order_offsets,
+                (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
+            if (cache.replay_order_count > buf_replay_count_) {
+                replay_gids_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(cache.replay_order_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                buf_replay_count_ = cache.replay_order_count;
+            }
+            replay_gids_buf_->upload(cache.replay_order_gids,
+                static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+        }
+
+        RasterizeBackwardUBO ubo{};
+        ubo.W = static_cast<uint32_t>(W);
+        ubo.H = static_cast<uint32_t>(H);
+        ubo.num_tiles_x = num_tiles_x;
+        ubo._pad = use_replay_order ? 1u : 0u;
+        ubo.bg_color[0] = cfg.bg_color[0];
+        ubo.bg_color[1] = cfg.bg_color[1];
+        ubo.bg_color[2] = cfg.bg_color[2];
+        ubo_buf_->upload(&ubo, sizeof(ubo));
+
+        RasterizeBackwardEval3DPass::Buffers rb{};
+        rb.tile_ranges = bin.tile_ranges_gpu
+            ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
+            : tr_buf_->handle();
+        rb.values_sorted = vs_buf_->handle();
+        rb.gauss2screen = g2s_buf_->handle();
+        rb.conic_opacity = co_buf_->handle();
+        rb.colors = col_buf_->handle();
+        rb.T_final = tf_buf_->handle();
+        rb.n_contrib = nc_buf_->handle();
+        rb.rendered_image = img_buf_->handle();
+        rb.dL_dpixels = dlpix_buf_->handle();
+        rb.dL_dgauss2screen = dlg2s_buf_->handle();
+        rb.dL_dopacity = dlopa_buf_->handle();
+        rb.dL_dcolors = dlcol_buf_->handle();
+        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
+        eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
+        eval3d_pass_->dispatch_sync(num_tiles_x, num_tiles_y);
+
+        dlopa_buf_->download(rgrad.d_opacities_2d, static_cast<std::size_t>(bytes_dL_opa));
+        dlcol_buf_->download(rgrad.d_rgb, static_cast<std::size_t>(bytes_dL_col));
+        dlg2s_buf_->download(rgrad.d_gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
+        return;
+    }
 
     // -------------------------------------------------------------------
     // Pack conic + opacity into a single interleaved buffer [N*4]:
@@ -180,8 +273,10 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     // -------------------------------------------------------------------
     // Upload inputs.
     // -------------------------------------------------------------------
-    tr_buf_ ->upload(bin.tile_ranges,
-                     static_cast<std::size_t>(bytes_tile_ranges));
+    if (bin.tile_ranges_gpu == nullptr) {
+        tr_buf_->upload(bin.tile_ranges,
+                        static_cast<std::size_t>(bytes_tile_ranges));
+    }
     vs_buf_ ->upload(bin.values_sorted,
                      static_cast<std::size_t>(bytes_vs));
     m2d_buf_->upload(pre.means2D,
@@ -192,7 +287,7 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                      static_cast<std::size_t>(bytes_colors));
     tf_buf_ ->upload(cache.T_final,
                      static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; we reinterpret as uint32 (same width, counts < 2^31).
+    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
     nc_buf_ ->upload(cache.n_contrib,
                      static_cast<std::size_t>(bytes_ncontrib));
     dlpix_buf_->upload(dL_dpixels,
@@ -237,7 +332,9 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizeBackwardPass::Buffers rb{};
-    rb.tile_ranges   = tr_buf_   ->handle();
+    rb.tile_ranges   = bin.tile_ranges_gpu
+        ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
+        : tr_buf_->handle();
     rb.values_sorted = vs_buf_   ->handle();
     rb.means2D       = m2d_buf_  ->handle();
     rb.conic_opacity = co_buf_   ->handle();
@@ -266,6 +363,32 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                          static_cast<std::size_t>(bytes_dL_col));
 }
 
+void RasterizerBackwardVulkan::download_outputs(
+    int N,
+    std::vector<float>& d_means2D,
+    std::vector<float>& d_conics,
+    std::vector<float>& d_opacity,
+    std::vector<float>& d_rgb,
+    std::vector<float>* d_gauss2screen) const
+{
+    d_means2D.assign(static_cast<std::size_t>(N) * 2u, 0.0f);
+    d_conics.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    d_opacity.assign(static_cast<std::size_t>(N), 0.0f);
+    d_rgb.assign(static_cast<std::size_t>(N) * 3u, 0.0f);
+    if (d_gauss2screen) {
+        d_gauss2screen->assign(static_cast<std::size_t>(N) * 16u, 0.0f);
+    }
+    if (N == 0 || !dlm2d_buf_) return;
+
+    dlm2d_buf_->download(d_means2D.data(), d_means2D.size() * sizeof(float));
+    dlcon_buf_->download(d_conics.data(),  d_conics.size()  * sizeof(float));
+    dlopa_buf_->download(d_opacity.data(), d_opacity.size() * sizeof(float));
+    dlcol_buf_->download(d_rgb.data(),     d_rgb.size()     * sizeof(float));
+    if (d_gauss2screen && dlg2s_buf_) {
+        dlg2s_buf_->download(d_gauss2screen->data(), d_gauss2screen->size() * sizeof(float));
+    }
+}
+
 void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                      const PreprocessOutput& pre,
                                                      const BinningOutput& bin,
@@ -273,12 +396,8 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                      const Camera& cam,
                                                      const RenderConfig& cfg,
                                                      const ForwardCache& cache,
-                                                     const float* dL_dpixels) {
-    // --- Guard: eval_3D path not implemented -------------------------------
-    if (pre.eval_3D)
-        throw std::runtime_error(
-            "RasterizerBackwardVulkan::backward_record_into: eval_3D=true is not supported");
-
+                                                     const float* dL_dpixels,
+                                                     const float* rendered_image) {
     const int W  = cam.width;
     const int H  = cam.height;
     if (W <= 0 || H <= 0) return;
@@ -328,6 +447,84 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         static_cast<VkDeviceSize>(N) * sizeof(float);
     const VkDeviceSize bytes_dL_col =
         static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_dL_g2s =
+        static_cast<VkDeviceSize>(N) * 16u * sizeof(float);
+
+    if (pre.eval_3D) {
+        if (!pre.gauss2screen)
+            throw std::runtime_error("RasterizerBackwardVulkan::backward_record_into: missing eval_3D gauss2screen");
+        if (!rendered_image)
+            throw std::runtime_error("RasterizerBackwardVulkan::backward_record_into: eval_3D requires rendered_image");
+
+        if (bin.tile_ranges_gpu == nullptr) {
+            tr_buf_->upload(bin.tile_ranges, static_cast<std::size_t>(bytes_tile_ranges));
+        }
+        vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
+        g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
+        col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
+        tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
+        nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
+        img_buf_->upload(rendered_image, static_cast<std::size_t>(bytes_dL_dpix));
+        dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
+
+        std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
+        for (int i = 0; i < N; ++i) {
+            conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+        }
+        co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+
+        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
+        const std::vector<float> zeros_col(static_cast<std::size_t>(N) * 3u, 0.0f);
+        const std::vector<float> zeros_g2s(static_cast<std::size_t>(N) * 16u, 0.0f);
+        dlopa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_dL_opa));
+        dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
+        dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
+
+        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        if (use_replay_order) {
+            replay_offsets_buf_->upload(cache.replay_order_offsets,
+                (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
+            if (cache.replay_order_count > buf_replay_count_) {
+                replay_gids_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(cache.replay_order_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                buf_replay_count_ = cache.replay_order_count;
+            }
+            replay_gids_buf_->upload(cache.replay_order_gids,
+                static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+        }
+
+        RasterizeBackwardUBO ubo{};
+        ubo.W = static_cast<uint32_t>(W);
+        ubo.H = static_cast<uint32_t>(H);
+        ubo.num_tiles_x = num_tiles_x;
+        ubo._pad = use_replay_order ? 1u : 0u;
+        ubo.bg_color[0] = cfg.bg_color[0];
+        ubo.bg_color[1] = cfg.bg_color[1];
+        ubo.bg_color[2] = cfg.bg_color[2];
+        ubo_buf_->upload(&ubo, sizeof(ubo));
+
+        RasterizeBackwardEval3DPass::Buffers rb{};
+        rb.tile_ranges = bin.tile_ranges_gpu
+            ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
+            : tr_buf_->handle();
+        rb.values_sorted = vs_buf_->handle();
+        rb.gauss2screen = g2s_buf_->handle();
+        rb.conic_opacity = co_buf_->handle();
+        rb.colors = col_buf_->handle();
+        rb.T_final = tf_buf_->handle();
+        rb.n_contrib = nc_buf_->handle();
+        rb.rendered_image = img_buf_->handle();
+        rb.dL_dpixels = dlpix_buf_->handle();
+        rb.dL_dgauss2screen = dlg2s_buf_->handle();
+        rb.dL_dopacity = dlopa_buf_->handle();
+        rb.dL_dcolors = dlcol_buf_->handle();
+        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
+        eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
+        eval3d_pass_->record(cmd, num_tiles_x, num_tiles_y);
+        return;
+    }
 
     // -------------------------------------------------------------------
     // Pack conic + opacity into a single interleaved buffer [N*4]:
@@ -346,8 +543,10 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     // -------------------------------------------------------------------
     // Upload inputs.
     // -------------------------------------------------------------------
-    tr_buf_ ->upload(bin.tile_ranges,
-                     static_cast<std::size_t>(bytes_tile_ranges));
+    if (bin.tile_ranges_gpu == nullptr) {
+        tr_buf_->upload(bin.tile_ranges,
+                        static_cast<std::size_t>(bytes_tile_ranges));
+    }
     vs_buf_ ->upload(bin.values_sorted,
                      static_cast<std::size_t>(bytes_vs));
     m2d_buf_->upload(pre.means2D,
@@ -358,7 +557,7 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                      static_cast<std::size_t>(bytes_colors));
     tf_buf_ ->upload(cache.T_final,
                      static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; we reinterpret as uint32 (same width, counts < 2^31).
+    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
     nc_buf_ ->upload(cache.n_contrib,
                      static_cast<std::size_t>(bytes_ncontrib));
     dlpix_buf_->upload(dL_dpixels,
@@ -403,7 +602,9 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     // Bind and record into cmd.
     // -------------------------------------------------------------------
     RasterizeBackwardPass::Buffers rb{};
-    rb.tile_ranges   = tr_buf_   ->handle();
+    rb.tile_ranges   = bin.tile_ranges_gpu
+        ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
+        : tr_buf_->handle();
     rb.values_sorted = vs_buf_   ->handle();
     rb.means2D       = m2d_buf_  ->handle();
     rb.conic_opacity = co_buf_   ->handle();

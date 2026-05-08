@@ -12,6 +12,7 @@ static OwnedRawParams make_test_params(int N, int sh_degree = 0) {
     p.sh_degree = sh_degree;
     p.max_coeffs = (sh_degree + 1) * (sh_degree + 1);
     p.resize(N);
+    p.filter_3D.resize(static_cast<size_t>(N));
     for (int i = 0; i < N; i++) {
         p.positions[i*3+0] = (float)i * 0.5f;
         p.positions[i*3+1] = 0.0f;
@@ -21,6 +22,7 @@ static OwnedRawParams make_test_params(int N, int sh_degree = 0) {
         p.rotations[i*4+0] = 1.0f;  // identity quaternion
         for (int j = 1; j < 4; j++) p.rotations[i*4+j] = 0.0f;
         p.opacities[i] = inv_sigmoid(0.5f);  // moderate opacity
+        p.filter_3D[static_cast<size_t>(i)] = 10.0f + static_cast<float>(i);
         for (int j = 0; j < p.max_coeffs * 3; j++)
             p.sh_coeffs[i * p.max_coeffs * 3 + j] = 1.0f;
     }
@@ -40,9 +42,11 @@ TEST(OwnedRawParams, AppendAndCompact) {
     float sc[3] = {-1, -1, -1};
     float rot[4] = {1, 0, 0, 0};
     float sh[3] = {2, 2, 2};
-    p.append(pos, sc, rot, sh, 0.5f);
+    float filter = 42.0f;
+    p.append(pos, sc, rot, sh, 0.5f, &filter);
     EXPECT_EQ(p.count(), 4);
     EXPECT_FLOAT_EQ(p.positions[9], 10.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[3], 42.0f);
 
     // Compact: remove index 1
     std::vector<bool> mask = {false, true, false, false};
@@ -52,6 +56,28 @@ TEST(OwnedRawParams, AppendAndCompact) {
     EXPECT_FLOAT_EQ(p.positions[0], 0.0f);      // original G0
     EXPECT_FLOAT_EQ(p.positions[3], 1.0f);       // original G2 (was at pos 1.0)
     EXPECT_FLOAT_EQ(p.positions[6], 10.0f);      // appended G3
+    EXPECT_FLOAT_EQ(p.filter_3D[0], 10.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[1], 12.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[2], 42.0f);
+}
+
+TEST(OwnedRawParams, AppendBackfillsFilterForExistingRows) {
+    OwnedRawParams p;
+    p.sh_degree = 0;
+    p.max_coeffs = 1;
+    p.resize(2);
+
+    float pos[3] = {10, 20, 30};
+    float sc[3] = {-1, -1, -1};
+    float rot[4] = {1, 0, 0, 0};
+    float sh[3] = {2, 2, 2};
+    float filter = 42.0f;
+    p.append(pos, sc, rot, sh, 0.5f, &filter);
+
+    ASSERT_EQ(p.filter_3D.size(), static_cast<size_t>(p.count()));
+    EXPECT_FLOAT_EQ(p.filter_3D[0], 0.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[1], 0.0f);
+    EXPECT_FLOAT_EQ(p.filter_3D[2], 42.0f);
 }
 
 TEST(OwnedRawParams, AsRawRoundtrip) {

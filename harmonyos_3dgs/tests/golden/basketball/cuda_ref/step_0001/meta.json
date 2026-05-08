@@ -1,0 +1,136 @@
+{
+  "phase": "0.3",
+  "description": "CUDA reference dump for VK-vs-CUDA first-loss parity",
+  "inputs": {
+    "ply": "/home/robota/h00813233/Graph/aaags-claude/basket-aaa.ply",
+    "cameras_json": "/home/robota/Downloads/basketball/_sp0_dump_output/cameras.json",
+    "gt_image": "/home/robota/Downloads/basketball/images/78899858295079.jpg",
+    "gt_image_original_size": [
+      720,
+      960
+    ],
+    "gt_image_resized_to": [
+      720,
+      960
+    ],
+    "gt_image_resize_algo": "none",
+    "cam_id": 0,
+    "img_name": "78899858295079"
+  },
+  "dims": {
+    "N": 400000,
+    "R": 1986226,
+    "W": 720,
+    "H": 960,
+    "tile_w": 16,
+    "tile_h": 16,
+    "num_tiles_x": 45,
+    "num_tiles_y": 60,
+    "num_tiles": 2700,
+    "sh_degree_active": 3,
+    "sh_max_coeffs": 16
+  },
+  "parity_config": {
+    "eval_3D": true,
+    "sort_mode": 0,
+    "sort_order": 0,
+    "near_clipping": false,
+    "lambda_dssim": 0.0,
+    "background": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "sh_degree_max": 3,
+    "new_aabb": true,
+    "scale_modifier": 1.0,
+    "antialiasing": false,
+    "note": "Forces single-level GLOBAL sort (sort_mode=0). Uses new_aabb=true (CUDA C++ default + VK production path). Overrides aaa.json sort_mode=3. filter_3D passed through if PLY had it.",
+    "filter_3D_present": true
+  },
+  "raster_inputs": {
+    "tan_fovx": 0.5098508927088025,
+    "tan_fovy": 0.6784915837831835,
+    "znear": 0.01,
+    "zfar": 100.0,
+    "scale_modifier": 1.0,
+    "prefiltered": false,
+    "render_depth": false,
+    "debug": false
+  },
+  "matrix_layouts": {
+    "view_matrix.npy": {
+      "shape": [
+        4,
+        4
+      ],
+      "dtype": "float32",
+      "convention": "row-major numpy storage of cam.world_view_transform (the exact tensor CUDA receives). Because numpy row-major storage of a matrix X is byte-identical to column-major storage of X.T, and this tensor IS W2C.T, the file is byte-identical to 'column-major W2C' \u2014 which is what VK's loadCameraJson writes into Camera.view_matrix[16]. Use np.load(...).reshape(-1) for VK vec4x4 comparison."
+    },
+    "view_matrix_cuda_native.npy": {
+      "shape": [
+        4,
+        4
+      ],
+      "convention": "Same bytes as view_matrix.npy; alias for clarity."
+    },
+    "view_matrix_canonical_row_major.npy": {
+      "shape": [
+        4,
+        4
+      ],
+      "convention": "Mathematical W2C with standard [row, col] indexing (row-major). Transpose of view_matrix.npy viewed as a mathematical matrix. Use this if an assertion wants W2C @ p_world to give p_view directly."
+    },
+    "proj_matrix.npy": {
+      "shape": [
+        4,
+        4
+      ],
+      "convention": "row-major numpy storage of cam.full_proj_transform (=world_view_transform @ projection_matrix, each pre-transposed). Byte-identical to 'column-major viewproj = proj * view' \u2014 matches VK Camera.viewproj_matrix."
+    },
+    "proj_matrix_cuda_native.npy": {
+      "shape": [
+        4,
+        4
+      ],
+      "convention": "Alias of proj_matrix.npy."
+    },
+    "cam_position.npy": {
+      "shape": [
+        3
+      ],
+      "convention": "World-space camera center."
+    },
+    "tan_fov.npy": {
+      "shape": [
+        2
+      ],
+      "convention": "[tan_fovx, tan_fovy]"
+    }
+  },
+  "outputs": {
+    "view_matrix.npy": "col-major W2C",
+    "proj_matrix.npy": "col-major full_proj",
+    "cam_position.npy": "(3,) float32 cam center world-space",
+    "tan_fov.npy": "(2,) [tan_fovx, tan_fovy]",
+    "raw_params.npz": "raw_positions(N,3), raw_scales(N,3), raw_rotations(N,4) quat (r,x,y,z), raw_opacities(N,), raw_sh_coeffs(N,16,3) [gaussian, coeff, channel] (CUDA native; note VK ply_loader uses channel-major-rest so a transpose is needed on VK side).",
+    "gt_image.npy": "(3,H,W) float32 in [0,1]",
+    "rendered_image.npy": "(3,H,W) float32 CUDA render output",
+    "means2D.npy": "(N,2) pixel coordinates, center of image = (W/2, H/2)",
+    "conic_opacity.npy": "(N,4) (conic.a, conic.b, conic.c, opacity)",
+    "rgb_colors.npy": "(N,3) SH-evaluated RGB before clamp-min in kernel",
+    "radii.npy": "(N,) int32 per-Gaussian screen-space radius",
+    "tiles_touched.npy": "(N,) int32 per-Gaussian tile touch count",
+    "depths.npy": "(N,) float32 per-Gaussian sort depth",
+    "T_final.npy": "(H,W) float32 per-pixel final transmittance (accum_alpha)",
+    "n_contrib.npy": "(H,W) int32 per-pixel contribution count",
+    "sorted_ids_per_tile.npy": "(R,) int32 flattened Gaussian IDs in render order, concatenated per tile.",
+    "tile_offsets.npy": "(num_tiles+1,) int32 start offsets; tile i's IDs are sorted_ids_per_tile[offsets[i]:offsets[i+1]]. Last entry = R.",
+    "l1_loss.npy": "(1,) float32 L1(render - gt).mean() over all CHW pixels"
+  },
+  "sort_layout_sanity": {
+    "tile_ranges_contiguous": true,
+    "note": "For sort_mode=0 (GLOBAL), stopthepop uses contiguous per-tile ranges. Contiguity checked above. If False, tile_offsets still accurately indexes each tile's segment but gaps between tiles are possible."
+  },
+  "l1_loss": 0.0613514706492424
+}

@@ -1,0 +1,567 @@
+#version 450
+
+// rasterize_hierarchical.comp — eval_3D hierarchical k-buffer rasterizer.
+//
+// Standalone shader for the eval_3D path extracted from rasterize.comp.
+// One workgroup = one 16x16 tile. Each invocation = one pixel. The workgroup
+// cooperatively loads batches of up to 256 Gaussians from the sorted list for
+// its tile into shared memory, then every pixel-thread walks the batch in
+// sub-tile-sorted order and front-to-back alpha-blends Gaussians that cover it
+// via a per-pixel HEAD k-buffer until transmittance T falls below a threshold
+// or the tile's Gaussian list ends.
+//
+// CUDA reference: AAA-Gaussians/submodules/diff-gaussian-rasterization/
+//   cuda_rasterizer/forward.cu: renderCUDA(...) — the algorithm we mirror.
+//
+// Bindings match rasterize_bind:: in include/vulkan/preprocess_bindings.h.
+//
+// NUMERICAL CONTRACTS (match CUDA bit-for-bit given identical inputs):
+//   - alpha threshold    : ALPHA_THRESHOLD = 1.0 / 255.0
+//   - T  (early-out)     : T_MIN           = 0.0001
+//   - alpha cap          : min(0.99, opacity * exp(power))   (forward.cu:366)
+//   - power              : from maxContribRayPixel
+//   - power > 0 skip     : Gaussian evaluated behind its own peak — skip.
+//   - n_contrib          : count of Gaussians actually blended into C
+//                          (those passing both alpha >= 1/255 AND test_T >= T_MIN).
+//                          The Gaussian that first trips T < T_MIN is NOT counted.
+//   - output layout      : CHW. out_image[ch*H*W + y*W + x]  (channel-first, matches CUDA/PyTorch).
+//   - background         : final color = C_accum + T_final * bg_color (always
+//                          applied, even when bg is zero).
+//
+// Shared memory footprint: s_g2s (16 KB) + s_opa (1 KB) +
+//                           s_rgb_{r,g,b}+s_gid (4 KB) +
+//                           sub_order[16][256] uint (16 KB) +
+//                           sub_count[16] (64 B) ≈ 37 KB.
+// Fits within typical Vulkan maxComputeSharedMemorySize (>= 32 KB on
+// target hardware; 48 KB on desktop).
+//
+// Synchronisation: barriers bracket each batch's cooperative load; pixels
+// whose tile has early-terminated still participate in barriers so divergent
+// pixel_done states don't hang the workgroup (no barrier inside the per-pixel
+// k-loop — that loop is fully divergent but contains no barrier calls).
+
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// binding 0 — Phase 2.3a v2 packed keyvals_sorted (u64 per (Gaussian,tile) pair).
+// Layout: bits [48..63]=tile_id, [20..47]=depth_q28, [0..19]=gauss_idx.
+// Rasterize extracts gauss_idx via (kv & 0xFFFFF). The legacy values_sorted
+// (separate uint[R]) array is gone — radix sort is automatically stable on
+// gauss_idx because it lives in the low bits.
+layout(std430, set = 0, binding = 0) readonly buffer KeyvalsSorted {
+    uint64_t keyvals_sorted[];
+};
+
+// binding 1 — [start0, end0, start1, end1, ...] inclusive/exclusive per tile.
+layout(std430, set = 0, binding = 1) readonly buffer TileRanges {
+    uint tile_ranges[];
+};
+
+// binding 2 — means2D interleaved [x0,y0, x1,y1, ...].
+layout(std430, set = 0, binding = 2) readonly buffer Means2D {
+    float means2D[];
+};
+
+// binding 3 — packed [a, b, c, opacity] per Gaussian (stride 4 floats).
+layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity {
+    float conic_opacity[];
+};
+
+// binding 4 — per-Gaussian RGB [r,g,b] interleaved (stride 3 floats).
+layout(std430, set = 0, binding = 4) readonly buffer RGB {
+    float rgb[];
+};
+
+// binding 5 — output image, CHW: [R-plane | G-plane | B-plane], each H*W.
+layout(std430, set = 0, binding = 5) writeonly buffer OutImage {
+    float out_image[];
+};
+
+// binding 6 — per-pixel final transmittance (H*W floats).
+layout(std430, set = 0, binding = 6) writeonly buffer Transmittance {
+    float transmittance[];
+};
+
+// binding 7 — per-pixel blended-Gaussian count (H*W uints).
+layout(std430, set = 0, binding = 7) writeonly buffer NContrib {
+    uint n_contrib[];
+};
+
+// binding 8 — background colour UBO (std140, 16 bytes).
+layout(std140, set = 0, binding = 8) uniform RasterUBO {
+    vec4 bg_color;  // (R, G, B, unused)
+};
+
+// eval_3D bindings (9..13).
+layout(std430, set = 0, binding = 9)  readonly buffer Gauss2Screen { float gauss2screen[]; };  // [N*16] row-major
+layout(std430, set = 0, binding = 10) readonly buffer Opacities2D  { float opacities_2d[]; };  // [N] pre-dilated opacity
+layout(std430, set = 0, binding = 11) readonly buffer Cov3DInv     { float cov3D_inv[];    };  // [N*6] inverse 3D cov
+layout(std430, set = 0, binding = 12) readonly buffer MeanOffset   { float mean_offset[];  };  // [N*3] (pos - cam_pos)
+layout(std140, set = 0, binding = 13) uniform RasterEval3DUBO {
+    mat4 inverse_vp;        // 64B: inverse viewproj (column-major)
+    vec4 cam_pos_pad;       // 16B: xyz=cam_pos, w=0
+    vec4 img_size_pad;      // 16B: x=width, y=height, z=0, w=0
+} eval3d_ubo;
+
+// RasterizePushConstants — 20 bytes (spec §4.8.7).
+layout(push_constant) uniform PC {
+    uint num_gaussians;  // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
+    uint image_width;
+    uint image_height;
+    uint num_tiles_x;
+    uint num_tiles_y;    // layout padding — kept to match RasterizePushConstants (spec §4.8.7)
+} pc;
+
+// --- Shared cache of the current batch (up to 256 Gaussians) ---
+shared float s_rgb_r  [256];
+shared float s_rgb_g  [256];
+shared float s_rgb_b  [256];
+shared uint  s_gid    [256];
+
+// eval_3D shared memory: gauss2screen all 4 rows (16 floats per Gaussian),
+// opacity. s_rgb_r/g/b and s_gid are reused.
+// Total eval_3D: 16*256*4 + 1*256*4 + reused = ~17 KB + 4 KB reused.
+shared float s_g2s  [256 * 16];  // all 4 rows of gauss2screen (need row 2 for depth)
+shared float s_opa  [256];       // pre-dilated opacity (eval_3D)
+
+// Hierarchical sub-tile re-sort (sort_mode=3 simplified — spec §4.8.7).
+// CUDA sortGaussiansRayHierarchicalCUDA_forward builds a per-4x4-sub-tile TAIL
+// that is sorted by sub-tile-center depth; the sorted TAIL is then streamed to
+// per-pixel HEAD k-buffers. We approximate that here with a PERMUTATION buffer
+// per sub-tile: for each batch of up to 256 Gaussians, one designated leader
+// thread per sub-tile sorts the batch indices by sub-tile-center NDC depth and
+// writes a permutation into `sub_order[subtile_id][0..BATCH_SIZE-1]`. Every
+// pixel in the sub-tile then walks the shared batch in THAT order (instead of
+// raw input order) and feeds its per-pixel HEAD k-buffer.
+//
+// Simplifications vs the full CUDA algorithm:
+//   - MID (2x2-group) queue is elided. Depth refinement jumps directly from
+//     4x4 sub-tile to per-pixel HEAD.
+//   - 4x4 alpha culling (hierarchical_4x4_culling) is NOT applied in step 2:
+//     CUDA uses max_contrib_gaussian_frustum_3D over the 3x3 rect; a cheap
+//     centre-alpha proxy over-culls Gaussians whose peak is off-centre. We
+//     rely on the per-pixel alpha test in step 3 instead.
+//   - Streaming drain to HEAD on TAIL overflow is replaced with a full-batch
+//     sort + sweep: every qualifying Gaussian is sorted once per batch and
+//     fed to HEAD in that order. No Gaussians are dropped.
+// Shared memory: 16 sub-tiles * 256 slots * 4B = 16 KB.
+const int  NUM_SUBTILES = 16;
+shared uint sub_order[NUM_SUBTILES][256];  // permutation of [0..batch_size) per sub-tile
+shared int  sub_count[NUM_SUBTILES];        // culled-in count per sub-tile for this batch
+
+const float ALPHA_THRESHOLD = 1.0 / 255.0;  // forward.cu: alpha < 1/255
+const float T_MIN           = 0.0001;       // forward.cu: test_T < 0.0001
+const uint  BATCH_SIZE      = 256u;         // 16*16 pixels per tile.
+
+// --- eval_3D helper functions ------------------------------------------------
+// Ported from preprocess.comp (which in turn ports consistent_common.cuh).
+// All functions take g2s row-major: g2s[row*4+col] = M_{row,col}.
+
+float maxContribRay_frustum(float plane_a[4], float plane_b[4], out float max_pos[4]) {
+    float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
+    float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
+    float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
+    float mx = plane_a[3]*plane_b[0] - plane_a[0]*plane_b[3];
+    float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
+    float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
+    float dd = dx*dx + dy*dy + dz*dz;
+    if (dd < 1e-8) { max_pos = float[4](0.0, 0.0, 0.0, 1.0); return 0.0; }
+    float md[3] = float[3](mx/dd, my/dd, mz/dd);
+    max_pos[0] = dy*md[2] - dz*md[1];
+    max_pos[1] = dz*md[0] - dx*md[2];
+    max_pos[2] = dx*md[1] - dy*md[0];
+    max_pos[3] = 1.0;
+    return mx*md[0] + my*md[1] + mz*md[2];
+}
+
+float maxContribPlane_frustum(float plane[4], float g2s[16], out float mps[4]) {
+    float norm = plane[3] / (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]);
+    float mpg[4] = float[4](-plane[0]*norm, -plane[1]*norm, -plane[2]*norm, 1.0);
+    for (int ii = 0; ii < 4; ii++) {
+        mps[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++) mps[ii] += g2s[ii*4+jj] * mpg[jj];
+    }
+    return plane[3] * norm;
+}
+
+float maxContribRayScreen_frustum(float pa[4], float pb[4], float g2s[16], out float mps[4]) {
+    float mp[4];
+    float c = maxContribRay_frustum(pa, pb, mp);
+    for (int ii = 0; ii < 4; ii++) {
+        mps[ii] = 0.0;
+        for (int jj = 0; jj < 4; jj++) mps[ii] += g2s[ii*4+jj] * mp[jj];
+    }
+    return c;
+}
+
+bool inRange_frustum(float ps[4], float rf[3], float ext[3], int dim) {
+    if (ps[3] <= 0.0) return false;
+    float d = ps[dim] - rf[dim] * ps[3];
+    return d > 0.0 && d < ext[dim] * ps[3];
+}
+
+bool inRange_frustum_d(float ps[4], float rf[3], float ext[3], int dim, out float d) {
+    if (ps[3] <= 0.0) { d = 0.0; return false; }
+    d = ps[dim] - rf[dim] * ps[3];
+    return d > 0.0 && d < ext[dim] * ps[3];
+}
+
+// Returns 0.5 * min_Mahalanobis_sq over the 4x4 sub-tile rect [rminx, rminx+4) x [rminy, rminy+4).
+// Port of preprocess.comp:maxContribGaussianFrustum3D / consistent_common.cuh.
+// g2s stores (W*G) row-major: g2s[row*4+col] = (world2screen * gauss2world)_{row,col}.
+float maxContribFrustum3D_4x4(float rminx, float rminy, float g2s[16], out float depth) {
+    float rf[3] = float[3](rminx, rminy, -1.0);
+    float ext[3] = float[3](4.0, 4.0, 2.0);  // 4x4 sub-tile covers pixel coords in [rminx, rminx+4)
+
+    float mc = 1e30;
+    float mps[4] = float[4](1.0, 1.0, 1.0, 1.0);
+    // Last column of row-major (W*G) = Gaussian center in screen space.
+    float mean_s[4] = float[4](g2s[3], g2s[7], g2s[11], g2s[15]);
+
+    // Guard: behind-camera (w<=0) — the inRange checks invert with negative w.
+    // Return 0.0 (no cull) to be conservative; these Gaussians are handled
+    // by the per-pixel power>0 check in step 3.
+    if (mean_s[3] <= 0.0) { depth = 0.0; return 0.0; }
+
+    float d0, d1, d2;
+    bool bx = inRange_frustum_d(mean_s, rf, ext, 0, d0);
+    bool by = inRange_frustum_d(mean_s, rf, ext, 1, d1);
+    bool bz = inRange_frustum_d(mean_s, rf, ext, 2, d2);
+
+    if (bx && by && bz) {
+        for (int i = 0; i < 4; i++) mps[i] = mean_s[i];
+        mc = 0.0;
+    } else {
+        float dxs = (d0 - (2.0 * mean_s[3])) >= 0.0 ? 2.0 : -2.0;  // EXTENT[0]*0.5 = 2.0
+        float dys = (d1 - (2.0 * mean_s[3])) >= 0.0 ? 2.0 : -2.0;
+
+        float cx = rf[0] + 2.0 + dxs;
+        float cy = rf[1] + 2.0 + dys;
+        float ocx = rf[0] + 2.0 - dxs;
+        float ocy = rf[1] + 2.0 - dys;
+
+        float cpx[4], cpy[4], opx[4], opy[4];
+        for (int i = 0; i < 4; i++) {
+            cpx[i] = g2s[0*4+i] - g2s[3*4+i] * cx;
+            cpy[i] = g2s[1*4+i] - g2s[3*4+i] * cy;
+            opx[i] = g2s[0*4+i] - g2s[3*4+i] * ocx;
+            opy[i] = g2s[1*4+i] - g2s[3*4+i] * ocy;
+        }
+
+        float ps[4]; float c;
+
+        c = maxContribPlane_frustum(cpx, g2s, ps);
+        if (c < mc && inRange_frustum(ps, rf, ext, 1) && inRange_frustum(ps, rf, ext, 2))
+            { mc = c; for (int i=0;i<4;i++) mps[i]=ps[i]; }
+
+        c = maxContribPlane_frustum(cpy, g2s, ps);
+        if (c < mc && inRange_frustum(ps, rf, ext, 0) && inRange_frustum(ps, rf, ext, 2))
+            { mc = c; for (int i=0;i<4;i++) mps[i]=ps[i]; }
+
+        c = maxContribRayScreen_frustum(cpx, cpy, g2s, ps);
+        if (c < mc && inRange_frustum(ps, rf, ext, 2))
+            { mc = c; for (int i=0;i<4;i++) mps[i]=ps[i]; }
+
+        c = maxContribRayScreen_frustum(cpx, opy, g2s, ps);
+        if (c < mc && inRange_frustum(ps, rf, ext, 2))
+            { mc = c; for (int i=0;i<4;i++) mps[i]=ps[i]; }
+
+        c = maxContribRayScreen_frustum(opx, cpy, g2s, ps);
+        if (c < mc && inRange_frustum(ps, rf, ext, 2))
+            { mc = c; for (int i=0;i<4;i++) mps[i]=ps[i]; }
+    }
+    // Safety: if no valid candidate found (mc == 1e30), don't cull — return 0.
+    // This is conservative: it means "max alpha could be opacity" (no reduction).
+    if (mc >= 1e29) { depth = 0.0; return 0.0; }
+    depth = mps[2] / mps[3];
+    return 0.5 * mc;
+}
+
+// Port of CUDA consistent_common.cuh:max_contrib_ray.
+// Returns squared Mahalanobis distance (peak exponent) and sets max_pos to
+// the closest-approach point on the ray (in Gaussian homogeneous coordinates).
+// Caller uses max_pos with g2s rows 2,3 to compute NDC depth.
+float maxContribRayPixel(float plane_a[4], float plane_b[4], out float max_pos[4]) {
+    float dx = plane_a[1]*plane_b[2] - plane_a[2]*plane_b[1];
+    float dy = plane_a[2]*plane_b[0] - plane_a[0]*plane_b[2];
+    float dz = plane_a[0]*plane_b[1] - plane_a[1]*plane_b[0];
+    float mx = plane_a[3]*plane_b[0] - plane_a[0]*plane_b[3];
+    float my = plane_a[3]*plane_b[1] - plane_a[1]*plane_b[3];
+    float mz = plane_a[3]*plane_b[2] - plane_a[2]*plane_b[3];
+    float dd = dx*dx + dy*dy + dz*dz;
+    if (dd < 1e-8) {
+        max_pos = float[4](0.0, 0.0, 0.0, 1.0);
+        return 0.0;
+    }
+    float m_div_dd[3] = float[3](mx/dd, my/dd, mz/dd);
+    max_pos[0] = dy*m_div_dd[2] - dz*m_div_dd[1];
+    max_pos[1] = dz*m_div_dd[0] - dx*m_div_dd[2];
+    max_pos[2] = dx*m_div_dd[1] - dy*m_div_dd[0];
+    max_pos[3] = 1.0;
+    return mx*m_div_dd[0] + my*m_div_dd[1] + mz*m_div_dd[2];
+}
+
+void main() {
+    // --- Tile -> range lookup ---
+    uint tile_id = gl_WorkGroupID.y * pc.num_tiles_x + gl_WorkGroupID.x;
+    uint range_start = tile_ranges[tile_id * 2u + 0u];
+    uint range_end   = tile_ranges[tile_id * 2u + 1u];
+
+    // --- Per-pixel coordinates ---
+    uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    bool valid_pixel = (pixel_x < pc.image_width) && (pixel_y < pc.image_height);
+
+    // Linear index into shared cache for cooperative loads (0..255).
+    uint local_idx = gl_LocalInvocationIndex;
+
+    // Per-pixel accumulators.
+    float T = 1.0;
+    vec3  C = vec3(0.0);
+    uint  n = 0u;
+    // Pixels outside the image still participate in cooperative loads/barriers
+    // but contribute nothing; treat them as already-done for the blending loop.
+    bool pixel_done = !valid_pixel;
+
+    // =================================================================
+    // eval_3D path: simplified hierarchical cascade (sort_mode=3).
+    //
+    // Port of CUDA sortGaussiansRayHierarchicalCUDA_forward (hierarchical_
+    // render.cuh) with MID queue elided. The 16x16 tile is decomposed into
+    // sixteen 4x4 sub-tiles. Per batch of up to 256 Gaussians, one leader
+    // thread per sub-tile (pixel (0,0) within each 4x4 block) sorts the
+    // batch indices by sub-tile-center NDC depth and writes a permutation
+    // into `sub_order[subtile_id]`. Every pixel in the sub-tile then walks
+    // the batch in that sub-tile-sorted order (not the raw tile-center-sorted
+    // input order) and feeds its private HEAD k-buffer.
+    //
+    // Why it helps over pure HEAD-only: the global sort is by tile-center
+    // depth, a coarse proxy. At 4x4 granularity neighbouring Gaussians can
+    // swap depth positions — a HEAD k-buffer alone cannot correct
+    // large reorderings. The sub-tile re-sort delivers Gaussians to HEAD
+    // already in near-correct per-pixel depth order, so HEAD's small window
+    // suffices.
+    //
+    // Streaming semantics: every batch Gaussian that passes 4x4-center
+    // culling is placed into `sub_order` (no drops), so each pixel still
+    // sees every qualifying Gaussian — we only REORDER the stream.
+    // =================================================================
+
+    // Per-pixel k-buffer (HEAD): HEAD_W sorted slots (ascending per-pixel depth).
+    // Private (per-thread register/local memory) — no shared memory needed.
+    // HEAD_W=8 matches CUDA exactly. Depth refinement comes from the TAIL
+    // (sub-tile-center) re-sort upstream, not from a wider HEAD window.
+    const int HEAD_W = 8;
+    float kbuf_depth[HEAD_W];
+    float kbuf_alpha[HEAD_W];
+    float kbuf_r[HEAD_W];
+    float kbuf_g[HEAD_W];
+    float kbuf_b[HEAD_W];
+    int kbuf_size = 0;
+    for (int i = 0; i < HEAD_W; i++) {
+        kbuf_depth[i] = 1e30;
+        kbuf_alpha[i] = 0.0;
+        kbuf_r[i] = 0.0; kbuf_g[i] = 0.0; kbuf_b[i] = 0.0;
+    }
+
+    // Sub-tile identification (4x4 pixel blocks in the 16x16 workgroup).
+    uint stx = gl_LocalInvocationID.x / 4u;   // 0..3
+    uint sty = gl_LocalInvocationID.y / 4u;   // 0..3
+    uint subtile_id = sty * 4u + stx;          // 0..15
+    float subtile_cx = float(gl_WorkGroupID.x * 16u + 4u * stx) + 2.0;
+    float subtile_cy = float(gl_WorkGroupID.y * 16u + 4u * sty) + 2.0;
+    // Sub-tile rect min corner (pixel coordinates of top-left pixel center).
+    float subtile_rx = float(gl_WorkGroupID.x * 16u + 4u * stx);
+    float subtile_ry = float(gl_WorkGroupID.y * 16u + 4u * sty);
+
+    // Leader thread for each sub-tile: pixel (0,0) within its 4x4 block.
+    bool is_subtile_leader = ((gl_LocalInvocationID.x % 4u) == 0u) &&
+                             ((gl_LocalInvocationID.y % 4u) == 0u);
+
+    for (uint batch_start = range_start;
+         batch_start < range_end;
+         batch_start += BATCH_SIZE)
+    {
+        // 1. Cooperative load into shared memory.
+        uint load_idx = batch_start + local_idx;
+        if (load_idx < range_end) {
+            // Phase 2.3a: gauss_idx lives in low 20 bits of the packed keyval.
+            uint gid = uint(keyvals_sorted[load_idx]) & 0xFFFFFu;
+            s_gid[local_idx] = gid;
+            for (int j = 0; j < 4; j++) {
+                s_g2s[local_idx * 16u + uint(j)]       = gauss2screen[gid * 16u + 0u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 4u + uint(j)]  = gauss2screen[gid * 16u + 1u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 8u + uint(j)]  = gauss2screen[gid * 16u + 2u * 4u + uint(j)];
+                s_g2s[local_idx * 16u + 12u + uint(j)] = gauss2screen[gid * 16u + 3u * 4u + uint(j)];
+            }
+            s_opa[local_idx]   = conic_opacity[gid * 4u + 3u];
+            s_rgb_r[local_idx] = rgb[gid * 3u + 0u];
+            s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
+            s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
+        }
+        if (local_idx < uint(NUM_SUBTILES)) {
+            sub_count[local_idx] = 0;
+        }
+        barrier();
+
+        uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+
+        // 2. Leader thread per sub-tile builds the sorted permutation.
+        //    Uses maxContribFrustum3D_4x4 to cull Gaussians whose maximum
+        //    contribution over the entire 4x4 sub-tile is below ALPHA_THRESHOLD
+        //    (Phase 3.2 — port of CUDA CULL_ALPHA path in hierarchical_render.cuh).
+        //    Depth comes directly from the frustum result, avoiding a second ray eval.
+        if (is_subtile_leader) {
+            float priv_depth[256];
+            int cnt = 0;
+
+            for (uint k = 0u; k < batch_size; ++k) {
+                // Load g2s for this Gaussian into a local array for the frustum function.
+                float g2s_k[16];
+                for (int j = 0; j < 16; j++) g2s_k[j] = s_g2s[k * 16u + uint(j)];
+
+                // Frustum cull: skip if max possible alpha over entire 4x4 sub-tile is tiny.
+                // Separate from the sort depth (which comes from the sub-tile center ray below).
+                float _frustum_depth_unused;
+                float cull_power = maxContribFrustum3D_4x4(subtile_rx, subtile_ry, g2s_k, _frustum_depth_unused);
+                if (min(0.99, s_opa[k] * exp(-cull_power)) < ALPHA_THRESHOLD) continue;
+
+                // Sort depth: evaluate at sub-tile center ray (original method, unchanged).
+                float plane_x[4], plane_y[4];
+                for (int j = 0; j < 4; j++) {
+                    plane_x[j] = g2s_k[0*4+j] - g2s_k[3*4+j] * subtile_cx;
+                    plane_y[j] = g2s_k[1*4+j] - g2s_k[3*4+j] * subtile_cy;
+                }
+                float max_pos[4];
+                maxContribRayPixel(plane_x, plane_y, max_pos);
+                float w_ndc = 0.0, z_ndc = 0.0;
+                for (int j = 0; j < 4; j++) {
+                    w_ndc += g2s_k[3*4+j] * max_pos[j];
+                    z_ndc += g2s_k[2*4+j] * max_pos[j];
+                }
+                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+                float sort_depth = (w_ndc > 1e-6 ? z_ndc / w_ndc : z_ndc) + 8.0;
+
+                // Bubble-up insertion into the ascending-depth permutation.
+                priv_depth[cnt] = sort_depth;
+                sub_order[subtile_id][cnt] = k;
+                for (int i = cnt; i > 0; --i) {
+                    if (priv_depth[i - 1] > priv_depth[i]) {
+                        float td = priv_depth[i];
+                        priv_depth[i]     = priv_depth[i - 1];
+                        priv_depth[i - 1] = td;
+                        uint tk = sub_order[subtile_id][i];
+                        sub_order[subtile_id][i]     = sub_order[subtile_id][i - 1];
+                        sub_order[subtile_id][i - 1] = tk;
+                    } else {
+                        break;
+                    }
+                }
+                cnt += 1;
+            }
+            sub_count[subtile_id] = cnt;
+        }
+        barrier();
+
+        // 3. Each pixel streams the sub-tile-sorted batch into HEAD.
+        if (!pixel_done) {
+            int tsz = sub_count[subtile_id];
+            float fpx = float(pixel_x);
+            float fpy = float(pixel_y);
+
+            for (int t = 0; t < tsz; ++t) {
+                uint k = sub_order[subtile_id][t];
+
+                float plane_x[4], plane_y[4];
+                for (int j = 0; j < 4; j++) {
+                    plane_x[j] = s_g2s[k * 16u + uint(j)]      - s_g2s[k * 16u + 12u + uint(j)] * fpx;
+                    plane_y[j] = s_g2s[k * 16u + 4u + uint(j)] - s_g2s[k * 16u + 12u + uint(j)] * fpy;
+                }
+
+                float max_pos[4];
+                float power = -0.5 * maxContribRayPixel(plane_x, plane_y, max_pos);
+                if (power > 0.0) continue;
+
+                float alpha = min(0.99, s_opa[k] * exp(power));
+                if (alpha < ALPHA_THRESHOLD) continue;
+
+                float w_ndc = 0.0, z_ndc = 0.0;
+                for (int j = 0; j < 4; j++) {
+                    w_ndc += s_g2s[k * 16u + 12u + uint(j)] * max_pos[j];
+                    z_ndc += s_g2s[k * 16u + 8u + uint(j)]  * max_pos[j];
+                }
+                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+                // Per-pixel depth for HEAD k-buffer.
+                // Use z_ndc + 8.0 (same +8 bias as scatter.comp; w_ndc is ~ constant per tile,
+                // so z_ndc alone gives correct relative ordering within a tile's pre-sorted list).
+                float sort_depth = z_ndc;
+
+                // HEAD overflow: blend shallowest entry, pop.
+                if (kbuf_size == HEAD_W) {
+                    float a0 = kbuf_alpha[0];
+                    float test_T0 = T * (1.0 - a0);
+                    if (test_T0 < T_MIN) { pixel_done = true; break; }
+                    C.r += kbuf_r[0] * a0 * T;
+                    C.g += kbuf_g[0] * a0 * T;
+                    C.b += kbuf_b[0] * a0 * T;
+                    T = test_T0; n += 1u;
+                    for (int i = 1; i < HEAD_W; i++) {
+                        kbuf_depth[i-1] = kbuf_depth[i]; kbuf_alpha[i-1] = kbuf_alpha[i];
+                        kbuf_r[i-1] = kbuf_r[i]; kbuf_g[i-1] = kbuf_g[i]; kbuf_b[i-1] = kbuf_b[i];
+                    }
+                    kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+                }
+
+                if (pixel_done) break;
+
+                // Insertion-sort into HEAD (ascending per-pixel depth).
+                float id = sort_depth, ia = alpha;
+                float ir = s_rgb_r[k], ig = s_rgb_g[k], ib = s_rgb_b[k];
+                for (int i = 0; i < HEAD_W; i++) {
+                    if (id < kbuf_depth[i]) {
+                        float td = kbuf_depth[i]; kbuf_depth[i] = id; id = td;
+                        float ta = kbuf_alpha[i]; kbuf_alpha[i] = ia; ia = ta;
+                        float tr = kbuf_r[i]; kbuf_r[i] = ir; ir = tr;
+                        float tg = kbuf_g[i]; kbuf_g[i] = ig; ig = tg;
+                        float tb = kbuf_b[i]; kbuf_b[i] = ib; ib = tb;
+                    }
+                }
+                kbuf_size += 1;
+            }
+        }
+        barrier();
+    }
+
+    // Flush remaining HEAD entries.
+    if (!pixel_done) {
+        for (int i = 0; i < HEAD_W; i++) {
+            if (kbuf_size <= 0) break;
+            float a0 = kbuf_alpha[0];
+            float test_T0 = T * (1.0 - a0);
+            if (test_T0 < T_MIN) { pixel_done = true; break; }
+            C.r += kbuf_r[0] * a0 * T;
+            C.g += kbuf_g[0] * a0 * T;
+            C.b += kbuf_b[0] * a0 * T;
+            T = test_T0; n += 1u;
+            for (int j = 1; j < HEAD_W; j++) {
+                kbuf_depth[j-1] = kbuf_depth[j]; kbuf_alpha[j-1] = kbuf_alpha[j];
+                kbuf_r[j-1] = kbuf_r[j]; kbuf_g[j-1] = kbuf_g[j]; kbuf_b[j-1] = kbuf_b[j];
+            }
+            kbuf_depth[HEAD_W-1] = 1e30; kbuf_size -= 1;
+        }
+    }
+
+    // --- Write final outputs ---
+    if (valid_pixel) {
+        uint px = pixel_y * pc.image_width + pixel_x;
+        uint HW = pc.image_width * pc.image_height;
+        // Always composite against bg; for golden fixtures bg=(0,0,0,0).
+        out_image[0u * HW + px] = C.r + T * bg_color.x;
+        out_image[1u * HW + px] = C.g + T * bg_color.y;
+        out_image[2u * HW + px] = C.b + T * bg_color.z;
+        transmittance[px] = T;
+        n_contrib[px]     = n;
+    }
+}

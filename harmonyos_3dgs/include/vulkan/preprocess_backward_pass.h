@@ -59,9 +59,26 @@ public:
         VkBuffer cov2D_cache_in;      // RO float[N*3]  (fa, fb, fc) dilated cov2D from forward
         VkBuffer cov2D_det_cache_in;  // RO float[N]    det = fa*fc - fb*fb from forward
         VkBuffer p_hom_w_cache_in;    // RO float[N]    p_hom.w from forward (inv_w for Part D)
+        VkBuffer debug_d_fabc;        // WO float[N*3]
+        VkBuffer debug_d_cov3D;       // WO float[N*6]
+        VkBuffer debug_d_M;           // WO float[N*9]
+        VkBuffer debug_d_scale;       // WO float[N*3]
+        VkBuffer debug_d_R;           // WO float[N*9]
+        VkBuffer debug_d_qn;          // WO float[N*4]
     };
 
-    explicit PreprocessBackwardPass(VulkanContext& ctx);
+    /// @param spec_proper_ewa  Specialization constant gating the h_conv_scaling
+    /// chain rule. MUST match the value passed to the forward PreprocessPass
+    /// (constant_id = 2 there). When 0 (proper_ewa_scaling disabled) the
+    /// backward skips the h_conv chain to mirror CUDA backward.cu:215 and the
+    /// forward.cu:157 identity branch.
+    /// Default 1u: legacy regression tests (PreprocessorBackwardVulkan.MatchesCPU_*)
+    /// pair this with PreprocessorCPU forward, which applies h_conv unconditionally
+    /// — so the default mirrors that "always-on" CPU forward behavior. Callers
+    /// that drive forward with proper_ewa=false (e.g. VulkanTrainer with
+    /// VkTrainingConfig::proper_ewa=false) MUST pass 0u explicitly.
+    explicit PreprocessBackwardPass(VulkanContext& ctx,
+                                    uint32_t spec_proper_ewa = 1u);
     ~PreprocessBackwardPass();  // out-of-line: unique_ptr to incomplete type
 
     PreprocessBackwardPass(const PreprocessBackwardPass&)            = delete;

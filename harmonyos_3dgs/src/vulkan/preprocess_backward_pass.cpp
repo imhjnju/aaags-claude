@@ -27,7 +27,8 @@
 #include <stdexcept>
 #include <vector>
 
-PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx)
+PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx,
+                                               uint32_t spec_proper_ewa)
     : ctx_(ctx) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
     shader_ = std::make_unique<VulkanShader>(
@@ -35,9 +36,24 @@ PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx)
         static_cast<const uint8_t*>(preprocess_backward_spv),
         static_cast<std::size_t>(preprocess_backward_spv_len));
 
-    // --- 2. Descriptor layout: 22 SSBOs (bindings 0..15, 17..22) + 1 UBO (binding 16) ---
-    // 23 bindings total; binding 16 is UNIFORM_BUFFER, all others are STORAGE_BUFFER.
-    std::vector<VkDescriptorType> binding_types(23,
+    // --- 2. Specialization constant: spec_proper_ewa (constant_id = 0) ----
+    // Gates the h_conv_scaling chain rule. Must match the value passed to
+    // PreprocessPass for the forward (preprocess.comp constant_id=2). When
+    // proper_ewa=false the forward sets h_conv=1, so the backward must skip
+    // the h_conv chain or it injects spurious gradient terms (matches CUDA
+    // backward.cu:215).
+    VkSpecializationMapEntry spec_entry{};
+    spec_entry.constantID = 0u;
+    spec_entry.offset     = 0u;
+    spec_entry.size       = sizeof(uint32_t);
+    VkSpecializationInfo spec_info{};
+    spec_info.mapEntryCount = 1u;
+    spec_info.pMapEntries   = &spec_entry;
+    spec_info.dataSize      = sizeof(uint32_t);
+    spec_info.pData         = &spec_proper_ewa;
+
+    // --- 3. Descriptor layout: SSBOs plus 1 UBO (binding 16) ---
+    std::vector<VkDescriptorType> binding_types(preprocess_backward_bind::BINDING_COUNT,
                                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     binding_types[preprocess_backward_bind::PREPROCESS_BACKWARD_UBO] =
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -47,9 +63,10 @@ PreprocessBackwardPass::PreprocessBackwardPass(VulkanContext& ctx)
         *shader_,
         binding_types,
         /*push_constant_bytes=*/0u,
-        /*max_descriptor_sets=*/4u);
+        /*max_descriptor_sets=*/4u,
+        /*spec_info=*/&spec_info);
 
-    // --- 3. Allocate the descriptor set once (update in-place per dispatch) ---
+    // --- 4. Allocate the descriptor set once (update in-place per dispatch) ---
     descriptor_set_ = pipeline_->allocate_empty_descriptor_set();
 }
 
@@ -101,6 +118,25 @@ void PreprocessBackwardPass::bind_buffers(const Buffers& b, VkBuffer ubo) {
                            preprocess_backward_bind::COV2D_DET_CACHE_IN, b.cov2D_det_cache_in);
     pipeline_->update_ssbo(descriptor_set_,
                            preprocess_backward_bind::P_HOM_W_CACHE_IN,   b.p_hom_w_cache_in);
+    const VkBuffer debug_fallback = b.d_means3D;
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_FABC,
+                           b.debug_d_fabc ? b.debug_d_fabc : debug_fallback);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_COV3D,
+                           b.debug_d_cov3D ? b.debug_d_cov3D : debug_fallback);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_M,
+                           b.debug_d_M ? b.debug_d_M : debug_fallback);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_SCALE,
+                           b.debug_d_scale ? b.debug_d_scale : debug_fallback);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_R,
+                           b.debug_d_R ? b.debug_d_R : debug_fallback);
+    pipeline_->update_ssbo(descriptor_set_,
+                           preprocess_backward_bind::DEBUG_D_QN,
+                           b.debug_d_qn ? b.debug_d_qn : debug_fallback);
 
     // UBO binding 16 (PreprocessBackwardUBO, 192 bytes).
     pipeline_->update_ubo(descriptor_set_,

@@ -85,6 +85,7 @@ float psnr_from_mse(float mse) {
 Metrics compute_metrics_chw(const std::vector<float>& vk,
                             const std::vector<float>& cuda) {
     EXPECT_EQ(vk.size(), cuda.size());
+    if (vk.size() != cuda.size()) return {};
     const size_t N = vk.size();
     const size_t per_ch = N / 3;
     double sse = 0.0, sse_r = 0.0, sse_g = 0.0, sse_b = 0.0;
@@ -183,7 +184,7 @@ TEST(VkVsCudaBasketball, Cam0_PsnrAtLeastBaseline) {
 
     const size_t alloc = 4ULL * 1024 * 1024 * 1024;
     Renderer renderer(
-        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true),
+        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true, /*proper_ewa=*/true),
         std::make_unique<TileBinnerVulkan>(ctx),
         std::make_unique<SorterVulkan>(ctx),
         std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/true),
@@ -349,7 +350,7 @@ TEST(VkVsCudaBasketball, Cam0_TableSubset) {
 
     const size_t alloc = 4ULL * 1024 * 1024 * 1024;
     Renderer renderer(
-        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true),
+        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true, /*proper_ewa=*/true),
         std::make_unique<TileBinnerVulkan>(ctx),
         std::make_unique<SorterVulkan>(ctx),
         std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/true),
@@ -557,7 +558,13 @@ TEST(VkVsCudaBasketball, Cam0_NContribDump) {
     // download_cache() fallback. The layer-1 rasterize() path already
     // auto-populates cache->T_final / cache->n_contrib when passed a non-null
     // cache with non-null CPU pointers (see rasterizer_vulkan.cpp:269-281).
-    auto preprocessor = std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true);
+    // basketball cam0 golden was regenerated with aaa.json features
+    // (proper_ewa_scaling=True) per commit 605bce9; matching here ensures
+    // the spec constant drives the shader to perform dilation. Same
+    // precedent as test_preprocess_pass_vk.cpp:148 — wiring must mirror
+    // the golden's actual generation config. Applies to all 3 PreprocessorVulkan
+    // call sites in this file.
+    auto preprocessor = std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/true, /*proper_ewa=*/true);
     auto tile_binner  = std::make_unique<TileBinnerVulkan>(ctx);
     auto sorter       = std::make_unique<SorterVulkan>(ctx);
     auto rasterizer   = std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/true);

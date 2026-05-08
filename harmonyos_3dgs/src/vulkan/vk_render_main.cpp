@@ -1,7 +1,7 @@
 // harmonyos_3dgs/src/vulkan/vk_render_main.cpp
 //
 // gs3d_vk_render — Vulkan forward render CLI for calibration.
-// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id]
+// Usage: gs3d_vk_render <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1] [--sh_degree 0..3]
 
 #include "camera_utils.h"
 #include "image_io.h"
@@ -23,14 +23,73 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "Usage: %s <model.ply> <cameras.json> [cam_id]\n",
+                     "Usage: %s <model.ply> <cameras.json> [cam_id] [--eval_3d 0|1] [--parity_mode 0|1] [--proper_ewa 0|1] [--sh_degree 0..3]\n",
                      argv[0]);
         return 1;
     }
 
     const char* ply_path = argv[1];
     const char* cam_path = argv[2];
-    int cam_id = (argc >= 4) ? std::atoi(argv[3]) : 0;
+    int cam_id = 0;
+    bool eval_3D = true;
+    bool parity_mode = false;
+    bool proper_ewa = true;
+    int sh_degree_override = -1;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--eval_3d") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "0") == 0) {
+                eval_3D = false;
+            } else if (std::strcmp(value, "1") == 0) {
+                eval_3D = true;
+            } else {
+                std::fprintf(stderr, "Error: --eval_3d requires 0 or 1\n");
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--eval_3d") == 0) {
+            std::fprintf(stderr, "Error: --eval_3d requires 0 or 1\n");
+            return 1;
+        } else if (std::strcmp(argv[i], "--parity_mode") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "0") == 0) {
+                parity_mode = false;
+            } else if (std::strcmp(value, "1") == 0) {
+                parity_mode = true;
+            } else {
+                std::fprintf(stderr, "Error: --parity_mode requires 0 or 1\n");
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--parity_mode") == 0) {
+            std::fprintf(stderr, "Error: --parity_mode requires 0 or 1\n");
+            return 1;
+        } else if (std::strcmp(argv[i], "--proper_ewa") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "0") == 0) {
+                proper_ewa = false;
+            } else if (std::strcmp(value, "1") == 0) {
+                proper_ewa = true;
+            } else {
+                std::fprintf(stderr, "Error: --proper_ewa requires 0 or 1\n");
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--proper_ewa") == 0) {
+            std::fprintf(stderr, "Error: --proper_ewa requires 0 or 1\n");
+            return 1;
+        } else if (std::strcmp(argv[i], "--sh_degree") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || value < 0 || value > 3) {
+                std::fprintf(stderr, "Error: --sh_degree requires an integer in [0, 3]\n");
+                return 1;
+            }
+            sh_degree_override = static_cast<int>(value);
+        } else if (std::strcmp(argv[i], "--sh_degree") == 0) {
+            std::fprintf(stderr, "Error: --sh_degree requires an integer in [0, 3]\n");
+            return 1;
+        } else {
+            cam_id = std::atoi(argv[i]);
+        }
+    }
 
     // 1. Vulkan init
     VulkanContext ctx;
@@ -46,6 +105,12 @@ int main(int argc, char** argv) {
     std::printf("  %d Gaussians, SH degree %d, filter_3D: %s\n",
                 model.data.count, model.data.sh_degree,
                 model.data.filter_3D ? "yes" : "no");
+    if (sh_degree_override > model.data.sh_degree) {
+        std::fprintf(stderr, "Error: --sh_degree %d exceeds model SH degree %d\n",
+                     sh_degree_override, model.data.sh_degree);
+        model.free();
+        return 1;
+    }
 
     // 3. Load camera
     Camera cam = loadCameraJson(cam_path, cam_id);
@@ -55,16 +120,19 @@ int main(int argc, char** argv) {
     const char* bg_env = std::getenv("BG_WHITE");
     float bg_val = (bg_env && bg_env[0] == '1') ? 1.0f : 0.0f;
     config.bg_color[0] = config.bg_color[1] = config.bg_color[2] = bg_val;
-    config.sh_degree = model.data.sh_degree;
-    config.eval_3D = true;
+    config.sh_degree = (sh_degree_override >= 0) ? sh_degree_override : model.data.sh_degree;
+    config.eval_3D = eval_3D;
+    config.eval_3D_parity_mode = parity_mode;
     config.antialiasing = false;
     // PreprocessorVulkan hardcodes spec_training=1 (no upper SH clamp).
     // Match on the CPU side so Renderer::render sees consistent config.
     config.training = true;
-    std::printf("Config: eval_3D=%s, training=%s, bg=%.0f, sh_degree=%d\n",
+    std::printf("Config: eval_3D=%s, parity_mode=%s, training=%s, bg=%.0f, sh_degree=%d, proper_ewa=%s\n",
                 config.eval_3D ? "ON" : "OFF",
+                config.eval_3D_parity_mode ? "ON" : "OFF",
                 config.training ? "ON" : "OFF",
-                bg_val, config.sh_degree);
+                bg_val, config.sh_degree,
+                proper_ewa ? "ON" : "OFF");
 
     // 5. Create Vulkan renderer
     size_t alloc_size = 512ULL * 1024 * 1024;
@@ -72,10 +140,11 @@ int main(int argc, char** argv) {
         alloc_size = 4ULL * 1024 * 1024 * 1024;
 
     auto renderer = std::make_unique<Renderer>(
-        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D),
+        std::make_unique<PreprocessorVulkan>(ctx, /*eval_3D=*/config.eval_3D, proper_ewa),
         std::make_unique<TileBinnerVulkan>(ctx),
         std::make_unique<SorterVulkan>(ctx),
-        std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/config.eval_3D),
+        std::make_unique<RasterizerVulkan>(ctx, /*eval_3D=*/config.eval_3D,
+                                          /*disable_subtile_resort=*/config.eval_3D_parity_mode),
         alloc_size);
 
     // 6. Render
@@ -90,7 +159,14 @@ int main(int argc, char** argv) {
 
     // 7. Save
     const char* out_path = "output_vk.ppm";
-    writePPM(out_path, image.data(), W, H);
+    std::vector<float> image_hwc(static_cast<size_t>(W) * H * 3);
+    const int HW = W * H;
+    for (int px = 0; px < HW; ++px) {
+        for (int c = 0; c < 3; ++c) {
+            image_hwc[px * 3 + c] = image[c * HW + px];
+        }
+    }
+    writePPM(out_path, image_hwc.data(), W, H);
     std::printf("Saved → %s\n", out_path);
 
     // Dump raw float32 for precision comparison with CUDA golden.

@@ -1,0 +1,402 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint spec_proper_ewa = 0u;
+
+layout(std430, set = 0, binding = 0) readonly buffer Positions { float positions[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Radii { int radii[]; };
+layout(std430, set = 0, binding = 2) readonly buffer SHCoeffs { float sh_coeffs[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Scales { float scales[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Rotations { float rotations[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DRgb { float d_rgb[]; };
+layout(std430, set = 0, binding = 6) readonly buffer DOpacity { float d_opacity[]; };
+layout(std430, set = 0, binding = 7) readonly buffer DGauss2Screen { float d_gauss2screen[]; };
+layout(std430, set = 0, binding = 8) writeonly buffer DMeans3D { float d_means3D[]; };
+layout(std430, set = 0, binding = 9) writeonly buffer DSH { float d_sh[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer DScales { float d_scales[]; };
+layout(std430, set = 0, binding = 11) writeonly buffer DRotations { float d_rotations[]; };
+layout(std430, set = 0, binding = 12) readonly buffer Opacities { float opacities[]; };
+layout(std430, set = 0, binding = 13) writeonly buffer DRawOpacities { float d_raw_opacities[]; };
+layout(std430, set = 0, binding = 14) readonly buffer RawRotations { float raw_rotations[]; };
+
+layout(std140, set = 0, binding = 15) uniform PreprocessBwdUBO {
+    mat4 view_matrix;
+    mat4 proj_matrix;
+    uint num_gaussians;
+    uint sh_degree;
+    uint sh_coeffs_per_g;
+    float scale_modifier;
+    float h_x;
+    float h_y;
+    float tan_fovx;
+    float tan_fovy;
+    vec3 cam_pos;
+    float _pad;
+    uint training;
+    uint cam_width;
+    uint cam_height;
+    uint debug_capture;
+} ubo;
+
+layout(std430, set = 0, binding = 16) readonly buffer Filter3D { float filter_3D[]; };
+
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2[5] = float[5](
+     1.0925484305920792,
+    -1.0925484305920792,
+     0.31539156525252005,
+    -1.0925484305920792,
+     0.5462742152960396
+);
+const float SH_C3[7] = float[7](
+    -0.5900435899266435,
+     2.890611442640554,
+    -0.4570457994644658,
+     0.3731763325901154,
+    -0.4570457994644658,
+     1.445305721320277,
+    -0.5900435899266435
+);
+
+void write_zero(uint i, uint base3, uint base4, uint sh_base) {
+    d_means3D[base3 + 0u] = 0.0;
+    d_means3D[base3 + 1u] = 0.0;
+    d_means3D[base3 + 2u] = 0.0;
+    d_scales[base3 + 0u] = 0.0;
+    d_scales[base3 + 1u] = 0.0;
+    d_scales[base3 + 2u] = 0.0;
+    d_rotations[base4 + 0u] = 0.0;
+    d_rotations[base4 + 1u] = 0.0;
+    d_rotations[base4 + 2u] = 0.0;
+    d_rotations[base4 + 3u] = 0.0;
+    d_raw_opacities[i] = 0.0;
+    for (uint k = 0u; k < ubo.sh_coeffs_per_g * 3u; ++k) {
+        d_sh[sh_base + k] = 0.0;
+    }
+}
+
+void quat2R(vec4 q, out float R[9]) {
+    float r = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    R[0] = 1.0 - 2.0 * (y * y + z * z);
+    R[1] = 2.0 * (x * y + r * z);
+    R[2] = 2.0 * (x * z - r * y);
+    R[3] = 2.0 * (x * y - r * z);
+    R[4] = 1.0 - 2.0 * (x * x + z * z);
+    R[5] = 2.0 * (y * z + r * x);
+    R[6] = 2.0 * (x * z + r * y);
+    R[7] = 2.0 * (y * z - r * x);
+    R[8] = 1.0 - 2.0 * (x * x + y * y);
+}
+
+void mat4Mul16(float A[16], float B[16], out float result[16]) {
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                sum += A[k * 4 + row] * B[col * 4 + k];
+            }
+            result[col * 4 + row] = sum;
+        }
+    }
+}
+
+void buildWorld2Screen(out float w2s[16]) {
+    float W = float(ubo.cam_width);
+    float H = float(ubo.cam_height);
+    float vp[16] = float[16](
+        W * 0.5, 0.0, 0.0, 0.0,
+        0.0, H * 0.5, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        W * 0.5 - 0.5, H * 0.5 - 0.5, 0.0, 1.0
+    );
+    float viewproj[16];
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            viewproj[col * 4 + row] = ubo.proj_matrix[col][row];
+        }
+    }
+    mat4Mul16(vp, viewproj, w2s);
+}
+
+void quatGradFromDR(float d_R[9], vec4 q, out vec4 d_qn) {
+    float qr = q.x;
+    float qx = q.y;
+    float qy = q.z;
+    float qz = q.w;
+    float d_qn_r = 0.0;
+    float d_qn_x = 0.0;
+    float d_qn_y = 0.0;
+    float d_qn_z = 0.0;
+
+    d_qn_y += d_R[0] * (-4.0 * qy);
+    d_qn_z += d_R[0] * (-4.0 * qz);
+    d_qn_r += d_R[1] * 2.0 * qz;
+    d_qn_x += d_R[1] * 2.0 * qy;
+    d_qn_y += d_R[1] * 2.0 * qx;
+    d_qn_z += d_R[1] * 2.0 * qr;
+    d_qn_r += d_R[2] * (-2.0 * qy);
+    d_qn_x += d_R[2] * 2.0 * qz;
+    d_qn_y += d_R[2] * (-2.0 * qr);
+    d_qn_z += d_R[2] * 2.0 * qx;
+    d_qn_r += d_R[3] * (-2.0 * qz);
+    d_qn_x += d_R[3] * 2.0 * qy;
+    d_qn_y += d_R[3] * 2.0 * qx;
+    d_qn_z += d_R[3] * (-2.0 * qr);
+    d_qn_x += d_R[4] * (-4.0 * qx);
+    d_qn_z += d_R[4] * (-4.0 * qz);
+    d_qn_r += d_R[5] * 2.0 * qx;
+    d_qn_x += d_R[5] * 2.0 * qr;
+    d_qn_y += d_R[5] * 2.0 * qz;
+    d_qn_z += d_R[5] * 2.0 * qy;
+    d_qn_r += d_R[6] * 2.0 * qy;
+    d_qn_x += d_R[6] * 2.0 * qz;
+    d_qn_y += d_R[6] * 2.0 * qr;
+    d_qn_z += d_R[6] * 2.0 * qx;
+    d_qn_r += d_R[7] * (-2.0 * qx);
+    d_qn_x += d_R[7] * (-2.0 * qr);
+    d_qn_y += d_R[7] * 2.0 * qz;
+    d_qn_z += d_R[7] * 2.0 * qy;
+    d_qn_x += d_R[8] * (-4.0 * qx);
+    d_qn_y += d_R[8] * (-4.0 * qy);
+
+    d_qn = vec4(d_qn_r, d_qn_x, d_qn_y, d_qn_z);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ubo.num_gaussians) return;
+
+    uint base3 = i * 3u;
+    uint base4 = i * 4u;
+    uint sh_base = i * ubo.sh_coeffs_per_g * 3u;
+
+    if (radii[i] <= 0) {
+        write_zero(i, base3, base4, sh_base);
+        return;
+    }
+
+    vec3 pos = vec3(positions[base3 + 0u], positions[base3 + 1u], positions[base3 + 2u]);
+    vec3 scale = vec3(scales[base3 + 0u], scales[base3 + 1u], scales[base3 + 2u]);
+    vec4 rot = vec4(rotations[base4 + 0u], rotations[base4 + 1u], rotations[base4 + 2u], rotations[base4 + 3u]);
+    float R[9];
+    quat2R(rot, R);
+
+    float w2s[16];
+    buildWorld2Screen(w2s);
+
+    float d_g2w[16];
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                sum += w2s[row * 4 + k] * d_gauss2screen[i * 16u + uint(col * 4 + k)];
+            }
+            d_g2w[col * 4 + row] = sum;
+        }
+    }
+
+    float focal = max(ubo.h_x, ubo.h_y);
+    float mean_view_z = ubo.view_matrix[0][2] * pos.x + ubo.view_matrix[1][2] * pos.y + ubo.view_matrix[2][2] * pos.z + ubo.view_matrix[3][2];
+    float mip_from_view = (mean_view_z / focal) * (mean_view_z / focal) * 0.3;
+    float f3 = filter_3D[i];
+    float variance = max(f3 * f3, mip_from_view);
+    float scale_dilated[3] = float[3](
+        sqrt(scale.x * scale.x + variance),
+        sqrt(scale.y * scale.y + variance),
+        sqrt(scale.z * scale.z + variance)
+    );
+    float sqrt_mod = sqrt(ubo.scale_modifier);
+    float sd[3] = float[3](scale_dilated[0] * sqrt_mod,
+                            scale_dilated[1] * sqrt_mod,
+                            scale_dilated[2] * sqrt_mod);
+
+    vec3 d_pos = vec3(d_g2w[12], d_g2w[13], d_g2w[14]);
+    float d_sd[3] = float[3](0.0, 0.0, 0.0);
+    float d_R[9];
+    for (int k = 0; k < 9; ++k) d_R[k] = 0.0;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int row = 0; row < 3; ++row) {
+            float grad = d_g2w[axis * 4 + row];
+            d_sd[axis] += grad * R[axis * 3 + row];
+            d_R[axis * 3 + row] += grad * sd[axis];
+        }
+    }
+
+    float conv = 1.0;
+    float d_scale_geom[3] = float[3](0.0, 0.0, 0.0);
+    for (int axis = 0; axis < 3; ++axis) {
+        d_scale_geom[axis] += d_sd[axis] * sqrt_mod * scale[axis] / max(scale_dilated[axis], 1e-12);
+    }
+
+    if (spec_proper_ewa != 0u) {
+        vec3 ray = pos - ubo.cam_pos;
+        float ray_len = max(length(ray), 1e-12);
+        vec3 viewray = ray / ray_len;
+        vec3 rd = vec3(
+            R[0] * viewray.x + R[1] * viewray.y + R[2] * viewray.z,
+            R[3] * viewray.x + R[4] * viewray.y + R[5] * viewray.z,
+            R[6] * viewray.x + R[7] * viewray.y + R[8] * viewray.z
+        );
+
+        vec3 s2 = scale * scale;
+        vec3 sdil = vec3(scale_dilated[0], scale_dilated[1], scale_dilated[2]);
+        vec3 sdil2 = sdil * sdil;
+        vec3 rd2 = rd * rd;
+        float A = rd2.x * s2.y * s2.z + rd2.y * s2.z * s2.x + rd2.z * s2.x * s2.y;
+        float B = rd2.x * sdil2.y * sdil2.z + rd2.y * sdil2.z * sdil2.x + rd2.z * sdil2.x * sdil2.y;
+        if (A > 1e-20 && B > 1e-20) {
+            conv = sqrt(A / B);
+            float d_conv = d_opacity[i] * opacities[i];
+            float dA = d_conv * 0.5 * conv / A;
+            float dB = -d_conv * 0.5 * conv / B;
+
+            d_scale_geom[0] += dA * 2.0 * scale.x * (rd2.y * s2.z + rd2.z * s2.y);
+            d_scale_geom[1] += dA * 2.0 * scale.y * (rd2.x * s2.z + rd2.z * s2.x);
+            d_scale_geom[2] += dA * 2.0 * scale.z * (rd2.x * s2.y + rd2.y * s2.x);
+
+            d_scale_geom[0] += dB * 2.0 * sdil.x * (rd2.y * sdil2.z + rd2.z * sdil2.y) * scale.x / max(sdil.x, 1e-12);
+            d_scale_geom[1] += dB * 2.0 * sdil.y * (rd2.x * sdil2.z + rd2.z * sdil2.x) * scale.y / max(sdil.y, 1e-12);
+            d_scale_geom[2] += dB * 2.0 * sdil.z * (rd2.x * sdil2.y + rd2.y * sdil2.x) * scale.z / max(sdil.z, 1e-12);
+
+            vec3 d_rd = vec3(
+                dA * 2.0 * rd.x * s2.y * s2.z + dB * 2.0 * rd.x * sdil2.y * sdil2.z,
+                dA * 2.0 * rd.y * s2.z * s2.x + dB * 2.0 * rd.y * sdil2.z * sdil2.x,
+                dA * 2.0 * rd.z * s2.x * s2.y + dB * 2.0 * rd.z * sdil2.x * sdil2.y
+            );
+            for (int row = 0; row < 3; ++row) {
+                d_R[row * 3 + 0] += d_rd[row] * viewray.x;
+                d_R[row * 3 + 1] += d_rd[row] * viewray.y;
+                d_R[row * 3 + 2] += d_rd[row] * viewray.z;
+            }
+            vec3 d_viewray = vec3(
+                R[0] * d_rd.x + R[3] * d_rd.y + R[6] * d_rd.z,
+                R[1] * d_rd.x + R[4] * d_rd.y + R[7] * d_rd.z,
+                R[2] * d_rd.x + R[5] * d_rd.y + R[8] * d_rd.z
+            );
+            d_pos += (d_viewray - viewray * dot(viewray, d_viewray)) / ray_len;
+        }
+    }
+
+    d_scales[base3 + 0u] = d_scale_geom[0] * scale.x;
+    d_scales[base3 + 1u] = d_scale_geom[1] * scale.y;
+    d_scales[base3 + 2u] = d_scale_geom[2] * scale.z;
+
+    vec4 d_qn;
+    quatGradFromDR(d_R, rot, d_qn);
+    vec4 raw_q = vec4(raw_rotations[base4 + 0u], raw_rotations[base4 + 1u], raw_rotations[base4 + 2u], raw_rotations[base4 + 3u]);
+    float raw_len = max(length(raw_q), 1e-12);
+    float dot_dq_q = dot(d_qn, rot);
+    vec4 d_raw_q = (d_qn - rot * dot_dq_q) / raw_len;
+    d_rotations[base4 + 0u] = d_raw_q.x;
+    d_rotations[base4 + 1u] = d_raw_q.y;
+    d_rotations[base4 + 2u] = d_raw_q.z;
+    d_rotations[base4 + 3u] = d_raw_q.w;
+
+    vec3 dir = normalize(pos - ubo.cam_pos);
+    float dx = dir.x;
+    float dy = dir.y;
+    float dz = dir.z;
+
+    vec3 rgb_raw = vec3(SH_C0 * sh_coeffs[sh_base + 0u],
+                        SH_C0 * sh_coeffs[sh_base + 1u],
+                        SH_C0 * sh_coeffs[sh_base + 2u]);
+    if (ubo.sh_degree > 0u) {
+        rgb_raw += -SH_C1 * dy * vec3(sh_coeffs[sh_base + 3u], sh_coeffs[sh_base + 4u], sh_coeffs[sh_base + 5u]);
+        rgb_raw +=  SH_C1 * dz * vec3(sh_coeffs[sh_base + 6u], sh_coeffs[sh_base + 7u], sh_coeffs[sh_base + 8u]);
+        rgb_raw += -SH_C1 * dx * vec3(sh_coeffs[sh_base + 9u], sh_coeffs[sh_base + 10u], sh_coeffs[sh_base + 11u]);
+
+        if (ubo.sh_degree > 1u) {
+            float xx = dx * dx, yy = dy * dy, zz = dz * dz;
+            float xy = dx * dy, yz = dy * dz, xz = dx * dz;
+            float b2[5] = float[5](
+                SH_C2[0] * xy,
+                SH_C2[1] * yz,
+                SH_C2[2] * (2.0 * zz - xx - yy),
+                SH_C2[3] * xz,
+                SH_C2[4] * (xx - yy));
+            for (int k = 0; k < 5; ++k) {
+                uint off = sh_base + uint(4 + k) * 3u;
+                rgb_raw += b2[k] * vec3(sh_coeffs[off + 0u], sh_coeffs[off + 1u], sh_coeffs[off + 2u]);
+            }
+            if (ubo.sh_degree > 2u) {
+                float b3[7] = float[7](
+                    SH_C3[0] * dy * (3.0 * xx - yy),
+                    SH_C3[1] * xy * dz,
+                    SH_C3[2] * dy * (4.0 * zz - xx - yy),
+                    SH_C3[3] * dz * (2.0 * zz - 3.0 * xx - 3.0 * yy),
+                    SH_C3[4] * dx * (4.0 * zz - xx - yy),
+                    SH_C3[5] * dz * (xx - yy),
+                    SH_C3[6] * dx * (xx - 3.0 * yy));
+                for (int k = 0; k < 7; ++k) {
+                    uint off = sh_base + uint(9 + k) * 3u;
+                    rgb_raw += b3[k] * vec3(sh_coeffs[off + 0u], sh_coeffs[off + 1u], sh_coeffs[off + 2u]);
+                }
+            }
+        }
+    }
+
+    vec3 mask = vec3(rgb_raw.x + 0.5 >= 0.0 ? 1.0 : 0.0,
+                     rgb_raw.y + 0.5 >= 0.0 ? 1.0 : 0.0,
+                     rgb_raw.z + 0.5 >= 0.0 ? 1.0 : 0.0);
+    vec3 d_rgb_eff = vec3(d_rgb[base3 + 0u], d_rgb[base3 + 1u], d_rgb[base3 + 2u]) * mask;
+
+    d_sh[sh_base + 0u] = SH_C0 * d_rgb_eff.x;
+    d_sh[sh_base + 1u] = SH_C0 * d_rgb_eff.y;
+    d_sh[sh_base + 2u] = SH_C0 * d_rgb_eff.z;
+    if (ubo.sh_degree > 0u) {
+        float b1[3] = float[3](-SH_C1 * dy, SH_C1 * dz, -SH_C1 * dx);
+        for (int k = 0; k < 3; ++k) {
+            uint off = sh_base + uint(1 + k) * 3u;
+            d_sh[off + 0u] = b1[k] * d_rgb_eff.x;
+            d_sh[off + 1u] = b1[k] * d_rgb_eff.y;
+            d_sh[off + 2u] = b1[k] * d_rgb_eff.z;
+        }
+        if (ubo.sh_degree > 1u) {
+            float xx = dx * dx, yy = dy * dy, zz = dz * dz;
+            float xy = dx * dy, yz = dy * dz, xz = dx * dz;
+            float b2[5] = float[5](
+                SH_C2[0] * xy,
+                SH_C2[1] * yz,
+                SH_C2[2] * (2.0 * zz - xx - yy),
+                SH_C2[3] * xz,
+                SH_C2[4] * (xx - yy));
+            for (int k = 0; k < 5; ++k) {
+                uint off = sh_base + uint(4 + k) * 3u;
+                d_sh[off + 0u] = b2[k] * d_rgb_eff.x;
+                d_sh[off + 1u] = b2[k] * d_rgb_eff.y;
+                d_sh[off + 2u] = b2[k] * d_rgb_eff.z;
+            }
+            if (ubo.sh_degree > 2u) {
+                float b3[7] = float[7](
+                    SH_C3[0] * dy * (3.0 * xx - yy),
+                    SH_C3[1] * xy * dz,
+                    SH_C3[2] * dy * (4.0 * zz - xx - yy),
+                    SH_C3[3] * dz * (2.0 * zz - 3.0 * xx - 3.0 * yy),
+                    SH_C3[4] * dx * (4.0 * zz - xx - yy),
+                    SH_C3[5] * dz * (xx - yy),
+                    SH_C3[6] * dx * (xx - 3.0 * yy));
+                for (int k = 0; k < 7; ++k) {
+                    uint off = sh_base + uint(9 + k) * 3u;
+                    d_sh[off + 0u] = b3[k] * d_rgb_eff.x;
+                    d_sh[off + 1u] = b3[k] * d_rgb_eff.y;
+                    d_sh[off + 2u] = b3[k] * d_rgb_eff.z;
+                }
+            }
+        }
+    }
+
+
+    d_means3D[base3 + 0u] = d_pos.x;
+    d_means3D[base3 + 1u] = d_pos.y;
+    d_means3D[base3 + 2u] = d_pos.z;
+
+    float sigma = opacities[i];
+    float d_opacity_activated = d_opacity[i] * conv;
+    d_raw_opacities[i] = d_opacity_activated * sigma * (1.0 - sigma);
+}

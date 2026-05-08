@@ -24,6 +24,18 @@ struct VulkanDeviceCapabilities {
     // Extension detection (affects SP-3 backward CAS fallback).
     bool has_shader_atomic_float = false;   // VK_EXT_shader_atomic_float
 
+    // Fuchsia vk_radix_sort required features. Default paths do not require
+    // these; Fuchsia/GPU-resident sort gates on them at runtime.
+    bool has_shader_int64               = false;
+    bool has_shader_int16               = false;
+    bool has_buffer_device_address      = false;
+    bool has_vulkan_memory_model        = false;
+    bool has_vulkan_memory_model_device_scope = false;
+
+    // Timestamp properties for profiling and query conversion.
+    float    timestamp_period      = 0.0f;
+    uint32_t timestamp_valid_bits  = 0;
+
     // Vulkan API version the device reports.
     uint32_t api_version = 0;               // >= VK_API_VERSION_1_1
 };

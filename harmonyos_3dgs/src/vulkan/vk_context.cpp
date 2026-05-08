@@ -192,14 +192,39 @@ bool VulkanContext::init() {
     dqci.queueFamilyIndex = compute_qf_;
     dqci.queueCount = 1;
     dqci.pQueuePriorities = &qp;
+
+    VkPhysicalDeviceVulkan12Features f12{};
+    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f12.bufferDeviceAddress = caps_.has_buffer_device_address ? VK_TRUE : VK_FALSE;
+    f12.vulkanMemoryModel = caps_.has_vulkan_memory_model ? VK_TRUE : VK_FALSE;
+    f12.vulkanMemoryModelDeviceScope = caps_.has_vulkan_memory_model_device_scope ? VK_TRUE : VK_FALSE;
+
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.features.shaderInt64 = caps_.has_shader_int64 ? VK_TRUE : VK_FALSE;
+    f2.features.shaderInt16 = caps_.has_shader_int16 ? VK_TRUE : VK_FALSE;
+    if (caps_.api_version >= VK_API_VERSION_1_2) {
+        f2.pNext = &f12;
+    }
+
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &dqci;
+    dci.pEnabledFeatures = nullptr;
     if (vkCreateDevice(phys_, &dci, nullptr, &device_) != VK_SUCCESS) {
         release();
         return false;
     }
     vkGetDeviceQueue(device_, compute_qf_, 0, &compute_queue_);
+
+    {
+        uint32_t nqf = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys_, &nqf, nullptr);
+        std::vector<VkQueueFamilyProperties> qfs(nqf);
+        vkGetPhysicalDeviceQueueFamilyProperties(phys_, &nqf, qfs.data());
+        if (compute_qf_ < nqf) caps_.timestamp_valid_bits = qfs[compute_qf_].timestampValidBits;
+    }
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = compute_qf_;

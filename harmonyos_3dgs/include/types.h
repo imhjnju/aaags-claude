@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 // Arena-style frame allocator. Avoids per-frame malloc/free overhead.
 class FrameAllocator {
@@ -62,6 +63,7 @@ struct RenderConfig {
     float scale_modifier = 1.0f;
     bool antialiasing = false;
     bool eval_3D = false;        // AAA-Gaussians: full 3D Gaussian evaluation
+    bool eval_3D_parity_mode = false;  // Match CUDA eval_3D sort_mode=GLOBAL/no tile culling
     bool training = false;       // Training mode: skip upper color clamp in SH eval
     int sh_degree = 3;
     int tile_w = 16;
@@ -92,15 +94,50 @@ struct BinningOutput {
     uint32_t* values_unsorted;
     uint64_t* keys_sorted;
     uint32_t* values_sorted;
+    uint64_t* keyvals_unsorted = nullptr;
+    uint64_t* keyvals_sorted = nullptr;
     int num_tiles;
     uint32_t* tile_ranges;    // [num_tiles * 2] (start, end)
     void* device_data = nullptr;  // GPU: opaque handle to device buffers
+    void* keyvals_unsorted_gpu = nullptr;  // VkBuffer, optional GPU-resident packed keyvals
+    void* keyvals_sorted_gpu = nullptr;    // VkBuffer, optional GPU-resident packed keyvals
+    void* tile_ranges_gpu = nullptr;       // VkBuffer, optional GPU-resident tile ranges
 };
+
+namespace keyval_pack {
+    constexpr uint32_t TILE_BITS  = 16;
+    constexpr uint32_t DEPTH_BITS = 28;
+    constexpr uint32_t IDX_BITS   = 20;
+    constexpr uint32_t IDX_SHIFT  = 0;
+    constexpr uint32_t DEPTH_SHIFT = IDX_BITS;
+    constexpr uint32_t TILE_SHIFT  = IDX_BITS + DEPTH_BITS;
+    constexpr uint32_t IDX_MASK    = (1u << IDX_BITS) - 1u;
+    constexpr uint32_t DEPTH_MASK  = (1u << DEPTH_BITS) - 1u;
+    constexpr uint32_t TILE_MASK   = (1u << TILE_BITS) - 1u;
+    constexpr uint32_t MAX_TILES   = 1u << TILE_BITS;
+    constexpr uint32_t MAX_GAUSS   = 1u << IDX_BITS;
+
+    inline uint64_t pack(uint32_t tile_id, uint32_t depth_q28, uint32_t gauss_idx) {
+        return (static_cast<uint64_t>(tile_id & TILE_MASK) << TILE_SHIFT)
+             | (static_cast<uint64_t>(depth_q28 & DEPTH_MASK) << DEPTH_SHIFT)
+             | (static_cast<uint64_t>(gauss_idx & IDX_MASK) << IDX_SHIFT);
+    }
+    inline uint32_t tile_of(uint64_t kv) { return static_cast<uint32_t>(kv >> TILE_SHIFT) & TILE_MASK; }
+    inline uint32_t depth_of(uint64_t kv) { return static_cast<uint32_t>(kv >> DEPTH_SHIFT) & DEPTH_MASK; }
+    inline uint32_t idx_of(uint64_t kv) { return static_cast<uint32_t>(kv) & IDX_MASK; }
+    inline uint32_t quantize_depth(uint32_t depth_bits_u32) { return depth_bits_u32 >> 4; }
+    constexpr uint64_t INVALID = 0xFFFFFFFFFFFFFFFFULL;
+}
 
 // Cached intermediate values from the forward pass, needed for backward.
 struct ForwardCache {
     float* T_final;       // [H*W] per-pixel final transmittance
-    int*   n_contrib;     // [H*W] per-pixel contributing Gaussian count
+    int*   n_contrib;     // [H*W] per-pixel last contributing candidate position / eval_3D blended count
+    std::vector<uint32_t> replay_order_offsets_storage;
+    std::vector<uint32_t> replay_order_gids_storage;
+    uint32_t* replay_order_offsets = nullptr;  // [H*W+1]
+    uint32_t* replay_order_gids = nullptr;     // [replay_order_count]
+    size_t replay_order_count = 0;
     float* cov2D;         // [N*3] filtered 2D covariance
     float* cov2D_det;     // [N] determinant of filtered cov2D
     float* cov3D;         // [N*6] 3D covariance upper triangle

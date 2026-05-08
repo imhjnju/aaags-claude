@@ -13,10 +13,9 @@
 //   5. Vulkan backward (RasterizerBackwardVulkan::backward) → rgrad_vk.
 //   6. Assert max abs diff < 1e-4 on d_means2D, d_conics, d_opacities_2d, d_rgb.
 //
-// n_contrib convention: CPU and Vulkan forward pass both store count-based
-// n_contrib (number of Gaussians that actually blended). The backward shader
-// processes all Gaussians in the tile range and uses alpha/power threshold
-// checks to skip non-contributors — matching the CPU backward forward-replay.
+// n_contrib convention: CPU and Vulkan forward pass both store CUDA-style
+// 1-based position of the last candidate that actually blended. Skipped
+// candidates before that position still advance the replay position.
 //
 // GTEST_SKIP if no Vulkan compute device.
 
