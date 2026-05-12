@@ -70,6 +70,7 @@ private:
     VulkanContext& ctx_;
     std::unique_ptr<RadixSortPass> sort_pass_;
     std::unique_ptr<TileRangePass> range_pass_;
+    std::unique_ptr<TileRangePass> packed_range_pass_;
 
     std::unique_ptr<RadixSortFuchsia>      fuchsia_;
     uint32_t                                fuchsia_max_keyvals_ = 0;

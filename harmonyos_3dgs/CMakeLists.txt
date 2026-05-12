@@ -220,6 +220,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(radix_sort_scatter _hdr_radix_scatter)
         gs3d_compile_glsl(tile_range _spv_tile_range)
         gs3d_embed_spirv(tile_range _hdr_tile_range)
+        gs3d_compile_glsl(tile_range_packed _spv_tile_range_packed)
+        gs3d_embed_spirv(tile_range_packed _hdr_tile_range_packed)
         gs3d_compile_glsl(rasterize _spv_rasterize)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
         gs3d_compile_glsl(rasterize_hierarchical _spv_rasterize_hierarchical)
@@ -245,6 +247,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_radix_count} ${_hdr_radix_count}
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
                     ${_spv_tile_range} ${_hdr_tile_range}
+                    ${_spv_tile_range_packed} ${_hdr_tile_range_packed}
                     ${_spv_rasterize} ${_hdr_rasterize}
                     ${_spv_rasterize_hierarchical} ${_hdr_rasterize_hierarchical}
                     ${_spv_rasterize_cascade_trace} ${_hdr_rasterize_cascade_trace}

@@ -87,9 +87,8 @@ private:
     bool proper_ewa_ = false;
     std::unique_ptr<PreprocessPass> pass_;
 
-    // Layer-1 per-call ForwardCache output buffers.
-    // Allocated in process() when the feature is used; reset each call.
-    // Named cov3d_buf_ / p_view_buf_ / p_hom_w_buf_ / cov2d_buf_ / cov2d_det_buf_ (Layer-1 scope).
+    // Layer-1 ForwardCache output buffers reused grow-only across process() calls.
+    // Downloads still expose only the current N entries.
     std::unique_ptr<VulkanBuffer> cov3d_buf_;
     std::unique_ptr<VulkanBuffer> p_view_buf_;
     std::unique_ptr<VulkanBuffer> p_hom_w_buf_;
@@ -99,6 +98,23 @@ private:
     std::unique_ptr<VulkanBuffer> gauss2screen_buf_;
     std::unique_ptr<VulkanBuffer> cov3d_inv_buf_;
     std::unique_ptr<VulkanBuffer> mean_offset_buf_;
+
+    // Layer-1 process() persistent buffers.
+    std::unique_ptr<VulkanBuffer> sync_pos_buf_;
+    std::unique_ptr<VulkanBuffer> sync_scl_buf_;
+    std::unique_ptr<VulkanBuffer> sync_rot_buf_;
+    std::unique_ptr<VulkanBuffer> sync_op_buf_;
+    std::unique_ptr<VulkanBuffer> sync_sh_buf_;
+    std::unique_ptr<VulkanBuffer> sync_f3_buf_;
+    std::unique_ptr<VulkanBuffer> sync_m2d_buf_;
+    std::unique_ptr<VulkanBuffer> sync_dep_buf_;
+    std::unique_ptr<VulkanBuffer> sync_cop_buf_;
+    std::unique_ptr<VulkanBuffer> sync_rgb_buf_;
+    std::unique_ptr<VulkanBuffer> sync_rad_buf_;
+    std::unique_ptr<VulkanBuffer> sync_tt_buf_;
+    std::unique_ptr<VulkanBuffer> sync_rf_buf_;
+    std::unique_ptr<VulkanBuffer> sync_cam_buf_;
+    std::vector<float> sync_filter_zeros_;
 
     // Layer-2 persistent buffers. Filled by prepare_record(); released and
     // re-allocated on the next prepare_record(). Index into this vector:

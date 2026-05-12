@@ -1,5 +1,18 @@
 # Sort 瓶颈分析与逐 Kernel Profiling
 
+## 2026-05-09 Vulkan/Fuchsia packed-keyval update
+
+The current Vulkan path has an opt-in Fuchsia radix-sort carrier path controlled by `GS3D_USE_FUCHSIA_SORT=1`. The safe merge-training-master integration keeps this path opt-in and conservative: Fuchsia sort can publish sorted packed keyvals and GPU-generated tile ranges, but host `keys_sorted`/`values_sorted` mirrors are still reconstructed for the existing rasterizer/backward consumers.
+
+Measured on NVIDIA Tegra Thor, basketball cam0, `runs/full_cap500000_step30000_vk_cuda3373529_literal_match/vk_trained_cap500000_step30000.ply`, `--eval_3d 1 --proper_ewa 1 --parity_mode 0`, 3 runs each:
+
+| Mode | Render mean | Sorter mean | Wall mean | Output vs fallback |
+|------|-------------|-------------|-----------|--------------------|
+| `GS3D_USE_FUCHSIA_SORT=0` | 1548.5 ms | 654.9 ms | 2.46 s | reference |
+| `GS3D_USE_FUCHSIA_SORT=1` | 1121.6 ms | 98.2 ms | 1.88 s | deterministic, but not bit-identical: 41.08 dB, RMSE 0.00883, max abs 0.7987 |
+
+Conclusion: Fuchsia sort removes most of the sort-stage time for this scene, but because full-scene output still differs from the fallback path, it is not a default parity-safe replacement yet. Further GPU-only rasterizer/backward handoff should first resolve or explicitly characterize the ordering difference.
+
 ## 测试条件
 
 - 模型: basketball.ply (400K Gaussians, 270K valid, 6.3M tile-pairs)

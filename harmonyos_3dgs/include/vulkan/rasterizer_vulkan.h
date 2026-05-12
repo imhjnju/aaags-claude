@@ -3,7 +3,8 @@
 // Supports two usage patterns:
 //
 //   1) Layer-1 rasterize() — sync, self-contained. Uploads CPU-side inputs
-//      (PreprocessOutput/BinningOutput) to fresh SSBOs, dispatches, downloads.
+//      (PreprocessOutput/BinningOutput) to grow-only cached SSBOs, dispatches,
+//      downloads.
 //   2) Layer-2 prepare_record() + record() — chained forward pipeline (T19).
 //      Inputs (values_sorted/tile_ranges/means2D/conic_opacity_packed/rgb) are
 //      EXTERNAL handles from Sorter+Preprocessor; the adapter allocates the
@@ -154,6 +155,37 @@ private:
     // Lazily-constructed trace-enabled pass (spec_trace_enabled=1, eval_3D=1).
     // Only built when rasterize_traced() is first called.
     std::unique_ptr<RasterizePass> traced_pass_;
+
+    void prepare_sync_buffers(uint32_t R, uint32_t N_eff,
+                              uint32_t num_tiles, uint32_t HW,
+                              bool need_eval3d_inputs);
+
+    // Layer-1 rasterize() persistent buffers.
+    uint32_t sync_R_capacity_              = 0;
+    uint32_t sync_N_eff_capacity_          = 0;
+    uint32_t sync_eval_N_capacity_         = 0;
+    uint32_t sync_num_tiles_capacity_      = 0;
+    uint32_t sync_HW_capacity_             = 0;
+    uint32_t sync_replay_offsets_capacity_ = 0;
+    uint32_t sync_replay_gids_capacity_    = 0;
+
+    std::unique_ptr<VulkanBuffer> sync_vs_buf_;
+    std::unique_ptr<VulkanBuffer> sync_tr_buf_;
+    std::unique_ptr<VulkanBuffer> sync_m2d_buf_;
+    std::unique_ptr<VulkanBuffer> sync_co_buf_;
+    std::unique_ptr<VulkanBuffer> sync_rgb_buf_;
+    std::unique_ptr<VulkanBuffer> sync_img_buf_;
+    std::unique_ptr<VulkanBuffer> sync_t_buf_;
+    std::unique_ptr<VulkanBuffer> sync_nc_buf_;
+    std::unique_ptr<VulkanBuffer> sync_ubo_buf_;
+    std::unique_ptr<VulkanBuffer> sync_g2s_buf_;
+    std::unique_ptr<VulkanBuffer> sync_opa2d_buf_;
+    std::unique_ptr<VulkanBuffer> sync_cov3d_buf_;
+    std::unique_ptr<VulkanBuffer> sync_mo_buf_;
+    std::unique_ptr<VulkanBuffer> sync_eval3d_ubo_buf_;
+    std::unique_ptr<VulkanBuffer> sync_dummy4_buf_;
+    std::unique_ptr<VulkanBuffer> sync_replay_offsets_buf_;
+    std::unique_ptr<VulkanBuffer> sync_replay_gids_buf_;
 
     // Layer-2 persistent buffers.
     std::unique_ptr<VulkanBuffer> r_img_;           // [3*H*W]   f32 CHW (channel-first)

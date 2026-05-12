@@ -211,52 +211,50 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
 
     // eval_3D scatter buffers: upload cov3D_inv, mean_offset, gauss2screen, and
     // build ScatterUBO. For 2D, allocate minimal dummy buffers.
-    std::unique_ptr<VulkanBuffer> bin_cov3d_inv_buf;
-    std::unique_ptr<VulkanBuffer> bin_mean_offset_buf;
-    std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
-    std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
-    std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf;
     const bool use_eval3d_tile_binning = cfg.eval_3D && !cfg.eval_3D_parity_mode;
-    if (use_eval3d_tile_binning && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
-        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_cov3d_inv_buf->upload(pre.cov3D_inv,
-            static_cast<std::size_t>(N) * 6u * sizeof(float));
-        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 3u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_mean_offset_buf->upload(pre.mean_offset,
-            static_cast<std::size_t>(N) * 3u * sizeof(float));
-        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 16u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_gauss2screen_buf->upload(pre.gauss2screen,
-            static_cast<std::size_t>(N) * 16u * sizeof(float));
-        // Pack {conic.a, conic.b, conic.c, opacity} per Gaussian for scatter
-        // tile-based culling predicate. Matches preprocess_bind::CONIC_OPACITY_PACKED layout.
-        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 4u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        if (pre.conics && pre.opacities_2d) {
-            std::vector<float> packed(static_cast<std::size_t>(N) * 4u);
-            for (int k = 0; k < N; ++k) {
-                packed[static_cast<std::size_t>(k) * 4u + 0u] = pre.conics[static_cast<std::size_t>(k) * 3u + 0u];
-                packed[static_cast<std::size_t>(k) * 4u + 1u] = pre.conics[static_cast<std::size_t>(k) * 3u + 1u];
-                packed[static_cast<std::size_t>(k) * 4u + 2u] = pre.conics[static_cast<std::size_t>(k) * 3u + 2u];
-                packed[static_cast<std::size_t>(k) * 4u + 3u] = pre.opacities_2d[k];
-            }
-            bin_conic_opacity_packed_buf->upload(packed.data(),
-                static_cast<std::size_t>(N) * 4u * sizeof(float));
+    if (use_eval3d_tile_binning && (!pre.cov3D_inv || !pre.mean_offset || !pre.gauss2screen || !pre.conics || !pre.opacities_2d)) {
+        throw std::runtime_error("TileBinnerVulkan: eval_3D tile binning requires cov3D_inv, mean_offset, gauss2screen, conics, and opacities_2d");
+    }
+    if (use_eval3d_tile_binning) {
+        const uint32_t N_u = static_cast<uint32_t>(N);
+        if (N_u > bin_eval_N_) {
+            bin_cov3d_inv_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_u) * 6u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_mean_offset_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_u) * 3u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_gauss2screen_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_u) * 16u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_conic_opacity_packed_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_u) * 4u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_eval_N_ = N_u;
         }
-    } else {
-        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        bin_cov3d_inv_buf_->upload(pre.cov3D_inv,
+            static_cast<std::size_t>(N) * 6u * sizeof(float));
+        bin_mean_offset_buf_->upload(pre.mean_offset,
+            static_cast<std::size_t>(N) * 3u * sizeof(float));
+        bin_gauss2screen_buf_->upload(pre.gauss2screen,
+            static_cast<std::size_t>(N) * 16u * sizeof(float));
+        std::vector<float> packed(static_cast<std::size_t>(N) * 4u);
+        for (int k = 0; k < N; ++k) {
+            packed[static_cast<std::size_t>(k) * 4u + 0u] = pre.conics[static_cast<std::size_t>(k) * 3u + 0u];
+            packed[static_cast<std::size_t>(k) * 4u + 1u] = pre.conics[static_cast<std::size_t>(k) * 3u + 1u];
+            packed[static_cast<std::size_t>(k) * 4u + 2u] = pre.conics[static_cast<std::size_t>(k) * 3u + 2u];
+            packed[static_cast<std::size_t>(k) * 4u + 3u] = pre.opacities_2d[k];
+        }
+        bin_conic_opacity_packed_buf_->upload(packed.data(),
+            static_cast<std::size_t>(N) * 4u * sizeof(float));
+    } else if (!bin_cov3d_inv_buf_) {
+        bin_cov3d_inv_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        bin_mean_offset_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        bin_gauss2screen_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        bin_conic_opacity_packed_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
     // Build ScatterUBO with inverse_vp, cam_pos, img_size.
@@ -275,10 +273,12 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         subo.img_size[2] = 0.0f;
         subo.img_size[3] = 0.0f;
     }
-    bin_scatter_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
-        sizeof(ScatterUBO),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    bin_scatter_ubo_buf->upload(&subo, sizeof(ScatterUBO));
+    if (!bin_scatter_ubo_buf_) {
+        bin_scatter_ubo_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+            sizeof(ScatterUBO),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+    bin_scatter_ubo_buf_->upload(&subo, sizeof(ScatterUBO));
 
     ScatterPass::Buffers sb{};
     sb.means2D         = bin_m2d_buf_->handle();
@@ -289,11 +289,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     sb.keys_unsorted   = bin_keys_buf_->handle();
     sb.values_unsorted = bin_vals_buf_->handle();
     sb.radius_f        = bin_rf_buf_ ->handle();
-    sb.cov3D_inv       = bin_cov3d_inv_buf->handle();
-    sb.mean_offset     = bin_mean_offset_buf->handle();
-    sb.scatter_ubo          = bin_scatter_ubo_buf->handle();
-    sb.gauss2screen         = bin_gauss2screen_buf->handle();
-    sb.conic_opacity_packed = bin_conic_opacity_packed_buf->handle();
+    sb.cov3D_inv       = bin_cov3d_inv_buf_->handle();
+    sb.mean_offset     = bin_mean_offset_buf_->handle();
+    sb.scatter_ubo          = bin_scatter_ubo_buf_->handle();
+    sb.gauss2screen         = bin_gauss2screen_buf_->handle();
+    sb.conic_opacity_packed = bin_conic_opacity_packed_buf_->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,

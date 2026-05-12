@@ -2,7 +2,7 @@
 
 Run: `ctest --test-dir harmonyos_3dgs/build`
 Build: `cd harmonyos_3dgs && cmake -B build -DBUILD_TESTS=ON && cmake --build build`
-Current CTest total: **327 tests** (2026-05-06 training/profiling sync, 73 .cpp test files)
+Current CTest total: **328 tests** (2026-05-09 profiling packed tile-range integration, 73 .cpp test files)
 
 ## Test Inventory (73 files)
 

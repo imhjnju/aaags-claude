@@ -1,5 +1,27 @@
 # Captain's Log
 
+## Session 21 — 2026-05-12 — Rasterizer sync-path reuse optimization
+
+Completed O2 after O1 timing showed `RasterizerVulkan::rasterize()` was the dominant Vulkan training stage. The sync Layer-1 rasterizer path now reuses grow-only cached buffers for the uploaded inputs, fallback tile ranges, outputs, eval_3D inputs, dummy bindings, UBOs, and replay-order sideband instead of allocating and destroying local `VulkanBuffer`s every call. This targets the `VulkanBuffer::~VulkanBuffer()` `vkDeviceWaitIdle()` destruction stall without changing shader math or pipeline ABI.
+
+The slice preserved all master cascade/config constraints: replay-order bindings stay at 14/15, cascade trace stays at 16..32, rasterize specialization IDs remain unchanged, Fuchsia sort stays opt-in, host mirrors/downloads remain in place, and `rasterize.comp` was not modified. Added one defensive eval_3D validation check so missing `gauss2screen`/`opacities_2d`/`cov3D_inv`/`mean_offset` fails fast instead of risking stale cached buffer contents.
+
+Validation is green for correctness: rasterizer/forward focus **8/8 PASS**, trainer/MCMC/Adam/densification/VkVsPyReference **35/35 PASS**, Fuchsia/TileRange/Sorter **9/9 PASS**, `VkVsCudaFirstLoss` **12/12 PASS**, basketball/cascade focus **9/9 PASS** with expected skips, and full CTest **328/328 PASS** in **2831.92s** with only the four known fixture-dependent skips. +1/+2 review cleared after fixing a stale header comment.
+
+Performance artifact: `build/compare_runs/radix_gt100k_perf_3step_500k_fuchsia_o2`. With Fuchsia sort and train-stage timers enabled, `R` stayed around **3.23M** and `VK saved vs CUDA` stayed **25.72 dB**. Rasterizer stage improved versus O1 from **1256.663/1877.950/1880.715 ms** to **950.623/1023.436/1230.353 ms** over steps 0/1/2. The benchmark script exited nonzero because the full-GT gap gate reported **2.16 dB > 2.00 dB**, the same gap recorded in the O1 report; the VK/CUDA parity metric did not regress. Total VK train CLI in this run was **15.17s** versus O1 report **10.77s**, so O2 removes a rasterizer stall source but does not yet solve total training time variance or non-rasterizer overhead.
+
+Remaining optimization candidates from the audit are the renderer GPU-resident fast path and broader GPU-only rasterizer/backward handoff. Do not cherry-pick profiling's cascade/rasterizer shader rewrites, Fuchsia default-enablement/global capability changes, or frustum/scatter ordering experiments without a separate parity-first plan.
+
+## Session 20 — 2026-05-09 — Profiling packed tile-range Fuchsia sync
+
+Ported the safe Slice A Phase A1 profiling optimization without cherry-picking profiling wholesale. A new packed-keyval tile-range shader is selected only via `TileRangeKeyLayout::PackedKeyval`, so legacy `TileRangePass` callers keep the high-32-bit tile-id contract while the Fuchsia env-on path can generate tile ranges directly from sorted packed keyvals on GPU.
+
+`SorterVulkan` now clears stale sort outputs at entry, publishes `keyvals_sorted_gpu`/`tile_ranges_gpu` for env-on Fuchsia sort, downloads host mirrors for compatibility, and reconstructs legacy `keys_sorted`/`values_sorted` so current rasterizer and backward paths still operate unchanged. Unsafe profiling changes were intentionally rejected: replay-order keeps bindings 14/15, cascade trace stays 16..32, rasterize specialization IDs are unchanged, eval_3D backward remains enabled, and Fuchsia requirements did not become global context-init requirements.
+
+Validation is green: shader build PASS, full build PASS, focused sorter/Fuchsia/tile-range **22/22 PASS**, forward/rasterizer/backward **20/20 PASS**, training/VkVsPyReference **35/35 PASS**, cascade/trace **4/4 PASS** with existing skips, basketball focus **7/7 PASS** with existing skips, `VkVsCudaFirstLoss` **12/12 PASS**, and full CTest **328/328 PASS** in **2535.72s** with only the four existing fixture-dependent skips.
+
+Performance check on basketball cam0 with the 30000-step cap500000 trained PLY: fallback sort averaged **1548.5 ms render / 654.9 ms sorter / 2.46s wall** over three runs; `GS3D_USE_FUCHSIA_SORT=1` averaged **1121.6 ms render / 98.2 ms sorter / 1.88s wall**. The env-on output was deterministic but differed from fallback on this full scene (`41.08 dB`, RMSE `0.00883`, max abs `0.7987`), so it remains an opt-in performance path rather than a default-safe parity path.
+
 ## Session 19 — 2026-05-08 — Training-priority eval_3D replay-order sync
 
 Ported the remaining training replay-order sideband into the merge worktree after the priority decision that training should win over trace binding preservation. Forward replay-order now owns rasterize bindings 14/15; cascade trace shifted to 16..32 and remained functional. Specialization IDs stayed compatible with the merge contract: `EVAL_3D=0`, `TRACE_ENABLED=1`, `SORT_MODE=2`, `EVAL3D_RAW_REPLAY=3`.

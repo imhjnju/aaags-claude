@@ -17,6 +17,7 @@
 #include "vulkan/sort_passes.h"
 #include "vulkan/vk_context.h"
 #include "vulkan/vk_buffer.h"
+#include "types.h"
 
 #include <gtest/gtest.h>
 
@@ -28,6 +29,12 @@ namespace {
 // Build a uint64 sort key from (tile_id, depth) layout.
 constexpr uint64_t make_key(uint32_t tile, uint32_t depth) {
     return (static_cast<uint64_t>(tile) << 32) | static_cast<uint64_t>(depth);
+}
+
+constexpr uint64_t make_packed_keyval(uint32_t tile, uint32_t depth, uint32_t idx) {
+    return (static_cast<uint64_t>(tile & keyval_pack::TILE_MASK) << keyval_pack::TILE_SHIFT) |
+           (static_cast<uint64_t>(depth & keyval_pack::DEPTH_MASK) << keyval_pack::DEPTH_SHIFT) |
+           static_cast<uint64_t>(idx & keyval_pack::IDX_MASK);
 }
 
 // Host-side oracle matching the tile_range.comp contract exactly:
@@ -55,7 +62,8 @@ std::vector<uint32_t> oracle_tile_ranges(const std::vector<uint64_t>& sorted_key
 
 std::vector<uint32_t> run_tile_range(VulkanContext& ctx,
                                      const std::vector<uint64_t>& sorted_keys,
-                                     uint32_t num_tiles) {
+                                     uint32_t num_tiles,
+                                     TileRangeKeyLayout layout = TileRangeKeyLayout::LegacyKey) {
     const uint32_t R = static_cast<uint32_t>(sorted_keys.size());
 
     // Upload keys (R may be 0 — allocate a one-byte dummy buffer then).
@@ -70,7 +78,7 @@ std::vector<uint32_t> run_tile_range(VulkanContext& ctx,
     std::vector<uint32_t> zeros(num_tiles * 2u, 0u);
     ranges_buf.upload(zeros.data(), zeros.size() * sizeof(uint32_t));
 
-    TileRangePass pass(ctx);
+    TileRangePass pass(ctx, layout);
     pass.bind_buffers(keys_buf.handle(), ranges_buf.handle());
     pass.dispatch_sync(R, num_tiles);
 
@@ -186,6 +194,33 @@ TEST(TileRangePassVk, MultiTileOracleCompare) {
 
     auto got      = run_tile_range(ctx, keys, num_tiles);
     auto expected = oracle_tile_ranges(keys, num_tiles);
+
+    ASSERT_EQ(got.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(got[i], expected[i]) << "mismatch at i=" << i;
+    }
+}
+
+TEST(TileRangePassVk, PackedKeyvalsMultiTileOracleCompare) {
+    VulkanContext ctx;
+    ASSERT_TRUE(ctx.init()) << "Vulkan init failed — no compute device?";
+
+    const std::vector<uint32_t> counts = {2, 0, 4, 1, 0, 3};
+    const uint32_t num_tiles = static_cast<uint32_t>(counts.size());
+
+    std::vector<uint64_t> keyvals;
+    std::vector<uint64_t> legacy_keys;
+    uint32_t idx = 0u;
+    for (uint32_t t = 0; t < num_tiles; ++t) {
+        for (uint32_t d = 0; d < counts[t]; ++d) {
+            keyvals.push_back(make_packed_keyval(t, d, idx++));
+            legacy_keys.push_back(make_key(t, d));
+        }
+    }
+    ASSERT_EQ(keyvals.size(), 10u);
+
+    auto got = run_tile_range(ctx, keyvals, num_tiles, TileRangeKeyLayout::PackedKeyval);
+    auto expected = oracle_tile_ranges(legacy_keys, num_tiles);
 
     ASSERT_EQ(got.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {

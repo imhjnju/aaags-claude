@@ -5,7 +5,10 @@
 #include "mcmc_densification.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -41,6 +44,20 @@
 // tensors (no interleave) with lrs 2.5e-3 / 1.25e-4.
 // ---------------------------------------------------------------------------
 namespace {
+
+using StageClock = std::chrono::steady_clock;
+
+bool training_stage_timers_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("GS3D_VK_TRAIN_STAGE_TIMERS");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+double elapsed_ms(StageClock::time_point start, StageClock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 // Gather DC slices (k=0) of all N Gaussians from interleaved [N, K, 3] -> [N, 3].
 inline void sh_gather_dc(const float* src_interleaved, int N, int K, float* dst_dc) {
@@ -474,13 +491,36 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     active_cfg.sh_degree = active_sh_degree_;
     active_cfg.eval_3D_parity_mode = tcfg_.eval_3D && tcfg_.parity_mode;
 
+    const bool stage_timers = training_stage_timers_enabled();
+    StageClock::time_point t_forward_start{};
+    StageClock::time_point t_stage_start{};
+    double preprocess_ms = 0.0;
+    double tile_binner_ms = 0.0;
+    double sorter_ms = 0.0;
+    double rasterizer_ms = 0.0;
+    double loss_ms = 0.0;
+    if (stage_timers) {
+        t_forward_start = StageClock::now();
+        t_stage_start = t_forward_start;
+    }
+
     // 1. Forward preprocess (populates cache: cov3D, p_view, p_hom_w, cov2D, cov2D_det)
     out_pre = preprocessor_.process(g_, cam, active_cfg, alloc_, &out_cache);
     preprocessor_.download_cache(N_, out_cache, alloc_);
     out_cache.pre = &out_pre;
+    if (stage_timers) {
+        const auto t_stage_end = StageClock::now();
+        preprocess_ms = elapsed_ms(t_stage_start, t_stage_end);
+        t_stage_start = t_stage_end;
+    }
 
     // 2. Tile binning
     out_bin = binner_.bin(out_pre, N_, cam, active_cfg, alloc_);
+    if (stage_timers) {
+        const auto t_stage_end = StageClock::now();
+        tile_binner_ms = elapsed_ms(t_stage_start, t_stage_end);
+        t_stage_start = t_stage_end;
+    }
     out_cache.bin = &out_bin;
     // Record actual R for next step's arena estimate.
     last_bin_R_ = static_cast<size_t>(out_bin.total_pairs);
@@ -488,10 +528,20 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
 
     // 3. Sort
     sorter_.sort(out_bin, alloc_);
+    if (stage_timers) {
+        const auto t_stage_end = StageClock::now();
+        sorter_ms = elapsed_ms(t_stage_start, t_stage_end);
+        t_stage_start = t_stage_end;
+    }
 
     // 4. Rasterize (populates cache.T_final and cache.n_contrib since they are non-null)
     rasterizer_.rasterize(out_pre, out_bin, cam, active_cfg, image_.data(),
                           /*depth=*/nullptr, &out_cache, &alloc_);
+    if (stage_timers) {
+        const auto t_stage_end = StageClock::now();
+        rasterizer_ms = elapsed_ms(t_stage_start, t_stage_end);
+        t_stage_start = t_stage_end;
+    }
     last_replay_order_count_ = out_cache.replay_order_count;
 
     // 4b. Optional intermediate capture — for VK-vs-CUDA parity tests only.
@@ -564,6 +614,17 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     //    lambda_dssim=0 disables the O(W*H*WINDOW^2) SSIM computation (use for large images).
     last_loss_ = compute_combined_loss_gradient(
         image_.data(), target, dL_dpixels_.data(), W, H, tcfg_.lambda_dssim);
+
+    if (stage_timers) {
+        const auto t_stage_end = StageClock::now();
+        loss_ms = elapsed_ms(t_stage_start, t_stage_end);
+        const double total_ms = elapsed_ms(t_forward_start, t_stage_end);
+        std::printf("[VK TRAIN STAGE] step=%d N=%d R=%d preprocess=%.3fms tile_binner=%.3fms sorter=%.3fms rasterizer=%.3fms loss=%.3fms total=%.3fms\n",
+                    step_count_, N_, out_bin.total_pairs,
+                    preprocess_ms, tile_binner_ms, sorter_ms,
+                    rasterizer_ms, loss_ms, total_ms);
+        std::fflush(stdout);
+    }
 
     return last_loss_;
 }

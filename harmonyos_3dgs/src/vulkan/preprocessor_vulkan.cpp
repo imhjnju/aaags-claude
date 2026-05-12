@@ -15,8 +15,8 @@
 //   - antialiasing flag not supported: shader path is the fixed +0.3 dilation
 //     variant without h_conv_scaling.
 //
-// Buffer allocation: fresh per process() call. Phase-1 simplicity — no caching
-// or reuse across calls. Future phases may hoist allocation for throughput.
+// Buffer allocation: Layer-1 sync buffers are grow-only cached across calls;
+// host outputs are still allocated from FrameAllocator per process() call.
 
 #include "vulkan/preprocessor_vulkan.h"
 #include "vulkan/preprocess_pass.h"
@@ -65,82 +65,66 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     const int N = g.count;
     const int M = g.max_coeffs;  // (sh_degree+1)^2
 
-    // --- 1. Allocate host-visible buffers ------------------------------------
-    // Inputs
-    auto pos_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto scl_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rot_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 4 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto op_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto sh_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * M * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto f3_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // Outputs
-    auto m2d_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 2 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dep_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // Packed {conic.a, conic.b, conic.c, opacity_2d}: 4 floats per Gaussian.
-    auto cop_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 4 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rgb_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // radii/tiles_touched: shader declares `int` (binding 10/11). Host-side
-    // PreprocessOutput uses `int*`. Buffer sized in 32-bit ints.
-    auto rad_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto tt_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rf_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 2u * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto cam_buf = std::make_unique<VulkanBuffer>(
-        ctx_, sizeof(CameraUBO),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    // ForwardCache output buffers (bindings 14..18).
-    // Always allocated so the shader descriptor set is always fully bound.
-    cov3d_buf_   = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 6 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    p_view_buf_  = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    p_hom_w_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    cov2d_buf_   = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    cov2d_det_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // eval_3D output buffers (bindings 19..21).
-    // Always allocated so the descriptor set is fully bound.
-    gauss2screen_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 16 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    cov3d_inv_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 6 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    mean_offset_buf_ = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // --- 1. Ensure host-visible buffers -------------------------------------
+    auto ensure_buffer = [&](std::unique_ptr<VulkanBuffer>& buffer,
+                             VkDeviceSize bytes,
+                             VkBufferUsageFlags usage) {
+        if (!buffer || buffer->size() < bytes) {
+            buffer = std::make_unique<VulkanBuffer>(ctx_, bytes, usage);
+        }
+    };
+    auto ensure_ssbo = [&](std::unique_ptr<VulkanBuffer>& buffer,
+                           VkDeviceSize bytes) {
+        ensure_buffer(buffer, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    };
+
+    const VkDeviceSize bytes_f1 = static_cast<VkDeviceSize>(N) * sizeof(float);
+    const VkDeviceSize bytes_i1 = static_cast<VkDeviceSize>(N) * sizeof(int32_t);
+    const VkDeviceSize bytes_f2 = static_cast<VkDeviceSize>(N) * 2u * sizeof(float);
+    const VkDeviceSize bytes_f3 = static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
+    const VkDeviceSize bytes_f4 = static_cast<VkDeviceSize>(N) * 4u * sizeof(float);
+    const VkDeviceSize bytes_sh = static_cast<VkDeviceSize>(N) *
+                                  static_cast<VkDeviceSize>(M) * 3u * sizeof(float);
+    const VkDeviceSize bytes_f6 = static_cast<VkDeviceSize>(N) * 6u * sizeof(float);
+    const VkDeviceSize bytes_f16 = static_cast<VkDeviceSize>(N) * 16u * sizeof(float);
+
+    ensure_ssbo(sync_pos_buf_, bytes_f3);
+    ensure_ssbo(sync_scl_buf_, bytes_f3);
+    ensure_ssbo(sync_rot_buf_, bytes_f4);
+    ensure_ssbo(sync_op_buf_, bytes_f1);
+    ensure_ssbo(sync_sh_buf_, bytes_sh);
+    ensure_ssbo(sync_f3_buf_, bytes_f1);
+    ensure_ssbo(sync_m2d_buf_, bytes_f2);
+    ensure_ssbo(sync_dep_buf_, bytes_f1);
+    ensure_ssbo(sync_cop_buf_, bytes_f4);
+    ensure_ssbo(sync_rgb_buf_, bytes_f3);
+    ensure_ssbo(sync_rad_buf_, bytes_i1);
+    ensure_ssbo(sync_tt_buf_, bytes_i1);
+    ensure_ssbo(sync_rf_buf_, bytes_f2);
+    ensure_buffer(sync_cam_buf_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    ensure_ssbo(cov3d_buf_, bytes_f6);
+    ensure_ssbo(p_view_buf_, bytes_f3);
+    ensure_ssbo(p_hom_w_buf_, bytes_f1);
+    ensure_ssbo(cov2d_buf_, bytes_f3);
+    ensure_ssbo(cov2d_det_buf_, bytes_f1);
+    ensure_ssbo(gauss2screen_buf_, bytes_f16);
+    ensure_ssbo(cov3d_inv_buf_, bytes_f6);
+    ensure_ssbo(mean_offset_buf_, bytes_f3);
+
+    auto& pos_buf = sync_pos_buf_;
+    auto& scl_buf = sync_scl_buf_;
+    auto& rot_buf = sync_rot_buf_;
+    auto& op_buf  = sync_op_buf_;
+    auto& sh_buf  = sync_sh_buf_;
+    auto& f3_buf  = sync_f3_buf_;
+    auto& m2d_buf = sync_m2d_buf_;
+    auto& dep_buf = sync_dep_buf_;
+    auto& cop_buf = sync_cop_buf_;
+    auto& rgb_buf = sync_rgb_buf_;
+    auto& rad_buf = sync_rad_buf_;
+    auto& tt_buf  = sync_tt_buf_;
+    auto& rf_buf  = sync_rf_buf_;
+    auto& cam_buf = sync_cam_buf_;
 
     // --- 2. Upload inputs ----------------------------------------------------
     pos_buf->upload(g.positions, static_cast<std::size_t>(N) * 3 * sizeof(float));
@@ -154,8 +138,11 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     if (g.filter_3D != nullptr) {
         f3_buf->upload(g.filter_3D, static_cast<std::size_t>(N) * sizeof(float));
     } else {
-        std::vector<float> zeros(static_cast<std::size_t>(N), 0.0f);
-        f3_buf->upload(zeros.data(), static_cast<std::size_t>(N) * sizeof(float));
+        const std::size_t count = static_cast<std::size_t>(N);
+        if (sync_filter_zeros_.size() < count) {
+            sync_filter_zeros_.resize(count, 0.0f);
+        }
+        f3_buf->upload(sync_filter_zeros_.data(), count * sizeof(float));
     }
 
     // --- 3. Build CameraUBO (std140, 224 bytes per spec §4.6) ----------------

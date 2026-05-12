@@ -9,6 +9,7 @@
 
 // xxd-embedded SPIR-V (CMake build dir produces tile_range_spv.h).
 #include "tile_range_spv.h"
+#include "tile_range_packed_spv.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,12 +22,15 @@ namespace {
 constexpr uint32_t kTileRangeLocalSize = 256;
 }  // namespace
 
-TileRangePass::TileRangePass(VulkanContext& ctx)
+TileRangePass::TileRangePass(VulkanContext& ctx, TileRangeKeyLayout layout)
     : ctx_(ctx) {
+    const bool packed = layout == TileRangeKeyLayout::PackedKeyval;
     shader_ = std::make_unique<VulkanShader>(
         ctx_,
-        static_cast<const uint8_t*>(tile_range_spv),
-        static_cast<std::size_t>(tile_range_spv_len));
+        packed ? static_cast<const uint8_t*>(tile_range_packed_spv)
+               : static_cast<const uint8_t*>(tile_range_spv),
+        packed ? static_cast<std::size_t>(tile_range_packed_spv_len)
+               : static_cast<std::size_t>(tile_range_spv_len));
 
     // 2 SSBOs: keys_sorted (RO), tile_ranges (RW). Both storage buffers.
     std::vector<VkDescriptorType> binding_types(2,

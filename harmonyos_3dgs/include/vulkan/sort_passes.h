@@ -116,9 +116,15 @@ private:
 // ---------------------------------------------------------------------------
 // TileRangePass -- emits tile_ranges[num_tiles*2] from sorted keys.
 // ---------------------------------------------------------------------------
+enum class TileRangeKeyLayout {
+    LegacyKey,
+    PackedKeyval,
+};
+
 class TileRangePass {
 public:
-    explicit TileRangePass(VulkanContext& ctx);
+    explicit TileRangePass(VulkanContext& ctx,
+                           TileRangeKeyLayout layout = TileRangeKeyLayout::LegacyKey);
     ~TileRangePass() = default;
 
     TileRangePass(const TileRangePass&)            = delete;

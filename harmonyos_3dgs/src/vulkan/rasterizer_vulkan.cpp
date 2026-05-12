@@ -74,6 +74,91 @@ RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
 // the header.
 RasterizerVulkan::~RasterizerVulkan() = default;
 
+void RasterizerVulkan::prepare_sync_buffers(uint32_t R, uint32_t N_eff,
+                                            uint32_t num_tiles, uint32_t HW,
+                                            bool need_eval3d_inputs) {
+    if (R > sync_R_capacity_) {
+        sync_vs_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(R) * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_R_capacity_ = R;
+    }
+
+    if (num_tiles > sync_num_tiles_capacity_) {
+        sync_tr_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(num_tiles) * 2u * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_num_tiles_capacity_ = num_tiles;
+    }
+
+    if (N_eff > sync_N_eff_capacity_) {
+        sync_m2d_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 2u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_co_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 4u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_rgb_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_N_eff_capacity_ = N_eff;
+    }
+
+    if (need_eval3d_inputs && N_eff > sync_eval_N_capacity_) {
+        sync_g2s_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 16u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_opa2d_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_cov3d_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 6u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_mo_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_eval_N_capacity_ = N_eff;
+    }
+
+    if (HW > sync_HW_capacity_) {
+        sync_img_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(HW) * 3u * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_t_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(HW) * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_nc_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(HW) * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_HW_capacity_ = HW;
+    }
+
+    if (!sync_ubo_buf_) {
+        sync_ubo_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+    if (!sync_eval3d_ubo_buf_) {
+        sync_eval3d_ubo_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, static_cast<VkDeviceSize>(sizeof(RasterEval3DUBO)),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+    if (!sync_dummy4_buf_) {
+        sync_dummy4_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    if (!sync_replay_offsets_buf_) {
+        sync_replay_offsets_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_replay_offsets_capacity_ = 1u;
+    }
+    if (!sync_replay_gids_buf_) {
+        sync_replay_gids_buf_ = std::make_unique<VulkanBuffer>(
+            ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        sync_replay_gids_capacity_ = 1u;
+    }
+}
+
 void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
                                  const BinningOutput& binning,
                                  const Camera& camera,
@@ -136,6 +221,16 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         if (g > max_gid) max_gid = g;
     }
     const uint32_t N_eff = max_gid + 1u;
+    const uint32_t HW_u = static_cast<uint32_t>(HW);
+    const bool need_eval3d_inputs = eval_3D_;
+    if (need_eval3d_inputs && (!preprocess.gauss2screen || !preprocess.opacities_2d ||
+                               !preprocess.cov3D_inv || !preprocess.mean_offset)) {
+        throw std::runtime_error(
+            "RasterizerVulkan::rasterize: eval_3D requires gauss2screen, opacities_2d, cov3D_inv, and mean_offset");
+    }
+
+    prepare_sync_buffers(static_cast<uint32_t>(R), N_eff, binning.num_tiles,
+                         HW_u, need_eval3d_inputs);
 
     // -------------------------------------------------------------------
     // Repack per-Gaussian conics (Nx3) + opacities_2d (Nx1) → packed (Nx4).
@@ -155,7 +250,7 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     }
 
     // -------------------------------------------------------------------
-    // Allocate GPU buffers (host-visible coherent; Phase 1).
+    // Input/output byte counts for cached GPU buffers.
     // -------------------------------------------------------------------
     const VkDeviceSize bytes_vs       =
         static_cast<VkDeviceSize>(R) * sizeof(uint32_t);
@@ -174,84 +269,41 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     const VkDeviceSize bytes_ncontrib =
         static_cast<VkDeviceSize>(HW) * sizeof(uint32_t);
 
-    auto vs_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_vs,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto tr_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tr,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto m2d_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_m2d,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto co_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_co,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rgb_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_rgb,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto img_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_img,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto t_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tfinal,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto nc_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_ncontrib, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto ubo_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-
     // -------------------------------------------------------------------
     // Upload inputs.
     // -------------------------------------------------------------------
-    vs_buf ->upload(binning.values_sorted,
-                    static_cast<std::size_t>(bytes_vs));
+    sync_vs_buf_->upload(binning.values_sorted,
+                         static_cast<std::size_t>(bytes_vs));
     if (binning.tile_ranges_gpu == nullptr) {
-        tr_buf->upload(binning.tile_ranges,
-                       static_cast<std::size_t>(bytes_tr));
+        sync_tr_buf_->upload(binning.tile_ranges,
+                             static_cast<std::size_t>(bytes_tr));
     }
-    m2d_buf->upload(preprocess.means2D,
-                    static_cast<std::size_t>(bytes_m2d));
-    co_buf ->upload(conic_opacity_packed.data(),
-                    static_cast<std::size_t>(bytes_co));
-    rgb_buf->upload(preprocess.rgb,
-                    static_cast<std::size_t>(bytes_rgb));
+    sync_m2d_buf_->upload(preprocess.means2D,
+                          static_cast<std::size_t>(bytes_m2d));
+    sync_co_buf_->upload(conic_opacity_packed.data(),
+                         static_cast<std::size_t>(bytes_co));
+    sync_rgb_buf_->upload(preprocess.rgb,
+                          static_cast<std::size_t>(bytes_rgb));
 
     RasterizeUBO ubo{};
     ubo.bg_r = config.bg_color[0];
     ubo.bg_g = config.bg_color[1];
     ubo.bg_b = config.bg_color[2];
-    ubo_buf->upload(&ubo, sizeof(ubo));
+    sync_ubo_buf_->upload(&ubo, sizeof(ubo));
 
     // -------------------------------------------------------------------
     // eval_3D rasterize buffers (gauss2screen, opacities_2d, cov3D_inv,
     // mean_offset, RasterEval3DUBO).
     // -------------------------------------------------------------------
-    std::unique_ptr<VulkanBuffer> g2s_buf, opa2d_buf, r_cov3d_buf, r_mo_buf;
-    std::unique_ptr<VulkanBuffer> eval3d_ubo_buf;
-    std::unique_ptr<VulkanBuffer> dummy4_buf;
-
-    if (eval_3D_ && preprocess.gauss2screen && preprocess.opacities_2d) {
-        g2s_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 16u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        g2s_buf->upload(preprocess.gauss2screen,
+    if (need_eval3d_inputs) {
+        sync_g2s_buf_->upload(preprocess.gauss2screen,
             static_cast<std::size_t>(N_eff) * 16u * sizeof(float));
-        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        opa2d_buf->upload(preprocess.opacities_2d,
+        sync_opa2d_buf_->upload(preprocess.opacities_2d,
             static_cast<std::size_t>(N_eff) * sizeof(float));
-        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 6u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_cov3d_buf->upload(preprocess.cov3D_inv,
+        sync_cov3d_buf_->upload(preprocess.cov3D_inv,
             static_cast<std::size_t>(N_eff) * 6u * sizeof(float));
-        r_mo_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_mo_buf->upload(preprocess.mean_offset,
+        sync_mo_buf_->upload(preprocess.mean_offset,
             static_cast<std::size_t>(N_eff) * 3u * sizeof(float));
-    } else {
-        dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        g2s_buf   = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_mo_buf  = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
     // Build RasterEval3DUBO.
     RasterEval3DUBO eubo{};
@@ -268,36 +320,30 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         eubo.img_size[2] = 0.0f;
         eubo.img_size[3] = 0.0f;
     }
-    eval3d_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
-        sizeof(RasterEval3DUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
-    auto replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    sync_eval3d_ubo_buf_->upload(&eubo, sizeof(eubo));
 
     // -------------------------------------------------------------------
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizePass::Buffers rb{};
-    rb.values_sorted        = vs_buf ->handle();
+    rb.values_sorted        = sync_vs_buf_->handle();
     rb.tile_ranges          = binning.tile_ranges_gpu
         ? static_cast<VkBuffer>(binning.tile_ranges_gpu)
-        : tr_buf->handle();
-    rb.means2D              = m2d_buf->handle();
-    rb.conic_opacity_packed = co_buf ->handle();
-    rb.rgb                  = rgb_buf->handle();
-    rb.out_image            = img_buf->handle();
-    rb.transmittance        = t_buf  ->handle();
-    rb.n_contrib            = nc_buf ->handle();
-    rb.raster_ubo           = ubo_buf->handle();
-    rb.gauss2screen         = g2s_buf->handle();
-    rb.opacities_2d         = opa2d_buf->handle();
-    rb.cov3D_inv            = r_cov3d_buf->handle();
-    rb.mean_offset          = r_mo_buf->handle();
-    rb.raster_eval3d_ubo    = eval3d_ubo_buf->handle();
-    rb.replay_order_offsets = replay_offsets_buf->handle();
-    rb.replay_order_gids    = replay_gids_buf->handle();
+        : sync_tr_buf_->handle();
+    rb.means2D              = sync_m2d_buf_->handle();
+    rb.conic_opacity_packed = sync_co_buf_->handle();
+    rb.rgb                  = sync_rgb_buf_->handle();
+    rb.out_image            = sync_img_buf_->handle();
+    rb.transmittance        = sync_t_buf_->handle();
+    rb.n_contrib            = sync_nc_buf_->handle();
+    rb.raster_ubo           = sync_ubo_buf_->handle();
+    rb.gauss2screen         = need_eval3d_inputs ? sync_g2s_buf_->handle() : sync_dummy4_buf_->handle();
+    rb.opacities_2d         = need_eval3d_inputs ? sync_opa2d_buf_->handle() : sync_dummy4_buf_->handle();
+    rb.cov3D_inv            = need_eval3d_inputs ? sync_cov3d_buf_->handle() : sync_dummy4_buf_->handle();
+    rb.mean_offset          = need_eval3d_inputs ? sync_mo_buf_->handle() : sync_dummy4_buf_->handle();
+    rb.raster_eval3d_ubo    = sync_eval3d_ubo_buf_->handle();
+    rb.replay_order_offsets = sync_replay_offsets_buf_->handle();
+    rb.replay_order_gids    = sync_replay_gids_buf_->handle();
     pass_->bind_buffers(rb);
     pass_->dispatch_sync(N_eff,
                          static_cast<uint32_t>(W), static_cast<uint32_t>(H),
@@ -306,19 +352,19 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // -------------------------------------------------------------------
     // Download outputs.
     // -------------------------------------------------------------------
-    img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+    sync_img_buf_->download(output_image, static_cast<std::size_t>(bytes_img));
 
     if (cache) {
         if (cache->T_final) {
-            t_buf->download(cache->T_final,
-                            static_cast<std::size_t>(bytes_tfinal));
+            sync_t_buf_->download(cache->T_final,
+                                  static_cast<std::size_t>(bytes_tfinal));
         }
         if (cache->n_contrib) {
             // ForwardCache::n_contrib is int*; the shader writes uint32 of the
             // same width so a raw copy is correct — no sign-reinterp happens
             // because counts fit well under 2^31.
-            nc_buf->download(cache->n_contrib,
-                             static_cast<std::size_t>(bytes_ncontrib));
+            sync_nc_buf_->download(cache->n_contrib,
+                                   static_cast<std::size_t>(bytes_ncontrib));
         }
 
         cache->replay_order_offsets_storage.clear();
@@ -351,26 +397,37 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
                 ? nullptr
                 : cache->replay_order_gids_storage.data();
 
-            replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_,
-                static_cast<VkDeviceSize>(HW_size + 1u) * sizeof(uint32_t),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            replay_offsets_buf->upload(cache->replay_order_offsets,
-                (HW_size + 1u) * sizeof(uint32_t));
-            replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_,
-                static_cast<VkDeviceSize>(cache->replay_order_count == 0u ? 4u : cache->replay_order_count * sizeof(uint32_t)),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const uint32_t replay_offsets_count = static_cast<uint32_t>(HW_size + 1u);
+            if (replay_offsets_count > sync_replay_offsets_capacity_) {
+                sync_replay_offsets_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(replay_offsets_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                sync_replay_offsets_capacity_ = replay_offsets_count;
+            }
+            sync_replay_offsets_buf_->upload(cache->replay_order_offsets,
+                static_cast<std::size_t>(replay_offsets_count) * sizeof(uint32_t));
+
+            const uint32_t replay_gids_count = cache->replay_order_count == 0u
+                ? 1u
+                : static_cast<uint32_t>(cache->replay_order_count);
+            if (replay_gids_count > sync_replay_gids_capacity_) {
+                sync_replay_gids_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(replay_gids_count) * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                sync_replay_gids_capacity_ = replay_gids_count;
+            }
 
             eubo.img_size[2] = 1.0f;
-            eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
-            rb.raster_eval3d_ubo = eval3d_ubo_buf->handle();
-            rb.replay_order_offsets = replay_offsets_buf->handle();
-            rb.replay_order_gids = replay_gids_buf->handle();
+            sync_eval3d_ubo_buf_->upload(&eubo, sizeof(eubo));
+            rb.raster_eval3d_ubo = sync_eval3d_ubo_buf_->handle();
+            rb.replay_order_offsets = sync_replay_offsets_buf_->handle();
+            rb.replay_order_gids = sync_replay_gids_buf_->handle();
             pass_->bind_buffers(rb);
             pass_->dispatch_sync(N_eff,
                                  static_cast<uint32_t>(W), static_cast<uint32_t>(H),
                                  num_tiles_x, num_tiles_y);
             if (cache->replay_order_count > 0u) {
-                replay_gids_buf->download(cache->replay_order_gids,
+                sync_replay_gids_buf_->download(cache->replay_order_gids,
                     cache->replay_order_count * sizeof(uint32_t));
             }
         }

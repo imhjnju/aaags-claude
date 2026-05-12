@@ -97,9 +97,10 @@ private:
     // Scan buffers sized to max N seen; scatter buffers sized to max ACTUAL R
     // seen (NOT N*num_tiles worst-case). prepare_for_scatter() is called after
     // the scan gives us actual R, so we never over-allocate by 100-1000x.
-    uint32_t bin_N_     = 0u;  // Gaussian count at last scan alloc
-    uint64_t bin_R_max_ = 0u;  // actual scatter buffer capacity (grow-only)
-    uint32_t bin_wg_    = 0u;  // workgroup count = ceil(N/256) at last alloc
+    uint32_t bin_N_      = 0u;  // Gaussian count at last scan alloc
+    uint64_t bin_R_max_  = 0u;  // actual scatter buffer capacity (grow-only)
+    uint32_t bin_wg_     = 0u;  // workgroup count = ceil(N/256) at last alloc
+    uint32_t bin_eval_N_ = 0u;  // eval_3D scratch capacity
 
     std::unique_ptr<VulkanBuffer> bin_tt_buf_;    // tiles_touched [N] i32
     std::unique_ptr<VulkanBuffer> bin_po_buf_;    // point_offsets [N] u32
@@ -109,6 +110,11 @@ private:
     std::unique_ptr<VulkanBuffer> bin_dep_buf_;   // depths [N] f32
     std::unique_ptr<VulkanBuffer> bin_rad_buf_;   // radii [N] i32
     std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N*2] f32 (extent_x, extent_y)
+    std::unique_ptr<VulkanBuffer> bin_cov3d_inv_buf_;
+    std::unique_ptr<VulkanBuffer> bin_mean_offset_buf_;
+    std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf_;
+    std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf_;
+    std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf_;
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
 
