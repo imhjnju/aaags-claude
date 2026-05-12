@@ -63,7 +63,6 @@ public:
     int step_count() const { return step_count_; }
     float last_loss() const { return last_loss_; }
     int active_sh_degree() const { return active_sh_degree_; }
-    size_t last_replay_order_count_for_test() const { return last_replay_order_count_; }
 
     // Access current raw parameters (for inspection/checkpointing).
     const RawGaussianParams& raw_params() const { return raw_view_; }
@@ -277,7 +276,6 @@ private:
     // N grows, so we scale by the N ratio and add a 4× safety margin.
     size_t last_bin_R_ = 0u;
     size_t last_bin_N_ = 0u;
-    size_t last_replay_order_count_ = 0u;
 
     // Learning rates per group — stored so step() doesn't hardcode them.
     float group_lrs_[6] = {1.6e-4f, 2.5e-3f, 1.25e-4f, 0.05f, 0.005f, 0.001f};
