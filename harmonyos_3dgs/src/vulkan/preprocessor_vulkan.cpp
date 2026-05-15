@@ -58,6 +58,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
 
     if (g.count <= 0) {
         PreprocessOutput out{};
+        out.num_gaussians = 0;
         out.eval_3D = eval_3D_;
         return out;
     }
@@ -86,28 +87,28 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     // Outputs
-    auto m2d_buf = std::make_unique<VulkanBuffer>(
+    means2d_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * 2 * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto dep_buf = std::make_unique<VulkanBuffer>(
+    depths_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     // Packed {conic.a, conic.b, conic.c, opacity_2d}: 4 floats per Gaussian.
-    auto cop_buf = std::make_unique<VulkanBuffer>(
+    conic_opacity_packed_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * 4 * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rgb_buf = std::make_unique<VulkanBuffer>(
+    rgb_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * 3 * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     // radii/tiles_touched: shader declares `int` (binding 10/11). Host-side
     // PreprocessOutput uses `int*`. Buffer sized in 32-bit ints.
-    auto rad_buf = std::make_unique<VulkanBuffer>(
+    radii_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto tt_buf  = std::make_unique<VulkanBuffer>(
+    tiles_touched_buf_  = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * sizeof(int32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rf_buf  = std::make_unique<VulkanBuffer>(
+    radius_f_buf_  = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(N) * 2u * sizeof(float),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto cam_buf = std::make_unique<VulkanBuffer>(
@@ -197,14 +198,14 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     b.opacities             = op_buf ->handle();
     b.sh                    = sh_buf ->handle();
     b.filter_3D             = f3_buf ->handle();
-    b.means2D               = m2d_buf->handle();
-    b.depths                = dep_buf->handle();
-    b.conic_opacity_packed  = cop_buf->handle();
-    b.rgb                   = rgb_buf->handle();
-    b.radii                 = rad_buf->handle();
-    b.tiles_touched         = tt_buf ->handle();
+    b.means2D               = means2d_buf_->handle();
+    b.depths                = depths_buf_->handle();
+    b.conic_opacity_packed  = conic_opacity_packed_buf_->handle();
+    b.rgb                   = rgb_buf_->handle();
+    b.radii                 = radii_buf_->handle();
+    b.tiles_touched         = tiles_touched_buf_->handle();
     b.camera_ubo            = cam_buf->handle();
-    b.radius_f              = rf_buf ->handle();
+    b.radius_f              = radius_f_buf_->handle();
     b.cov3D_cache           = cov3d_buf_    ->handle();
     b.p_view_cache          = p_view_buf_   ->handle();
     b.p_hom_w_cache         = p_hom_w_buf_  ->handle();
@@ -222,11 +223,13 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     pc.num_tiles_x     = static_cast<uint32_t>((cam.width  + 15) / 16);
     pc.num_tiles_y     = static_cast<uint32_t>((cam.height + 15) / 16);
     pc.scale_modifier  = cfg.scale_modifier;
+    pc.compact_eval3D_tiles = (eval_3D_ && cfg.compact_eval3D_tiles) ? 1u : 0u;
 
     pass_->dispatch_sync(pc);
 
     // --- 5. Download outputs + deinterleave ----------------------------------
     PreprocessOutput out{};
+    out.num_gaussians = N;
     out.means2D       = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 2);
     out.depths        = alloc.allocate_array<float>(static_cast<std::size_t>(N));
     out.conics        = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
@@ -245,13 +248,27 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         out.cov3D_inv    = nullptr;
         out.mean_offset  = nullptr;
     }
+    out.means2D_gpu = means2d_buf_ ? means2d_buf_->handle() : nullptr;
+    out.depths_gpu = depths_buf_ ? depths_buf_->handle() : nullptr;
+    out.conic_opacity_packed_gpu = conic_opacity_packed_buf_ ? conic_opacity_packed_buf_->handle() : nullptr;
+    out.rgb_gpu = rgb_buf_ ? rgb_buf_->handle() : nullptr;
+    out.radii_gpu = radii_buf_ ? radii_buf_->handle() : nullptr;
+    out.tiles_touched_gpu = tiles_touched_buf_ ? tiles_touched_buf_->handle() : nullptr;
+    out.radius_f_gpu = radius_f_buf_ ? radius_f_buf_->handle() : nullptr;
+    out.gauss2screen_gpu = (eval_3D_ && gauss2screen_buf_) ? gauss2screen_buf_->handle() : nullptr;
+    out.cov3D_inv_gpu = (eval_3D_ && cov3d_inv_buf_) ? cov3d_inv_buf_->handle() : nullptr;
+    out.mean_offset_gpu = (eval_3D_ && mean_offset_buf_) ? mean_offset_buf_->handle() : nullptr;
 
-    m2d_buf->download(out.means2D,       static_cast<std::size_t>(N) * 2 * sizeof(float));
-    dep_buf->download(out.depths,        static_cast<std::size_t>(N) * sizeof(float));
-    rgb_buf->download(out.rgb,           static_cast<std::size_t>(N) * 3 * sizeof(float));
-    rad_buf->download(out.radii,         static_cast<std::size_t>(N) * sizeof(int32_t));
-    tt_buf ->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
-    rf_buf ->download(out.radius_f,      static_cast<std::size_t>(N) * 2 * sizeof(float));
+    means2d_buf_->download(out.means2D,       static_cast<std::size_t>(N) * 2 * sizeof(float));
+    depths_buf_->download(out.depths,        static_cast<std::size_t>(N) * sizeof(float));
+    rgb_buf_->download(out.rgb,           static_cast<std::size_t>(N) * 3 * sizeof(float));
+    radii_buf_->download(out.radii,         static_cast<std::size_t>(N) * sizeof(int32_t));
+    tiles_touched_buf_->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
+    out.num_tile_pairs = 0;
+    for (int i = 0; i < N; ++i) {
+        out.num_tile_pairs += out.tiles_touched[i];
+    }
+    radius_f_buf_->download(out.radius_f,      static_cast<std::size_t>(N) * 2 * sizeof(float));
 
     if (eval_3D_) {
         gauss2screen_buf_->download(out.gauss2screen, static_cast<std::size_t>(N) * 16 * sizeof(float));
@@ -262,7 +279,7 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     // Deinterleave packed {conic.a, conic.b, conic.c, opacity} (stride-4 per
     // Gaussian) into the CPU-reference layout: conics[N*3] and opacities_2d[N].
     std::vector<float> packed(static_cast<std::size_t>(N) * 4);
-    cop_buf->download(packed.data(), static_cast<std::size_t>(N) * 4 * sizeof(float));
+    conic_opacity_packed_buf_->download(packed.data(), static_cast<std::size_t>(N) * 4 * sizeof(float));
     for (int i = 0; i < N; ++i) {
         out.conics[i * 3 + 0] = packed[i * 4 + 0];
         out.conics[i * 3 + 1] = packed[i * 4 + 1];
@@ -271,6 +288,174 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
     }
 
     // Populate ForwardCache if requested.
+    if (cache) {
+        download_cache(N, *cache, alloc);
+    }
+
+    return out;
+}
+
+PreprocessOutput PreprocessorVulkan::process_gpu_inputs(int N,
+                                                        int M,
+                                                        VkBuffer positions,
+                                                        VkBuffer scales,
+                                                        VkBuffer rotations,
+                                                        VkBuffer opacities,
+                                                        VkBuffer sh,
+                                                        VkBuffer filter_3D,
+                                                        const Camera& cam,
+                                                        const RenderConfig& cfg,
+                                                        FrameAllocator& alloc,
+                                                        ForwardCache* cache) {
+    if (cfg.tile_w != 16 || cfg.tile_h != 16)
+        throw std::runtime_error(
+            "PreprocessorVulkan: only 16x16 tiles supported");
+    if (cfg.antialiasing)
+        throw std::runtime_error(
+            "PreprocessorVulkan: antialiasing flag not supported");
+
+    if (N <= 0) {
+        PreprocessOutput out{};
+        out.num_gaussians = 0;
+        out.eval_3D = eval_3D_;
+        return out;
+    }
+
+    auto mk_ssbo = [&](VkDeviceSize bytes) {
+        return std::make_unique<VulkanBuffer>(
+            ctx_, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    };
+
+    means2d_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 2 * sizeof(float));
+    depths_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    conic_opacity_packed_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 4 * sizeof(float));
+    rgb_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    radii_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(int32_t));
+    tiles_touched_buf_  = mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(int32_t));
+    radius_f_buf_  = mk_ssbo(static_cast<VkDeviceSize>(N) * 2u * sizeof(float));
+    auto cam_buf = std::make_unique<VulkanBuffer>(
+        ctx_, sizeof(CameraUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    cov3d_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 6 * sizeof(float));
+    p_view_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    p_hom_w_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    cov2d_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+    cov2d_det_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * sizeof(float));
+    gauss2screen_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 16 * sizeof(float));
+    cov3d_inv_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 6 * sizeof(float));
+    mean_offset_buf_ = mk_ssbo(static_cast<VkDeviceSize>(N) * 3 * sizeof(float));
+
+    CameraUBO c{};
+    std::memcpy(c.viewmatrix, cam.view_matrix, 16 * sizeof(float));
+    std::memcpy(c.projmatrix, cam.viewproj_matrix, 16 * sizeof(float));
+    float inv_vp[16];
+    if (!invertMatrix4x4(cam.viewproj_matrix, inv_vp)) {
+        std::memset(inv_vp, 0, sizeof(inv_vp));
+        inv_vp[0] = inv_vp[5] = inv_vp[10] = inv_vp[15] = 1.0f;
+    }
+    std::memcpy(c.inv_viewprojmatrix, inv_vp, 16 * sizeof(float));
+    c.campos_pad[0] = cam.cam_pos[0];
+    c.campos_pad[1] = cam.cam_pos[1];
+    c.campos_pad[2] = cam.cam_pos[2];
+    c.campos_pad[3] = 0.0f;
+    c.fov_size[0] = cam.tan_fovx;
+    c.fov_size[1] = cam.tan_fovy;
+    c.fov_size[2] = static_cast<float>(cam.width);
+    c.fov_size[3] = static_cast<float>(cam.height);
+    cam_buf->upload(&c, sizeof(CameraUBO));
+
+    PreprocessPass::Buffers b{};
+    b.positions = positions;
+    b.scales = scales;
+    b.rotations = rotations;
+    b.opacities = opacities;
+    b.sh = sh;
+    b.filter_3D = filter_3D;
+    b.means2D = means2d_buf_->handle();
+    b.depths = depths_buf_->handle();
+    b.conic_opacity_packed = conic_opacity_packed_buf_->handle();
+    b.rgb = rgb_buf_->handle();
+    b.radii = radii_buf_->handle();
+    b.tiles_touched = tiles_touched_buf_->handle();
+    b.camera_ubo = cam_buf->handle();
+    b.radius_f = radius_f_buf_->handle();
+    b.cov3D_cache = cov3d_buf_->handle();
+    b.p_view_cache = p_view_buf_->handle();
+    b.p_hom_w_cache = p_hom_w_buf_->handle();
+    b.cov2D_cache = cov2d_buf_->handle();
+    b.cov2D_det_cache = cov2d_det_buf_->handle();
+    b.gauss2screen = gauss2screen_buf_->handle();
+    b.cov3D_inv = cov3d_inv_buf_->handle();
+    b.mean_offset = mean_offset_buf_->handle();
+    pass_->bind_buffers(b);
+
+    PreprocessPushConstants pc{};
+    pc.num_gaussians = static_cast<uint32_t>(N);
+    pc.sh_degree = static_cast<uint32_t>(cfg.sh_degree);
+    pc.sh_coeffs_per_g = static_cast<uint32_t>(M);
+    pc.num_tiles_x = static_cast<uint32_t>((cam.width + 15) / 16);
+    pc.num_tiles_y = static_cast<uint32_t>((cam.height + 15) / 16);
+    pc.scale_modifier = cfg.scale_modifier;
+    pc.compact_eval3D_tiles = (eval_3D_ && cfg.compact_eval3D_tiles) ? 1u : 0u;
+    pass_->dispatch_sync(pc);
+
+    PreprocessOutput out{};
+    out.num_gaussians = N;
+    out.means2D = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 2);
+    out.depths = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    out.conics = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    out.opacities_2d = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    out.rgb = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    out.radii = alloc.allocate_array<int>(static_cast<std::size_t>(N));
+    out.tiles_touched = alloc.allocate_array<int>(static_cast<std::size_t>(N));
+    out.radius_f = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 2);
+    out.eval_3D = eval_3D_;
+    if (eval_3D_) {
+        out.gauss2screen = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 16);
+        out.cov3D_inv = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 6);
+        out.mean_offset = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
+    } else {
+        out.gauss2screen = nullptr;
+        out.cov3D_inv = nullptr;
+        out.mean_offset = nullptr;
+    }
+    out.means2D_gpu = means2d_buf_ ? means2d_buf_->handle() : nullptr;
+    out.depths_gpu = depths_buf_ ? depths_buf_->handle() : nullptr;
+    out.conic_opacity_packed_gpu = conic_opacity_packed_buf_ ? conic_opacity_packed_buf_->handle() : nullptr;
+    out.rgb_gpu = rgb_buf_ ? rgb_buf_->handle() : nullptr;
+    out.radii_gpu = radii_buf_ ? radii_buf_->handle() : nullptr;
+    out.tiles_touched_gpu = tiles_touched_buf_ ? tiles_touched_buf_->handle() : nullptr;
+    out.radius_f_gpu = radius_f_buf_ ? radius_f_buf_->handle() : nullptr;
+    out.gauss2screen_gpu = (eval_3D_ && gauss2screen_buf_) ? gauss2screen_buf_->handle() : nullptr;
+    out.cov3D_inv_gpu = (eval_3D_ && cov3d_inv_buf_) ? cov3d_inv_buf_->handle() : nullptr;
+    out.mean_offset_gpu = (eval_3D_ && mean_offset_buf_) ? mean_offset_buf_->handle() : nullptr;
+
+    means2d_buf_->download(out.means2D, static_cast<std::size_t>(N) * 2 * sizeof(float));
+    depths_buf_->download(out.depths, static_cast<std::size_t>(N) * sizeof(float));
+    rgb_buf_->download(out.rgb, static_cast<std::size_t>(N) * 3 * sizeof(float));
+    radii_buf_->download(out.radii, static_cast<std::size_t>(N) * sizeof(int32_t));
+    tiles_touched_buf_->download(out.tiles_touched, static_cast<std::size_t>(N) * sizeof(int32_t));
+    out.num_tile_pairs = 0;
+    for (int i = 0; i < N; ++i) {
+        out.num_tile_pairs += out.tiles_touched[i];
+    }
+    radius_f_buf_->download(out.radius_f, static_cast<std::size_t>(N) * 2 * sizeof(float));
+
+    if (eval_3D_) {
+        gauss2screen_buf_->download(out.gauss2screen, static_cast<std::size_t>(N) * 16 * sizeof(float));
+        cov3d_inv_buf_->download(out.cov3D_inv, static_cast<std::size_t>(N) * 6 * sizeof(float));
+        mean_offset_buf_->download(out.mean_offset, static_cast<std::size_t>(N) * 3 * sizeof(float));
+    }
+
+    std::vector<float> packed(static_cast<std::size_t>(N) * 4);
+    conic_opacity_packed_buf_->download(packed.data(), static_cast<std::size_t>(N) * 4 * sizeof(float));
+    for (int i = 0; i < N; ++i) {
+        out.conics[i * 3 + 0] = packed[i * 4 + 0];
+        out.conics[i * 3 + 1] = packed[i * 4 + 1];
+        out.conics[i * 3 + 2] = packed[i * 4 + 2];
+        out.opacities_2d[i] = packed[i * 4 + 3];
+    }
+
     if (cache) {
         download_cache(N, *cache, alloc);
     }
@@ -292,6 +477,9 @@ void PreprocessorVulkan::download_cache(int N, ForwardCache& cache,
     cache.p_hom_w   = alloc.allocate_array<float>(static_cast<std::size_t>(N));
     cache.cov2D     = alloc.allocate_array<float>(static_cast<std::size_t>(N) * 3);
     cache.cov2D_det = alloc.allocate_array<float>(static_cast<std::size_t>(N));
+    cache.gauss2screen_gpu = (eval_3D_ && gauss2screen_buf_)
+        ? gauss2screen_buf_->handle()
+        : nullptr;
     cov3d_buf_    ->download(cache.cov3D,     static_cast<std::size_t>(N) * 6 * sizeof(float));
     p_view_buf_   ->download(cache.p_view,    static_cast<std::size_t>(N) * 3 * sizeof(float));
     p_hom_w_buf_  ->download(cache.p_hom_w,   static_cast<std::size_t>(N) * sizeof(float));

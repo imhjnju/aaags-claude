@@ -264,6 +264,7 @@ void VulkanComputePipeline::dispatch_sync(VkDescriptorSet desc_set,
         vkCmdPushConstants(cmd, layout_,
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push_constants);
     }
+    insert_compute_barrier(cmd);
     vkCmdDispatch(cmd, gx, gy, gz);
 
     VK_CHECK(vkEndCommandBuffer(cmd));

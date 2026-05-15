@@ -59,6 +59,23 @@ static bool has_fuchsia_sort_features(const VulkanDeviceCapabilities& caps)
            caps.has_vulkan_memory_model && caps.has_vulkan_memory_model_device_scope;
 }
 
+static bool fuchsia_zero_copy_enabled()
+{
+    const char* env = std::getenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+}
+
+constexpr uint32_t kFuchsiaMaxSortableKeyvals = 1u << 30;
+
+static uint32_t fuchsia_capacity_for(uint32_t count)
+{
+    uint32_t capacity = 1u;
+    while (capacity < count && capacity < (kFuchsiaMaxSortableKeyvals >> 1u)) {
+        capacity <<= 1u;
+    }
+    return capacity < count ? count : capacity;
+}
+
 static void populate_legacy_from_keyvals(BinningOutput& bin, FrameAllocator& alloc)
 {
     const int R = bin.total_pairs;
@@ -279,12 +296,17 @@ void SorterVulkan::sort(BinningOutput& bin, FrameAllocator& alloc) {
 }
 
 bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& alloc) {
+    if (bin.total_pairs <= 0) return false;
+    if (static_cast<uint32_t>(bin.total_pairs) >= kFuchsiaMaxSortableKeyvals) return false;
+
     const uint32_t R = static_cast<uint32_t>(bin.total_pairs);
     const uint32_t num_tiles = static_cast<uint32_t>(bin.num_tiles);
-    if (R == 0u) return false;
     if (num_tiles >= keyval_pack::MAX_TILES) return false;
 
-    if (bin.keyvals_unsorted == nullptr) {
+    const VkBuffer input_keyvals_gpu = bin.keyvals_unsorted_gpu
+        ? static_cast<VkBuffer>(bin.keyvals_unsorted_gpu)
+        : VK_NULL_HANDLE;
+    if (input_keyvals_gpu == VK_NULL_HANDLE && bin.keyvals_unsorted == nullptr) {
         if (bin.keys_unsorted == nullptr || bin.values_unsorted == nullptr) return false;
         bin.keyvals_unsorted = alloc.allocate_array<uint64_t>(R);
         for (uint32_t i = 0; i < R; ++i) {
@@ -292,16 +314,14 @@ bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& allo
         }
     }
 
-    constexpr uint32_t kMaxKeyvals = 1u << 22;
-    if (R > kMaxKeyvals) return false;
-
-    if (!fuchsia_) {
-        fuchsia_max_keyvals_ = kMaxKeyvals;
-        fuchsia_ = std::make_unique<RadixSortFuchsia>(ctx_, fuchsia_max_keyvals_);
+    const uint32_t required_capacity = fuchsia_capacity_for(R);
+    if (!fuchsia_ || f_keyvals_count_capacity_ < required_capacity) {
+        fuchsia_ = std::make_unique<RadixSortFuchsia>(ctx_, required_capacity);
+        f_keyvals_count_capacity_ = required_capacity;
     }
 
     const auto mr = fuchsia_->memory_requirements(R);
-    const auto mr_max = fuchsia_->memory_requirements(fuchsia_max_keyvals_);
+    const auto mr_capacity = fuchsia_->memory_requirements(f_keyvals_count_capacity_);
     const VkBufferUsageFlags keyval_usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -312,29 +332,57 @@ bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& allo
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-    if (!f_keyvals_even_ ||
-        f_keyvals_capacity_ < static_cast<uint32_t>(mr_max.keyvals_size)) {
+    if (!f_keyvals_even_ || f_keyvals_byte_capacity_ < mr_capacity.keyvals_size) {
         f_keyvals_even_ = std::make_unique<VulkanAlignedBuffer>(
-            ctx_, mr_max.keyvals_size, mr_max.keyvals_alignment, keyval_usage);
+            ctx_, mr_capacity.keyvals_size, mr_capacity.keyvals_alignment, keyval_usage);
         f_keyvals_scratch_ = std::make_unique<VulkanAlignedBuffer>(
-            ctx_, mr_max.keyvals_size, mr_max.keyvals_alignment, keyval_usage);
-        f_keyvals_capacity_ = static_cast<uint32_t>(mr_max.keyvals_size);
+            ctx_, mr_capacity.keyvals_size, mr_capacity.keyvals_alignment, keyval_usage);
+        f_keyvals_byte_capacity_ = mr_capacity.keyvals_size;
     }
-    if (!f_internal_scratch_ ||
-        f_internal_capacity_ < static_cast<uint32_t>(mr_max.internal_size)) {
+    if (!f_internal_scratch_ || f_internal_byte_capacity_ < mr_capacity.internal_size) {
         f_internal_scratch_ = std::make_unique<VulkanAlignedBuffer>(
-            ctx_, mr_max.internal_size, mr_max.internal_alignment, internal_usage);
-        f_internal_capacity_ = static_cast<uint32_t>(mr_max.internal_size);
+            ctx_, mr_capacity.internal_size, mr_capacity.internal_alignment, internal_usage);
+        f_internal_byte_capacity_ = mr_capacity.internal_size;
     }
 
+    const bool zero_copy = fuchsia_zero_copy_enabled();
     const VkDeviceSize keyval_bytes = static_cast<VkDeviceSize>(R) * sizeof(uint64_t);
-    VulkanBuffer src_staging(ctx_, keyval_bytes,
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    VulkanBuffer sorted_staging(ctx_, keyval_bytes,
-                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    src_staging.upload(bin.keyvals_unsorted, static_cast<std::size_t>(keyval_bytes));
+    std::unique_ptr<VulkanBuffer> src_staging;
+    VkBuffer src_keyvals = input_keyvals_gpu;
+    if (src_keyvals == VK_NULL_HANDLE) {
+        src_staging = std::make_unique<VulkanBuffer>(
+            ctx_, keyval_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        src_staging->upload(bin.keyvals_unsorted, static_cast<std::size_t>(keyval_bytes));
+        src_keyvals = src_staging->handle();
+    }
+    std::unique_ptr<VulkanBuffer> sorted_staging;
+    if (!zero_copy) {
+        sorted_staging = std::make_unique<VulkanBuffer>(
+            ctx_, keyval_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
+
+    const VkDeviceSize values_bytes = static_cast<VkDeviceSize>(R) * sizeof(uint32_t);
+    const VkDeviceSize ranges_bytes = static_cast<VkDeviceSize>(num_tiles) * 2u * sizeof(uint32_t);
+    if (zero_copy) {
+        if (!f_values_sorted_ || f_values_sorted_capacity_ < R) {
+            f_values_sorted_ = std::make_unique<VulkanBuffer>(
+                ctx_, values_bytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            f_values_sorted_capacity_ = R;
+        }
+        if (!f_tile_ranges_ || f_tile_ranges_capacity_ < num_tiles) {
+            f_tile_ranges_ = std::make_unique<VulkanBuffer>(
+                ctx_, ranges_bytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            f_tile_ranges_capacity_ = num_tiles;
+        }
+        f_tile_ranges_->zero_fill(static_cast<std::size_t>(ranges_bytes));
+        if (!f_extract_pass_) {
+            f_extract_pass_ = std::make_unique<PackedKeyvalExtractPass>(ctx_);
+        }
+    }
 
     VkBuffer even = f_keyvals_even_->handle();
     VkBuffer scratch = f_keyvals_scratch_->handle();
@@ -345,9 +393,24 @@ bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& allo
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
+    if (input_keyvals_gpu != VK_NULL_HANDLE) {
+        VkBufferMemoryBarrier input_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        input_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        input_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        input_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        input_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        input_barrier.buffer = input_keyvals_gpu;
+        input_barrier.offset = 0;
+        input_barrier.size = keyval_bytes;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 1, &input_barrier, 0, nullptr);
+    }
+
     VkBufferCopy to_even{};
     to_even.size = keyval_bytes;
-    vkCmdCopyBuffer(cmd, src_staging.handle(), even, 1, &to_even);
+    vkCmdCopyBuffer(cmd, src_keyvals, even, 1, &to_even);
 
     VkBufferMemoryBarrier sort_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     sort_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -365,22 +428,47 @@ bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& allo
     fuchsia_->record(cmd, even, scratch, internal, R, 64u);
     VkBuffer sorted = fuchsia_->sorted_buffer_after_sort(even, scratch, R, 64u);
 
-    VkBufferMemoryBarrier read_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    read_barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    read_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    read_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    read_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    read_barrier.buffer = sorted;
-    read_barrier.offset = 0;
-    read_barrier.size = mr.keyvals_size;
+    VkBufferMemoryBarrier post_sort_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    post_sort_barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    post_sort_barrier.dstAccessMask = zero_copy
+        ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+        : VK_ACCESS_TRANSFER_READ_BIT;
+    post_sort_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    post_sort_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    post_sort_barrier.buffer = sorted;
+    post_sort_barrier.offset = 0;
+    post_sort_barrier.size = mr.keyvals_size;
     vkCmdPipelineBarrier(cmd,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 1, &read_barrier, 0, nullptr);
+                         zero_copy ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                   : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 1, &post_sort_barrier, 0, nullptr);
 
-    VkBufferCopy to_host{};
-    to_host.size = keyval_bytes;
-    vkCmdCopyBuffer(cmd, sorted, sorted_staging.handle(), 1, &to_host);
+    if (zero_copy) {
+        f_extract_pass_->bind_buffers(sorted, f_values_sorted_->handle(), f_tile_ranges_->handle());
+        f_extract_pass_->dispatch_record(cmd, R, num_tiles);
+
+        VkBufferMemoryBarrier extract_barriers[2]{};
+        for (auto& barrier : extract_barriers) {
+            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.offset = 0;
+            barrier.size = VK_WHOLE_SIZE;
+        }
+        extract_barriers[0].buffer = f_values_sorted_->handle();
+        extract_barriers[1].buffer = f_tile_ranges_->handle();
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 2, extract_barriers, 0, nullptr);
+    } else {
+        VkBufferCopy to_host{};
+        to_host.size = keyval_bytes;
+        vkCmdCopyBuffer(cmd, sorted, sorted_staging->handle(), 1, &to_host);
+    }
 
     VK_CHECK(vkEndCommandBuffer(cmd));
     ctx_.submitAndWait(cmd);
@@ -388,11 +476,20 @@ bool SorterVulkan::sort_via_fuchsia_gpu(BinningOutput& bin, FrameAllocator& allo
 
     f_last_sorted_ = sorted;
     bin.keyvals_sorted_gpu = sorted;
+    if (zero_copy) {
+        bin.values_sorted_gpu = f_values_sorted_->handle();
+        bin.tile_ranges_gpu = f_tile_ranges_->handle();
+        bin.keyvals_sorted = nullptr;
+        bin.keys_sorted = nullptr;
+        bin.values_sorted = nullptr;
+        bin.tile_ranges = nullptr;
+        return true;
+    }
+
     bin.keyvals_sorted = alloc.allocate_array<uint64_t>(R);
-    sorted_staging.download(bin.keyvals_sorted, static_cast<std::size_t>(keyval_bytes));
+    sorted_staging->download(bin.keyvals_sorted, static_cast<std::size_t>(keyval_bytes));
     populate_legacy_from_keyvals(bin, alloc);
 
-    const VkDeviceSize ranges_bytes = static_cast<VkDeviceSize>(num_tiles) * 2u * sizeof(uint32_t);
     if (!f_tile_ranges_ || f_tile_ranges_capacity_ < num_tiles) {
         f_tile_ranges_ = std::make_unique<VulkanBuffer>(ctx_, ranges_bytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);

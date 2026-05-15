@@ -64,6 +64,7 @@ struct RenderConfig {
     bool antialiasing = false;
     bool eval_3D = false;        // AAA-Gaussians: full 3D Gaussian evaluation
     bool eval_3D_parity_mode = false;  // Match CUDA eval_3D sort_mode=GLOBAL/no tile culling
+    bool compact_eval3D_tiles = false;
     bool training = false;       // Training mode: skip upper color clamp in SH eval
     int sh_degree = 3;
     int tile_w = 16;
@@ -72,6 +73,7 @@ struct RenderConfig {
 
 // Preprocessor output (per-Gaussian arrays, size N)
 struct PreprocessOutput {
+    int num_gaussians = 0;
     float* means2D;          // [N * 2]
     float* depths;           // [N]
     float* conics;           // [N * 3]
@@ -79,12 +81,23 @@ struct PreprocessOutput {
     float* rgb;              // [N * 3]
     int* radii;              // [N]
     int* tiles_touched;      // [N]
+    int num_tile_pairs = -1;  // sum(tiles_touched), valid sideband when non-negative
     float* radius_f = nullptr;  // [N*2] (extent_x, extent_y) per Gaussian (nullptr for CPU paths)
     float* gauss2screen;     // [N * 16] AAA-Gaussians: 4x4 matrix per Gaussian (nullptr if not eval_3D)
     float* cov3D_inv;       // [N * 6] inverse 3D covariance upper triangle (eval_3D only, nullptr otherwise)
     float* mean_offset;     // [N * 3] world-space (pos - cam_pos) per Gaussian (eval_3D only)
     bool eval_3D = false;    // Whether eval_3D mode was used
     void* device_data = nullptr;  // GPU: opaque handle to device buffers
+    void* means2D_gpu = nullptr;              // VkBuffer, optional [N*2], valid until producer's next process/destruction
+    void* depths_gpu = nullptr;               // VkBuffer, optional [N], valid until producer's next process/destruction
+    void* conic_opacity_packed_gpu = nullptr; // VkBuffer, optional [N*4], valid until producer's next process/destruction
+    void* rgb_gpu = nullptr;                  // VkBuffer, optional [N*3], valid until producer's next process/destruction
+    void* radii_gpu = nullptr;                // VkBuffer, optional [N], valid until producer's next process/destruction
+    void* tiles_touched_gpu = nullptr;        // VkBuffer, optional [N], valid until producer's next process/destruction
+    void* radius_f_gpu = nullptr;             // VkBuffer, optional [N*2], valid until producer's next process/destruction
+    void* gauss2screen_gpu = nullptr;         // VkBuffer, optional [N*16], valid until producer's next process/destruction
+    void* cov3D_inv_gpu = nullptr;            // VkBuffer, optional [N*6], valid until producer's next process/destruction
+    void* mean_offset_gpu = nullptr;          // VkBuffer, optional [N*3], valid until producer's next process/destruction
 };
 
 // Tile binner output
@@ -101,6 +114,7 @@ struct BinningOutput {
     void* device_data = nullptr;  // GPU: opaque handle to device buffers
     void* keyvals_unsorted_gpu = nullptr;  // VkBuffer, optional GPU-resident packed keyvals
     void* keyvals_sorted_gpu = nullptr;    // VkBuffer, optional GPU-resident packed keyvals
+    void* values_sorted_gpu = nullptr;     // VkBuffer, optional GPU-resident sorted gaussian ids
     void* tile_ranges_gpu = nullptr;       // VkBuffer, optional GPU-resident tile ranges
 };
 
@@ -138,6 +152,15 @@ struct ForwardCache {
     uint32_t* replay_order_offsets = nullptr;  // [H*W+1]
     uint32_t* replay_order_gids = nullptr;     // [replay_order_count]
     size_t replay_order_count = 0;
+    void* replay_order_offsets_gpu = nullptr;  // VkBuffer, optional [H*W+1]
+    void* replay_order_gids_gpu = nullptr;     // VkBuffer, optional [replay_order_count]
+    bool gpu_resident_outputs = false;
+    bool retain_gpu_outputs = false;
+    void* rendered_image_gpu = nullptr;        // VkBuffer, optional [3*H*W]
+    void* T_final_gpu = nullptr;               // VkBuffer, optional [H*W]
+    void* n_contrib_gpu = nullptr;             // VkBuffer, optional [H*W]
+    void* dL_dpixels_gpu = nullptr;            // VkBuffer, optional [3*H*W]
+    void* gauss2screen_gpu = nullptr;          // VkBuffer, optional [N*16], producer-owned
     float* cov2D;         // [N*3] filtered 2D covariance
     float* cov2D_det;     // [N] determinant of filtered cov2D
     float* cov3D;         // [N*6] 3D covariance upper triangle

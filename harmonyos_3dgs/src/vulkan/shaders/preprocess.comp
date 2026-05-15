@@ -39,6 +39,8 @@ layout(push_constant) uniform PC {
     uint  num_tiles_x;
     uint  num_tiles_y;
     float scale_modifier;
+    uint  compact_eval3D_tiles;
+    uint  _pad;
 } pc;
 
 // ---- SSBOs (bindings 0..11) -------------------------------------------------
@@ -1067,6 +1069,25 @@ void main() {
         ivec2 rmn_3d = rectMin(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
         ivec2 rmx_3d = rectMax(center_3d, extent_x_3d, extent_y_3d, grid_x_3d, grid_y_3d, TILE_W, TILE_H);
         int n_tiles_3d = (rmx_3d.x - rmn_3d.x) * (rmx_3d.y - rmn_3d.y);
+        if (pc.compact_eval3D_tiles != 0u) {
+            n_tiles_3d = 0;
+            for (int ty = rmn_3d.y; ty < rmx_3d.y; ++ty) {
+                for (int tx = rmn_3d.x; tx < rmx_3d.x; ++tx) {
+                    float screen_min_x = float(tx) * float(TILE_W);
+                    float screen_min_y = float(ty) * float(TILE_H);
+                    float screen_max_x = float(tx + 1) * float(TILE_W) - 1.0;
+                    float screen_max_y = float(ty + 1) * float(TILE_H) - 1.0;
+                    float tile_depth;
+                    float tile_contrib = maxContribGaussianFrustum3D(
+                        screen_min_x, screen_min_y,
+                        screen_max_x, screen_max_y,
+                        gauss2screen, tile_depth);
+                    if (tile_contrib <= opacity_power_threshold) {
+                        n_tiles_3d++;
+                    }
+                }
+            }
+        }
         if (n_tiles_3d == 0) { means2D[i*2u]=0.0; means2D[i*2u+1u]=0.0; return; }  // zero tiles touched (cite: forward.cu:266-269)
         int my_radius_3d = int(ceil(max(extent_x_3d, extent_y_3d)));
         my_radius_3d = max(my_radius_3d, 1);

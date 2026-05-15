@@ -173,17 +173,32 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         set(_vk_shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
         set(_vk_shader_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/shaders)
 
+        find_program(SPIRV_OPT spirv-opt)
         function(gs3d_compile_glsl SHADER_NAME OUT_SPV_VAR)
             set(_src ${_vk_shader_src_dir}/${SHADER_NAME}.comp)
             set(_spv ${_vk_shader_dir}/${SHADER_NAME}.spv)
-            add_custom_command(
-                OUTPUT ${_spv}
-                COMMAND ${CMAKE_COMMAND} -E make_directory ${_vk_shader_dir}
-                COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1
-                        ${_src} -o ${_spv}
-                DEPENDS ${_src}
-                COMMENT "Compiling ${SHADER_NAME}.comp -> SPIR-V (vulkan1.1)"
-                VERBATIM)
+            if(SPIRV_OPT)
+                set(_raw_spv ${_vk_shader_dir}/${SHADER_NAME}.raw.spv)
+                add_custom_command(
+                    OUTPUT ${_spv}
+                    BYPRODUCTS ${_raw_spv}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory ${_vk_shader_dir}
+                    COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+                            ${_src} -o ${_raw_spv}
+                    COMMAND ${SPIRV_OPT} -O ${_raw_spv} -o ${_spv}
+                    DEPENDS ${_src}
+                    COMMENT "Compiling ${SHADER_NAME}.comp -> optimized SPIR-V (vulkan1.1)"
+                    VERBATIM)
+            else()
+                add_custom_command(
+                    OUTPUT ${_spv}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory ${_vk_shader_dir}
+                    COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+                            ${_src} -o ${_spv}
+                    DEPENDS ${_src}
+                    COMMENT "Compiling ${SHADER_NAME}.comp -> SPIR-V (vulkan1.1)"
+                    VERBATIM)
+            endif()
             set(${OUT_SPV_VAR} ${_spv} PARENT_SCOPE)
         endfunction()
 
@@ -220,6 +235,18 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(radix_sort_scatter _hdr_radix_scatter)
         gs3d_compile_glsl(tile_range _spv_tile_range)
         gs3d_embed_spirv(tile_range _hdr_tile_range)
+        gs3d_compile_glsl(packed_keyval_extract _spv_packed_keyval_extract)
+        gs3d_embed_spirv(packed_keyval_extract _hdr_packed_keyval_extract)
+        gs3d_compile_glsl(l1_loss _spv_l1_loss)
+        gs3d_embed_spirv(l1_loss _hdr_l1_loss)
+        gs3d_compile_glsl(dssim_loss_terms _spv_dssim_loss_terms)
+        gs3d_embed_spirv(dssim_loss_terms _hdr_dssim_loss_terms)
+        gs3d_compile_glsl(dssim_loss_grad _spv_dssim_loss_grad)
+        gs3d_embed_spirv(dssim_loss_grad _hdr_dssim_loss_grad)
+        gs3d_compile_glsl(sh_grad_split _spv_sh_grad_split)
+        gs3d_embed_spirv(sh_grad_split _hdr_sh_grad_split)
+        gs3d_compile_glsl(raw_activation _spv_raw_activation)
+        gs3d_embed_spirv(raw_activation _hdr_raw_activation)
         gs3d_compile_glsl(rasterize _spv_rasterize)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
         gs3d_compile_glsl(rasterize_hierarchical _spv_rasterize_hierarchical)
@@ -230,6 +257,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(rasterize_backward _hdr_rasterize_backward)
         gs3d_compile_glsl(rasterize_backward_eval3d _spv_rasterize_backward_eval3d)
         gs3d_embed_spirv(rasterize_backward_eval3d _hdr_rasterize_backward_eval3d)
+        gs3d_compile_glsl(rasterize_backward_eval3d_replay _spv_rasterize_backward_eval3d_replay)
+        gs3d_embed_spirv(rasterize_backward_eval3d_replay _hdr_rasterize_backward_eval3d_replay)
         gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
         gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
         gs3d_compile_glsl(preprocess_backward_eval3d _spv_preprocess_backward_eval3d)
@@ -245,11 +274,18 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_radix_count} ${_hdr_radix_count}
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
                     ${_spv_tile_range} ${_hdr_tile_range}
+                    ${_spv_packed_keyval_extract} ${_hdr_packed_keyval_extract}
+                    ${_spv_l1_loss} ${_hdr_l1_loss}
+                    ${_spv_dssim_loss_terms} ${_hdr_dssim_loss_terms}
+                    ${_spv_dssim_loss_grad} ${_hdr_dssim_loss_grad}
+                    ${_spv_sh_grad_split} ${_hdr_sh_grad_split}
+                    ${_spv_raw_activation} ${_hdr_raw_activation}
                     ${_spv_rasterize} ${_hdr_rasterize}
                     ${_spv_rasterize_hierarchical} ${_hdr_rasterize_hierarchical}
                     ${_spv_rasterize_cascade_trace} ${_hdr_rasterize_cascade_trace}
                     ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
                     ${_spv_rasterize_backward_eval3d} ${_hdr_rasterize_backward_eval3d}
+                    ${_spv_rasterize_backward_eval3d_replay} ${_hdr_rasterize_backward_eval3d_replay}
                     ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
                     ${_spv_preprocess_backward_eval3d} ${_hdr_preprocess_backward_eval3d}
                     ${_spv_adam_step} ${_hdr_adam_step})
@@ -268,6 +304,11 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/tile_binner_vulkan.cpp
             src/vulkan/radix_sort_pass.cpp
             src/vulkan/tile_range_pass.cpp
+            src/vulkan/packed_keyval_extract_pass.cpp
+            src/vulkan/l1_loss_pass.cpp
+            src/vulkan/dssim_loss_pass.cpp
+            src/vulkan/sh_grad_split_pass.cpp
+            src/vulkan/raw_activation_pass.cpp
             src/vulkan/sorter_vulkan.cpp
             src/vulkan/rasterize_pass.cpp
             src/vulkan/rasterizer_vulkan.cpp
@@ -319,6 +360,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_tile_binner_vulkan.cpp
                 tests/test_radix_sort_pass_vk.cpp
                 tests/test_tile_range_pass_vk.cpp
+                tests/test_l1_loss_pass_vk.cpp
+                tests/test_dssim_loss_pass_vk.cpp
                 tests/test_sorter_vulkan.cpp
                 tests/test_rasterize_pass_vk.cpp
                 tests/test_forward_pipeline_vk.cpp

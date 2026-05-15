@@ -74,7 +74,7 @@ public:
     /// / `internal_scratch` from any prior write (e.g. TRANSFER_WRITE on a
     /// staging upload) and after the sort before any subsequent read.
     ///
-    /// `count` must be <= max_keyvals from the constructor and <= 2^30.
+    /// `count` must be <= max_keyvals from the constructor and < 2^30.
     /// `key_bits` is the number of low bits to sort on (1..64 for u64).
     /// `keyvals_in` and `keyvals_scratch` must be sized at
     /// `memory_requirements(count).keyvals_size` and aligned to

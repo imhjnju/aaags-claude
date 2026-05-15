@@ -2,9 +2,9 @@
 
 Run: `ctest --test-dir harmonyos_3dgs/build`
 Build: `cd harmonyos_3dgs && cmake -B build -DBUILD_TESTS=ON && cmake --build build`
-Current CTest total: **327 tests** (2026-05-06 training/profiling sync, 73 .cpp test files)
+Current CTest total: **351 tests** (2026-05-15 Vulkan DSSIM loss pass and trainer GPU DSSIM fast-path coverage, 75 .cpp test files)
 
-## Test Inventory (73 files)
+## Test Inventory (75 files)
 
 ### CPU / Unit Tests
 | File | Subsystem | What It Tests |
@@ -57,6 +57,8 @@ Current CTest total: **327 tests** (2026-05-06 training/profiling sync, 73 .cpp 
 | `test_scatter_pass_vk.cpp` | Vulkan Pass | Scatter pass |
 | `test_radix_sort_pass_vk.cpp` | Vulkan Pass | Radix sort pass |
 | `test_tile_range_pass_vk.cpp` | Vulkan Pass | Tile range construction |
+| `test_l1_loss_pass_vk.cpp` | Vulkan Pass | GPU L1 loss and dL/dpixel parity for lambda_dssim=0 |
+| `test_dssim_loss_pass_vk.cpp` | Vulkan Pass | GPU DSSIM loss and dL/dpixel parity for lambda_dssim>0 |
 | `test_fuchsia_link.cpp` | Vulkan Pass | Fuchsia radix sort vendored link gate |
 | `test_fuchsia_radix_wrapper.cpp` | Vulkan Pass | Fuchsia radix sort wrapper target/memory/record smoke |
 | `test_fuchsia_radix_e2e_vk.cpp` | Vulkan Pass | Fuchsia sort env routing and GPU carrier/rasterizer contract |

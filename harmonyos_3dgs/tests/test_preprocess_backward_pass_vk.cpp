@@ -1,6 +1,6 @@
 // test_preprocess_backward_pass_vk.cpp — SP-3 T23: PreprocessBackwardPass smoke test.
 //
-// N=4, sh_degree=0 (1 coefficient per channel, 3 total).
+// N=4, sh_degree=0 with a larger SH buffer to cover inactive coefficient overwrite.
 // Constructs plausible input: positions, radii=[1,1,0,1], cov3D (diagonal),
 // d_conics, d_rgb, d_means2D (nonzero), simple view matrix.
 // Runs pass, downloads d_sh, d_scales, d_rotations, d_means3D.
@@ -27,7 +27,7 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     }
 
     const uint32_t N       = 4;
-    const uint32_t K       = 1u;  // sh_degree=0 → 1 coeff per Gaussian
+    const uint32_t K       = 16u;  // allocated coeffs can exceed active sh_degree during warmup
     const uint32_t sh_deg  = 0u;
 
     // ---- positions (N*3) ---------------------------------------------------
@@ -101,7 +101,7 @@ TEST(PreprocessBackwardPass, TinyFixture) {
 
     // ---- Output zero buffers -----------------------------------------------
     std::vector<float> zeros_m3d(N * 3, 0.0f);
-    std::vector<float> zeros_sh(N * K * 3, 0.0f);
+    std::vector<float> poison_sh(N * K * 3, 123.0f);
     std::vector<float> zeros_sc(N * 3, 0.0f);
     std::vector<float> zeros_rot(N * 4, 0.0f);
 
@@ -199,7 +199,7 @@ TEST(PreprocessBackwardPass, TinyFixture) {
     drgb_buf    ->upload(d_rgb_data.data(),         N*3*sizeof(float));
     dm2d_buf    ->upload(d_means2D_data.data(),     N*2*sizeof(float));
     dm3d_buf    ->upload(zeros_m3d.data(),          N*3*sizeof(float));
-    dsh_buf     ->upload(zeros_sh.data(),           N*K*3*sizeof(float));
+    dsh_buf     ->upload(poison_sh.data(),           N*K*3*sizeof(float));
     dsc_buf     ->upload(zeros_sc.data(),           N*3*sizeof(float));
     drot_buf    ->upload(zeros_rot.data(),          N*4*sizeof(float));
     opa_buf     ->upload(opacities_data.data(),     N*sizeof(float));
@@ -309,6 +309,14 @@ TEST(PreprocessBackwardPass, TinyFixture) {
         }
         EXPECT_TRUE(sh_nonzero)
             << "Active Gaussian " << idx << " d_sh is all-zero";
+        for (uint32_t coeff = 1u; coeff < K; ++coeff) {
+            for (uint32_t ch = 0u; ch < 3u; ++ch) {
+                const uint32_t off = idx * K * 3u + coeff * 3u + ch;
+                EXPECT_EQ(out_d_sh[off], 0.0f)
+                    << "Inactive SH coeff retained stale data for Gaussian " << idx
+                    << " coeff " << coeff << " channel " << ch;
+            }
+        }
 
         // d_means3D should be finite
         for (int c = 0; c < 3; c++) {

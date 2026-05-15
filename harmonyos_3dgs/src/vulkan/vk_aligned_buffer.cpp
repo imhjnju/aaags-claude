@@ -72,7 +72,6 @@ VulkanAlignedBuffer::VulkanAlignedBuffer(VulkanContext& ctx,
 
 VulkanAlignedBuffer::~VulkanAlignedBuffer() {
     if (buffer_ != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(ctx_.device());
         vkDestroyBuffer(ctx_.device(), buffer_, nullptr);
     }
     if (memory_ != VK_NULL_HANDLE)

@@ -1,0 +1,78 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer RawScales {
+    float raw_scales[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer RawRotations {
+    float raw_rotations[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer RawOpacities {
+    float raw_opacities[];
+};
+layout(std430, set = 0, binding = 3) readonly buffer RawShDc {
+    float raw_sh_dc[];
+};
+layout(std430, set = 0, binding = 4) readonly buffer RawShRest {
+    float raw_sh_rest[];
+};
+layout(std430, set = 0, binding = 5) writeonly buffer ActiveScales {
+    float active_scales[];
+};
+layout(std430, set = 0, binding = 6) writeonly buffer ActiveRotations {
+    float active_rotations[];
+};
+layout(std430, set = 0, binding = 7) writeonly buffer ActiveOpacities {
+    float active_opacities[];
+};
+layout(std430, set = 0, binding = 8) writeonly buffer ActiveSh {
+    float active_sh[];
+};
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint K;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.N) return;
+
+    uint scale_base = gid * 3u;
+    active_scales[scale_base + 0u] = exp(raw_scales[scale_base + 0u]);
+    active_scales[scale_base + 1u] = exp(raw_scales[scale_base + 1u]);
+    active_scales[scale_base + 2u] = exp(raw_scales[scale_base + 2u]);
+
+    uint rot_base = gid * 4u;
+    float r = raw_rotations[rot_base + 0u];
+    float x = raw_rotations[rot_base + 1u];
+    float y = raw_rotations[rot_base + 2u];
+    float z = raw_rotations[rot_base + 3u];
+    float len = sqrt(r * r + x * x + y * y + z * z);
+    len = max(len, 1e-12);
+    active_rotations[rot_base + 0u] = r / len;
+    active_rotations[rot_base + 1u] = x / len;
+    active_rotations[rot_base + 2u] = y / len;
+    active_rotations[rot_base + 3u] = z / len;
+
+    active_opacities[gid] = 1.0 / (1.0 + exp(-raw_opacities[gid]));
+
+    uint sh_base = gid * pc.K * 3u;
+    uint dc_base = gid * 3u;
+    active_sh[sh_base + 0u] = raw_sh_dc[dc_base + 0u];
+    active_sh[sh_base + 1u] = raw_sh_dc[dc_base + 1u];
+    active_sh[sh_base + 2u] = raw_sh_dc[dc_base + 2u];
+
+    if (pc.K <= 1u) return;
+    uint rest_base = gid * (pc.K - 1u) * 3u;
+    for (uint k = 1u; k < pc.K; ++k) {
+        uint dst = sh_base + k * 3u;
+        uint src = rest_base + (k - 1u) * 3u;
+        active_sh[dst + 0u] = raw_sh_rest[src + 0u];
+        active_sh[dst + 1u] = raw_sh_rest[src + 1u];
+        active_sh[dst + 2u] = raw_sh_rest[src + 2u];
+    }
+}

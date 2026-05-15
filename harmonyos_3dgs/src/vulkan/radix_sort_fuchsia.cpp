@@ -29,8 +29,24 @@ const radix_sort_vk_target* RadixSortFuchsia::pick_target(VulkanContext& ctx) {
     return radix_sort_vk_target_auto_detect(&props, /*keyval_dwords=*/2);
 }
 
+namespace {
+constexpr uint32_t kMaxFuchsiaKeyvals = 1u << 30;
+
+void validate_count(uint32_t count, uint32_t max_keyvals, const char* where) {
+    if (count > max_keyvals) {
+        throw std::runtime_error(std::string(where) + ": count exceeds max_keyvals");
+    }
+    if (count >= kMaxFuchsiaKeyvals) {
+        throw std::runtime_error(std::string(where) + ": count must be < 1<<30");
+    }
+}
+}
+
 RadixSortFuchsia::RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals)
     : ctx_(ctx), max_keyvals_(max_keyvals) {
+    if (max_keyvals_ == 0u || max_keyvals_ >= kMaxFuchsiaKeyvals) {
+        throw std::runtime_error("RadixSortFuchsia: max_keyvals must be in [1, 1<<30)");
+    }
 
     target_ = pick_target(ctx_);
     if (target_ == nullptr) {
@@ -54,7 +70,6 @@ RadixSortFuchsia::RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals)
             "(target was selected but pipeline creation failed — likely "
             "missing required device feature; check VulkanContext logs)");
     }
-    (void)max_keyvals_;
 }
 
 RadixSortFuchsia::~RadixSortFuchsia() {
@@ -66,6 +81,8 @@ RadixSortFuchsia::~RadixSortFuchsia() {
 
 RadixSortFuchsia::MemoryRequirements
 RadixSortFuchsia::memory_requirements(uint32_t count) const {
+    validate_count(count, max_keyvals_, "RadixSortFuchsia::memory_requirements");
+
     radix_sort_vk_memory_requirements_t mr{};
     radix_sort_vk_get_memory_requirements(rs_, count, &mr);
     MemoryRequirements out{};
@@ -91,6 +108,10 @@ void RadixSortFuchsia::record(VkCommandBuffer cmd,
         // also the output.
         last_sorted_ = keyvals_in;
         return;
+    }
+    validate_count(count, max_keyvals_, "RadixSortFuchsia::record");
+    if (key_bits > 64u) {
+        throw std::runtime_error("RadixSortFuchsia::record: key_bits must be <= 64");
     }
 
     radix_sort_vk_memory_requirements_t mr{};

@@ -3,8 +3,6 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(std430, set = 0, binding = 0) readonly buffer TileRanges { uint tile_ranges[]; };
-layout(std430, set = 0, binding = 1) readonly buffer ValuesSorted { uint values_sorted[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Gauss2Screen { float gauss2screen[]; };
 layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity { float conic_opacity[]; };
 layout(std430, set = 0, binding = 4) readonly buffer Colors { float colors[]; };
@@ -71,17 +69,11 @@ void main() {
 
     uint px = pixel_y * ubo.W + pixel_x;
     uint HW = ubo.W * ubo.H;
-    uint tile_id = gl_WorkGroupID.y * ubo.num_tiles_x + gl_WorkGroupID.x;
-    uint range_start = tile_ranges[tile_id * 2u + 0u];
-    uint range_end = tile_ranges[tile_id * 2u + 1u];
-    uint total = range_end - range_start;
 
     uint last_contributor = n_contrib[px];
     if (last_contributor == 0u) return;
-    bool use_replay_order = (ubo._pad != 0u);
-    uint replay_start = use_replay_order ? replay_order_offsets[px] : 0u;
-    total = use_replay_order ? last_contributor : total;
-    uint contributor = total;
+    uint replay_start = replay_order_offsets[px];
+    uint contributor = last_contributor;
 
     float T = T_final[px];
     float final_T = T;
@@ -95,12 +87,9 @@ void main() {
     float bg_dot_dpixel = has_bg ? dot(ubo.bg_color, dL_dpixel) : 0.0;
     vec2 pixf = vec2(float(pixel_x), float(pixel_y));
 
-    for (uint offset = 0u; offset < total; ++offset) {
+    for (uint offset = 0u; offset < last_contributor; ++offset) {
         contributor -= 1u;
-        if (!use_replay_order && contributor >= last_contributor) continue;
-        uint gid = use_replay_order
-            ? replay_order_gids[replay_start + contributor]
-            : values_sorted[range_start + contributor];
+        uint gid = replay_order_gids[replay_start + contributor];
         vec4 row0 = g2s_row(gid, 0u);
         vec4 row1 = g2s_row(gid, 1u);
         vec4 row2 = g2s_row(gid, 2u);

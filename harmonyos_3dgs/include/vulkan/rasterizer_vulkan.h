@@ -23,6 +23,7 @@
 #include "splatting_settings.h"
 #include "vulkan/vk_context.h"
 #include "vulkan/rasterize_pass.h"
+#include "vulkan/tile_binner_passes.h"
 
 #include <array>
 #include <cstdint>
@@ -92,13 +93,22 @@ public:
 
     // Post-record download helpers. Must be called AFTER the caller has
     // submitted + waited on the command buffer that contained record().
-    void download_image(float* dst, uint32_t W, uint32_t H);
+    void download_image(float* dst, uint32_t W, uint32_t H) const;
     void download_cache(float* T_final, int* n_contrib, uint32_t HW);
 
     // Output handles valid after prepare_record().
     VkBuffer out_image_buf()     const;
     VkBuffer transmittance_buf() const;
     VkBuffer n_contrib_buf()     const;
+
+#ifdef GS3D_TESTING
+    bool last_layer1_image_downloaded_for_test() const { return last_layer1_image_downloaded_; }
+    bool last_layer1_cache_downloaded_for_test() const { return last_layer1_cache_downloaded_; }
+    void set_layer1_download_probes_for_test(bool image_downloaded, bool cache_downloaded) {
+        last_layer1_image_downloaded_ = image_downloaded;
+        last_layer1_cache_downloaded_ = cache_downloaded;
+    }
+#endif
 
     // -- Phase 4 / Milestone A: traced rasterize --------------------------
     //
@@ -162,6 +172,17 @@ private:
     std::unique_ptr<VulkanBuffer> r_ubo_;           // RasterizeUBO (16 bytes std140)
     std::unique_ptr<VulkanBuffer> r_eval3d_ubo_;    // RasterEval3DUBO (96 bytes std140)
     std::unique_ptr<VulkanBuffer> r_dummy4_;        // 4-byte dummy for unbound eval_3D SSBOs
+    std::unique_ptr<VulkanBuffer> replay_offsets_gpu_buf_;
+    std::unique_ptr<VulkanBuffer> replay_gids_gpu_buf_;
+    std::unique_ptr<VulkanBuffer> replay_scan_wg_buf_;
+    std::unique_ptr<VulkanBuffer> replay_scan_wg2_buf_;
+    std::unique_ptr<PrefixScanPass> replay_scan_pass_;
+    size_t replay_offsets_gpu_capacity_ = 0;
+    size_t replay_gids_gpu_capacity_ = 0;
+    uint32_t replay_scan_wg_capacity_ = 0;
+    uint32_t replay_scan_wg2_capacity_ = 0;
+    bool last_layer1_image_downloaded_ = false;
+    bool last_layer1_cache_downloaded_ = false;
     uint32_t r_W_   = 0;
     uint32_t r_H_   = 0;
     uint32_t r_ntx_ = 0;

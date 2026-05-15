@@ -28,6 +28,7 @@
 //   binding 5 = keys_unsorted  (WO)   uint64_t[R]
 //   binding 6 = values_unsorted(WO)   uint[R]
 //   binding 7 = radius_f       (RO)   float[N*2]  — (extent_x, extent_y) per Gaussian from preprocess
+//   binding 13 = keyvals_unsorted(WO) uint64_t[R] — packed Fuchsia radix input
 // where R = sum(tiles_touched[0..N-1]).
 //
 // NUMERICAL CONTRACT (P0 scatter float-radius fix applied):
@@ -63,6 +64,7 @@ layout(std430, set = 0, binding = 8) readonly  buffer Cov3DInvIn   { float    co
 layout(std430, set = 0, binding = 9) readonly  buffer MeanOffsetIn { float    mean_offset[];     };  // [N*3] world-space (pos - cam_pos)
 layout(std430, set = 0, binding = 11) readonly buffer Gauss2ScreenIn { float  gauss2screen_arr[];};  // [N*16] gauss2screen row-major
 layout(std430, set = 0, binding = 12) readonly buffer ConicOpacityIn { float  conic_opacity_packed_arr[]; }; // [N*4] {a,b,c,opacity} for tile culling
+layout(std430, set = 0, binding = 13) writeonly buffer KeyvalsOut { uint64_t keyvals_unsorted[]; };
 
 layout(std140, set = 0, binding = 10) uniform ScatterUBO {
     mat4 inverse_vp;       // 64B: inverse viewproj (column-major)
@@ -77,6 +79,8 @@ layout(push_constant) uniform PC {
     uint tile_w;   // 16 per spec §4.4
     uint tile_h;   // 16
     uint eval_3D;  // 1 = use depthAlongRay per-tile, 0 = view-space z
+    uint compact_eval3D_tiles;
+    uint _pad;
 } pc;
 
 // Exact match of preprocess.comp rectMin/rectMax formula & clamp, with separate
@@ -103,6 +107,17 @@ ivec2 rectMax(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, in
 // maxContribGaussianFrustum3D algorithm used by CUDA AAA-Gaussians to compute
 // per-tile sort keys that find the closest approach depth of each Gaussian
 // within a tile's pixel frustum.
+
+const uint IDX_MASK = 0xFFFFFu;
+const uint DEPTH_MASK = 0x0FFFFFFFu;
+const uint DEPTH_SHIFT = 20u;
+const uint TILE_SHIFT = 48u;
+
+uint64_t pack_keyval(uint tile_id, uint depth_bits, uint gauss_idx) {
+    return (uint64_t(tile_id & 0xFFFFu) << TILE_SHIFT) |
+           (uint64_t((depth_bits >> 4u) & DEPTH_MASK) << DEPTH_SHIFT) |
+           uint64_t(gauss_idx & IDX_MASK);
+}
 
 // Port of math_utils.cpp:186-207.
 float maxContribRay(float plane_a[4], float plane_b[4], out float max_pos[4]) {
@@ -313,11 +328,10 @@ void main() {
                     screen_min_x, screen_min_y,
                     screen_max_x, screen_max_y,
                     g2s, max_pos_depth);
-                // tile_based_culling: if max_contrib_val > threshold, the Gaussian
-                // contributes < ALPHA_THRESHOLD anywhere in this tile — write INVALID.
-                // Matches CUDA: write_tile = (max_opac_factor <= opacity_factor_threshold).
                 if (max_contrib_val > opacity_factor_threshold) {
-                    // INVALID sentinel — radix sort pushes to end, tile_range ignores.
+                    if (pc.compact_eval3D_tiles != 0u) {
+                        continue;
+                    }
                     key = uint64_t(0xFFFFFFFFu) << 32 | uint64_t(0xFFFFFFFFu);
                 } else {
                     // +8.0 bias matches CUDA (AAA-Gaussians forward.cu).
@@ -330,6 +344,7 @@ void main() {
             }
             keys_unsorted[offset + slot]   = key;
             values_unsorted[offset + slot] = i;
+            keyvals_unsorted[offset + slot] = pack_keyval(uint(key >> 32), uint(key), i);
             slot++;
         }
     }

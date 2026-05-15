@@ -146,3 +146,25 @@ private:
     std::unique_ptr<VulkanComputePipeline> pipeline_;
     VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
 };
+
+class PackedKeyvalExtractPass {
+public:
+    explicit PackedKeyvalExtractPass(VulkanContext& ctx);
+    ~PackedKeyvalExtractPass() = default;
+
+    PackedKeyvalExtractPass(const PackedKeyvalExtractPass&)            = delete;
+    PackedKeyvalExtractPass& operator=(const PackedKeyvalExtractPass&) = delete;
+
+    void bind_buffers(VkBuffer keyvals_sorted,
+                      VkBuffer values_sorted,
+                      VkBuffer tile_ranges);
+    void dispatch_record(VkCommandBuffer cmd,
+                         uint32_t num_elements,
+                         uint32_t num_tiles);
+
+private:
+    VulkanContext& ctx_;
+    std::unique_ptr<VulkanShader>          shader_;
+    std::unique_ptr<VulkanComputePipeline> pipeline_;
+    VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
+};

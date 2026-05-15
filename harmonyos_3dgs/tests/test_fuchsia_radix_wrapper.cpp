@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -136,9 +137,9 @@ TEST(FuchsiaRadixWrapper, MemoryRequirementsSanity) {
     if (!ctx.init()) {
         GTEST_SKIP() << "skip: no Vulkan 1.2 device with Fuchsia features";
     }
-    RadixSortFuchsia rs(ctx, /*max_keyvals=*/1u << 20);
+    RadixSortFuchsia rs(ctx, /*max_keyvals=*/7500000u);
 
-    for (uint32_t count : {1024u, 100000u, 1u << 20}) {
+    for (uint32_t count : {1024u, 100000u, 1u << 20, (1u << 22) + 1u, 7500000u}) {
         auto mr = rs.memory_requirements(count);
         EXPECT_EQ(mr.keyval_size, 8u)
             << "expected 8-byte keyvals (keyval_dwords=2 in pick_target)";
@@ -159,6 +160,26 @@ TEST(FuchsiaRadixWrapper, MemoryRequirementsSanity) {
             << ": internal_alignment must be power of two ("
             << mr.internal_alignment << ")";
     }
+}
+
+TEST(FuchsiaRadixWrapper, ConstructorRejectsInvalidMaxKeyvals) {
+    VulkanContext ctx;
+    EXPECT_THROW(RadixSortFuchsia(ctx, 0u), std::runtime_error);
+    EXPECT_THROW(RadixSortFuchsia(ctx, 1u << 30), std::runtime_error);
+}
+
+TEST(FuchsiaRadixWrapper, RejectsCountsAboveConstructorMax) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "skip: no Vulkan 1.2 device with Fuchsia features";
+    }
+    RadixSortFuchsia rs(ctx, /*max_keyvals=*/1024u);
+
+    EXPECT_THROW(rs.memory_requirements(1025u), std::runtime_error);
+    EXPECT_THROW(rs.record(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                           VK_NULL_HANDLE, 1025u, 64u), std::runtime_error);
+    EXPECT_THROW(rs.record(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                           VK_NULL_HANDLE, 1u, 65u), std::runtime_error);
 }
 
 // =============================================================================

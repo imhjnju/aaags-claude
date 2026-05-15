@@ -1,8 +1,7 @@
 // SP-3 T23: PreprocessorBackwardVulkan — high-level backward preprocessor adapter.
 //
-// Uploads all CPU-side inputs to host-visible SSBOs, zero-fills gradient
-// output buffers (preprocess_backward.comp writes directly, not atomicAdd),
-// dispatches preprocess_backward.comp via PreprocessBackwardPass, then
+// Uploads all CPU-side inputs to host-visible SSBOs, dispatches
+// preprocess_backward.comp via PreprocessBackwardPass, then
 // downloads the resulting gradients into the caller-provided grads arrays.
 //
 // Buffer-size contract (matches the shader std430 layouts):
@@ -16,10 +15,10 @@
 //   rotations     : N * 4 * sizeof(float)
 //   d_rgb         : N * 3 * sizeof(float)
 //   d_means2D     : N * 2 * sizeof(float)
-//   d_means3D     : N * 3 * sizeof(float)    zeroed
-//   d_sh          : N * max_coeffs * 3 * sizeof(float)  zeroed
-//   d_scales      : N * 3 * sizeof(float)    zeroed
-//   d_rotations   : N * 4 * sizeof(float)    zeroed
+//   d_means3D     : N * 3 * sizeof(float)
+//   d_sh          : N * max_coeffs * 3 * sizeof(float)
+//   d_scales      : N * 3 * sizeof(float)
+//   d_rotations   : N * 4 * sizeof(float)
 //   preproc_bwd_ubo : sizeof(PreprocessBackwardUBO) = 192  UNIFORM_BUFFER
 
 #include "vulkan/preprocessor_backward_vulkan.h"
@@ -47,7 +46,7 @@ PreprocessorBackwardVulkan::~PreprocessorBackwardVulkan() = default;
 
 void PreprocessorBackwardVulkan::clear_grad_buffers(VkCommandBuffer cmd) {
     // Clear all gradient output buffers to prevent accumulation of stale data.
-    // Note: Currently unused - backward_record_into already clears via CPU upload.
+    // Currently unused; the preprocess-backward shaders overwrite core gradient outputs.
     // vkCmdFillBuffer is efficient: GPU fills the buffer with a constant value.
     // Must use a pipeline barrier after to ensure fills complete before shaders read.
 
@@ -212,17 +211,6 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
         opa_in_buf_->upload(g.opacities, static_cast<std::size_t>(bytes_N_float));
         raw_rot_buf_->upload(raw.raw_rotations, static_cast<std::size_t>(bytes_raw_rot));
 
-        const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
-        const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
-        dsh_buf_->upload(zeros_sh.data(), static_cast<std::size_t>(bytes_d_sh));
-        dsc_buf_->upload(zeros_sc.data(), static_cast<std::size_t>(bytes_d_sc));
-        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
-        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
-
         PreprocessBackwardUBO ubo{};
         std::memcpy(ubo.view_matrix, cam.view_matrix, 16 * sizeof(float));
         std::memcpy(ubo.proj_matrix, cam.viewproj_matrix, 16 * sizeof(float));
@@ -309,24 +297,6 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     c2ddet_in_buf_->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
     phomw_in_buf_ ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
 
-    // Zero-fill gradient output buffers.
-    {
-        const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
-
-        const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
-        dsh_buf_ ->upload(zeros_sh.data(),  static_cast<std::size_t>(bytes_d_sh));
-
-        const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dsc_buf_ ->upload(zeros_sc.data(),  static_cast<std::size_t>(bytes_d_sc));
-
-        const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
-        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
-
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
-    }
-
     // Upload UBO.
     PreprocessBackwardUBO ubo{};
     std::memcpy(ubo.view_matrix, cam.view_matrix,       16 * sizeof(float));
@@ -401,7 +371,8 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                        VkBuffer d_rgb_gpu,
                                                        VkBuffer d_means2D_gpu,
                                                        const RawGaussianParams& raw,
-                                                       VkBuffer d_gauss2screen_gpu) {
+                                                       VkBuffer d_gauss2screen_gpu,
+                                                       const PreprocessBackwardGpuInputs* gpu_inputs) {
     const int N = num_gaussians;
     const int K = g.max_coeffs;  // (sh_degree+1)^2
 
@@ -436,30 +407,60 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         if (d_gauss2screen_gpu == VK_NULL_HANDLE)
             throw std::runtime_error("PreprocessorBackwardVulkan::backward_record_into: missing eval_3D d_gauss2screen buffer");
 
-        pos_buf_->upload(g.positions, static_cast<std::size_t>(bytes_pos));
-        rad_buf_->upload(cache.pre->radii, static_cast<std::size_t>(bytes_radii));
-        sh_buf_->upload(g.sh_coeffs, static_cast<std::size_t>(bytes_sh));
-        sc_buf_->upload(g.scales, static_cast<std::size_t>(bytes_scales));
-        rot_buf_->upload(g.rotations, static_cast<std::size_t>(bytes_rot));
-        if (g.filter_3D) {
-            f3_buf_->upload(g.filter_3D, static_cast<std::size_t>(bytes_N_float));
-        } else {
-            const std::vector<float> zeros_f3(static_cast<std::size_t>(N), 0.0f);
-            f3_buf_->upload(zeros_f3.data(), static_cast<std::size_t>(bytes_N_float));
-        }
-        opa_in_buf_->upload(g.opacities, static_cast<std::size_t>(bytes_N_float));
-        raw_rot_buf_->upload(raw.raw_rotations, static_cast<std::size_t>(bytes_raw_rot));
+        const VkBuffer positions_handle = (gpu_inputs && gpu_inputs->positions != VK_NULL_HANDLE)
+            ? gpu_inputs->positions
+            : pos_buf_->handle();
+        const VkBuffer radii_handle = (gpu_inputs && gpu_inputs->radii != VK_NULL_HANDLE)
+            ? gpu_inputs->radii
+            : rad_buf_->handle();
+        const VkBuffer sh_handle = (gpu_inputs && gpu_inputs->sh_coeffs != VK_NULL_HANDLE)
+            ? gpu_inputs->sh_coeffs
+            : sh_buf_->handle();
+        const VkBuffer scales_handle = (gpu_inputs && gpu_inputs->scales != VK_NULL_HANDLE)
+            ? gpu_inputs->scales
+            : sc_buf_->handle();
+        const VkBuffer rotations_handle = (gpu_inputs && gpu_inputs->rotations != VK_NULL_HANDLE)
+            ? gpu_inputs->rotations
+            : rot_buf_->handle();
+        const VkBuffer opacities_handle = (gpu_inputs && gpu_inputs->opacities != VK_NULL_HANDLE)
+            ? gpu_inputs->opacities
+            : opa_in_buf_->handle();
+        const VkBuffer raw_rotations_handle = (gpu_inputs && gpu_inputs->raw_rotations != VK_NULL_HANDLE)
+            ? gpu_inputs->raw_rotations
+            : raw_rot_buf_->handle();
+        const VkBuffer filter_3D_handle = (gpu_inputs && gpu_inputs->filter_3D != VK_NULL_HANDLE)
+            ? gpu_inputs->filter_3D
+            : f3_buf_->handle();
 
-        const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
-        const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
-        dsh_buf_->upload(zeros_sh.data(), static_cast<std::size_t>(bytes_d_sh));
-        dsc_buf_->upload(zeros_sc.data(), static_cast<std::size_t>(bytes_d_sc));
-        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
-        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
+        if (positions_handle == pos_buf_->handle()) {
+            pos_buf_->upload(g.positions, static_cast<std::size_t>(bytes_pos));
+        }
+        if (radii_handle == rad_buf_->handle()) {
+            rad_buf_->upload(cache.pre->radii, static_cast<std::size_t>(bytes_radii));
+        }
+        if (sh_handle == sh_buf_->handle()) {
+            sh_buf_->upload(g.sh_coeffs, static_cast<std::size_t>(bytes_sh));
+        }
+        if (scales_handle == sc_buf_->handle()) {
+            sc_buf_->upload(g.scales, static_cast<std::size_t>(bytes_scales));
+        }
+        if (rotations_handle == rot_buf_->handle()) {
+            rot_buf_->upload(g.rotations, static_cast<std::size_t>(bytes_rot));
+        }
+        if (filter_3D_handle == f3_buf_->handle()) {
+            if (g.filter_3D) {
+                f3_buf_->upload(g.filter_3D, static_cast<std::size_t>(bytes_N_float));
+            } else {
+                const std::vector<float> zeros_f3(static_cast<std::size_t>(N), 0.0f);
+                f3_buf_->upload(zeros_f3.data(), static_cast<std::size_t>(bytes_N_float));
+            }
+        }
+        if (opacities_handle == opa_in_buf_->handle()) {
+            opa_in_buf_->upload(g.opacities, static_cast<std::size_t>(bytes_N_float));
+        }
+        if (raw_rotations_handle == raw_rot_buf_->handle()) {
+            raw_rot_buf_->upload(raw.raw_rotations, static_cast<std::size_t>(bytes_raw_rot));
+        }
 
         PreprocessBackwardUBO ubo{};
         std::memcpy(ubo.view_matrix, cam.view_matrix, 16 * sizeof(float));
@@ -482,11 +483,11 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         ubo_buf_->upload(&ubo, sizeof(ubo));
 
         PreprocessBackwardEval3DPass::Buffers pb{};
-        pb.positions = pos_buf_->handle();
-        pb.radii = rad_buf_->handle();
-        pb.sh_coeffs = sh_buf_->handle();
-        pb.scales = sc_buf_->handle();
-        pb.rotations = rot_buf_->handle();
+        pb.positions = positions_handle;
+        pb.radii = radii_handle;
+        pb.sh_coeffs = sh_handle;
+        pb.scales = scales_handle;
+        pb.rotations = rotations_handle;
         pb.d_rgb = d_rgb_gpu;
         pb.d_opacity = d_opacity_gpu;
         pb.d_gauss2screen = d_gauss2screen_gpu;
@@ -494,10 +495,10 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         pb.d_sh = dsh_buf_->handle();
         pb.d_scales = dsc_buf_->handle();
         pb.d_rotations = drot_buf_->handle();
-        pb.opacities = opa_in_buf_->handle();
+        pb.opacities = opacities_handle;
         pb.d_raw_opacities = d_raw_opa_buf_->handle();
-        pb.raw_rotations = raw_rot_buf_->handle();
-        pb.filter_3D = f3_buf_->handle();
+        pb.raw_rotations = raw_rotations_handle;
+        pb.filter_3D = filter_3D_handle;
         eval3d_pass_->bind_buffers(pb, ubo_buf_->handle());
         eval3d_pass_->record(cmd, static_cast<uint32_t>(N));
         return;
@@ -521,38 +522,56 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
             "PreprocessorBackwardVulkan::backward_record_into: cache.p_hom_w is null — "
             "call PreprocessorCPU::process() or PreprocessorVulkan::download_cache() first");
 
+    const VkBuffer positions_handle = (gpu_inputs && gpu_inputs->positions != VK_NULL_HANDLE)
+        ? gpu_inputs->positions
+        : pos_buf_->handle();
+    const VkBuffer radii_handle = (gpu_inputs && gpu_inputs->radii != VK_NULL_HANDLE)
+        ? gpu_inputs->radii
+        : rad_buf_->handle();
+    const VkBuffer sh_handle = (gpu_inputs && gpu_inputs->sh_coeffs != VK_NULL_HANDLE)
+        ? gpu_inputs->sh_coeffs
+        : sh_buf_->handle();
+    const VkBuffer scales_handle = (gpu_inputs && gpu_inputs->scales != VK_NULL_HANDLE)
+        ? gpu_inputs->scales
+        : sc_buf_->handle();
+    const VkBuffer rotations_handle = (gpu_inputs && gpu_inputs->rotations != VK_NULL_HANDLE)
+        ? gpu_inputs->rotations
+        : rot_buf_->handle();
+    const VkBuffer opacities_handle = (gpu_inputs && gpu_inputs->opacities != VK_NULL_HANDLE)
+        ? gpu_inputs->opacities
+        : opa_in_buf_->handle();
+    const VkBuffer raw_rotations_handle = (gpu_inputs && gpu_inputs->raw_rotations != VK_NULL_HANDLE)
+        ? gpu_inputs->raw_rotations
+        : raw_rot_buf_->handle();
+
     // --- Upload inputs (all except the rgrad GPU inputs) --------------------
-    pos_buf_ ->upload(g.positions,                   static_cast<std::size_t>(bytes_pos));
-    rad_buf_ ->upload(cache.pre->radii,               static_cast<std::size_t>(bytes_radii));
+    if (positions_handle == pos_buf_->handle()) {
+        pos_buf_->upload(g.positions, static_cast<std::size_t>(bytes_pos));
+    }
+    if (radii_handle == rad_buf_->handle()) {
+        rad_buf_->upload(cache.pre->radii, static_cast<std::size_t>(bytes_radii));
+    }
     cv3_buf_ ->upload(cache.cov3D,                    static_cast<std::size_t>(bytes_cov3D));
-    sh_buf_  ->upload(g.sh_coeffs,                    static_cast<std::size_t>(bytes_sh));
-    sc_buf_  ->upload(g.scales,                       static_cast<std::size_t>(bytes_scales));
-    rot_buf_ ->upload(g.rotations,                    static_cast<std::size_t>(bytes_rot));
-    opa_in_buf_->upload(g.opacities,                 static_cast<std::size_t>(bytes_N_float));
-    raw_rot_buf_->upload(raw.raw_rotations,           static_cast<std::size_t>(bytes_raw_rot));
+    if (sh_handle == sh_buf_->handle()) {
+        sh_buf_->upload(g.sh_coeffs, static_cast<std::size_t>(bytes_sh));
+    }
+    if (scales_handle == sc_buf_->handle()) {
+        sc_buf_->upload(g.scales, static_cast<std::size_t>(bytes_scales));
+    }
+    if (rotations_handle == rot_buf_->handle()) {
+        rot_buf_->upload(g.rotations, static_cast<std::size_t>(bytes_rot));
+    }
+    if (opacities_handle == opa_in_buf_->handle()) {
+        opa_in_buf_->upload(g.opacities, static_cast<std::size_t>(bytes_N_float));
+    }
+    if (raw_rotations_handle == raw_rot_buf_->handle()) {
+        raw_rot_buf_->upload(raw.raw_rotations, static_cast<std::size_t>(bytes_raw_rot));
+    }
     m2d_cache_buf_->upload(cache.pre->means2D,        static_cast<std::size_t>(bytes_m2d_cache));
     pview_in_buf_ ->upload(cache.p_view,              static_cast<std::size_t>(bytes_p_view));
     cov2d_in_buf_ ->upload(cache.cov2D,               static_cast<std::size_t>(bytes_cov2d));
     c2ddet_in_buf_->upload(cache.cov2D_det,           static_cast<std::size_t>(bytes_c2d_det));
     phomw_in_buf_ ->upload(cache.p_hom_w,             static_cast<std::size_t>(bytes_phomw));
-
-    // Zero-fill gradient output buffers.
-    {
-        const std::vector<float> zeros_m3d(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dm3d_buf_->upload(zeros_m3d.data(), static_cast<std::size_t>(bytes_d_m3d));
-
-        const std::vector<float> zeros_sh(static_cast<std::size_t>(N) * K * 3u, 0.0f);
-        dsh_buf_ ->upload(zeros_sh.data(),  static_cast<std::size_t>(bytes_d_sh));
-
-        const std::vector<float> zeros_sc(static_cast<std::size_t>(N) * 3u, 0.0f);
-        dsc_buf_ ->upload(zeros_sc.data(),  static_cast<std::size_t>(bytes_d_sc));
-
-        const std::vector<float> zeros_rot(static_cast<std::size_t>(N) * 4u, 0.0f);
-        drot_buf_->upload(zeros_rot.data(), static_cast<std::size_t>(bytes_d_rot));
-
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        d_raw_opa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_N_float));
-    }
 
     // Upload UBO.
     PreprocessBackwardUBO ubo{};
@@ -579,23 +598,23 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     // rgrad inputs come directly from GPU buffers (d_conics_gpu, d_opacity_gpu,
     // d_rgb_gpu, d_means2D_gpu) rather than being uploaded from CPU.
     PreprocessBackwardPass::Buffers pb{};
-    pb.positions   = pos_buf_ ->handle();
-    pb.radii       = rad_buf_ ->handle();
+    pb.positions   = positions_handle;
+    pb.radii       = radii_handle;
     pb.cov3D       = cv3_buf_ ->handle();
     pb.d_conics    = d_conics_gpu;
     pb.d_opacity   = d_opacity_gpu;
-    pb.sh_coeffs   = sh_buf_  ->handle();
-    pb.scales      = sc_buf_  ->handle();
-    pb.rotations   = rot_buf_ ->handle();
+    pb.sh_coeffs   = sh_handle;
+    pb.scales      = scales_handle;
+    pb.rotations   = rotations_handle;
     pb.d_rgb       = d_rgb_gpu;
     pb.d_means2D   = d_means2D_gpu;
     pb.d_means3D       = dm3d_buf_   ->handle();
     pb.d_sh            = dsh_buf_    ->handle();
     pb.d_scales        = dsc_buf_    ->handle();
     pb.d_rotations     = drot_buf_   ->handle();
-    pb.opacities       = opa_in_buf_ ->handle();
+    pb.opacities       = opacities_handle;
     pb.d_raw_opacities = d_raw_opa_buf_->handle();
-    pb.raw_rotations      = raw_rot_buf_  ->handle();
+    pb.raw_rotations      = raw_rotations_handle;
     pb.means2D_cache      = m2d_cache_buf_->handle();
     pb.p_view_cache_in    = pview_in_buf_ ->handle();
     pb.cov2D_cache_in     = cov2d_in_buf_ ->handle();

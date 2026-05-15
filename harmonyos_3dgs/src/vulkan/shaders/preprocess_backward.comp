@@ -690,6 +690,14 @@ void main() {
         }
     }
 
+    uint active_coeffs = (ubo.sh_degree + 1u) * (ubo.sh_degree + 1u);
+    for (uint coeff = active_coeffs; coeff < ubo.sh_coeffs_per_g; ++coeff) {
+        uint off = sh_base + coeff * 3u;
+        d_sh[off + 0u] = 0.0;
+        d_sh[off + 1u] = 0.0;
+        d_sh[off + 2u] = 0.0;
+    }
+
     // =========================================================================
     // Part C (continued): d_rgb -> d_pos via SH view-direction dependency
     // (Matches computeColorFromSH_backward in preprocessor_backward_cpu.cpp:122-202)

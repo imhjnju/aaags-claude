@@ -42,6 +42,58 @@ std::string tiny_cam0_dir() {
 
 }  // namespace
 
+TEST(RasterizerVulkan, EmptySceneClearsGpuResidentOutputsRequest) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    constexpr int W = 4;
+    constexpr int H = 3;
+    constexpr int HW = W * H;
+    PreprocessOutput pre{};
+    BinningOutput bin{};
+    bin.total_pairs = 0;
+
+    Camera cam{};
+    cam.width = W;
+    cam.height = H;
+
+    RenderConfig cfg{};
+    cfg.bg_color[0] = 0.25f;
+    cfg.bg_color[1] = 0.50f;
+    cfg.bg_color[2] = 0.75f;
+    cfg.tile_w = 16;
+    cfg.tile_h = 16;
+
+    std::vector<float> out_image(static_cast<size_t>(HW) * 3u, 0.0f);
+    std::vector<float> T_final(HW, 0.0f);
+    std::vector<int> n_contrib(HW, -1);
+    ForwardCache cache{};
+    cache.T_final = T_final.data();
+    cache.n_contrib = n_contrib.data();
+    cache.gpu_resident_outputs = true;
+    cache.retain_gpu_outputs = true;
+
+    RasterizerVulkan rasterizer(ctx);
+    rasterizer.set_layer1_download_probes_for_test(true, true);
+    rasterizer.rasterize(pre, bin, cam, cfg, out_image.data(), nullptr, &cache, nullptr);
+
+    EXPECT_FALSE(cache.gpu_resident_outputs);
+    EXPECT_EQ(cache.rendered_image_gpu, nullptr);
+    EXPECT_EQ(cache.T_final_gpu, nullptr);
+    EXPECT_EQ(cache.n_contrib_gpu, nullptr);
+    EXPECT_FALSE(rasterizer.last_layer1_image_downloaded_for_test());
+    EXPECT_FALSE(rasterizer.last_layer1_cache_downloaded_for_test());
+    for (int px = 0; px < HW; ++px) {
+        EXPECT_FLOAT_EQ(out_image[px], 0.25f);
+        EXPECT_FLOAT_EQ(out_image[static_cast<size_t>(HW) + px], 0.50f);
+        EXPECT_FLOAT_EQ(out_image[static_cast<size_t>(HW) * 2u + px], 0.75f);
+        EXPECT_FLOAT_EQ(T_final[px], 1.0f);
+        EXPECT_EQ(n_contrib[px], 0);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // End-to-end golden test: RasterizerVulkan::rasterize() on tiny fixture.
 // -----------------------------------------------------------------------------

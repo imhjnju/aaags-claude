@@ -20,7 +20,7 @@ public:
         VkBuffer colors;
         VkBuffer T_final;
         VkBuffer n_contrib;
-        VkBuffer rendered_image;
+        VkBuffer rendered_image; // Compatibility slot; shader no longer reads it.
         VkBuffer dL_dpixels;
         VkBuffer dL_dgauss2screen;
         VkBuffer dL_dopacity;
@@ -36,12 +36,15 @@ public:
     RasterizeBackwardEval3DPass& operator=(const RasterizeBackwardEval3DPass&) = delete;
 
     void bind_buffers(const Buffers& b, VkBuffer ubo);
-    void dispatch_sync(uint32_t num_tiles_x, uint32_t num_tiles_y);
-    void record(VkCommandBuffer cmd, uint32_t num_tiles_x, uint32_t num_tiles_y);
+    void dispatch_sync(uint32_t num_tiles_x, uint32_t num_tiles_y, bool use_replay_order);
+    void record(VkCommandBuffer cmd, uint32_t num_tiles_x, uint32_t num_tiles_y, bool use_replay_order);
 
 private:
     VulkanContext& ctx_;
     std::unique_ptr<VulkanShader>          shader_;
+    std::unique_ptr<VulkanShader>          replay_shader_;
     std::unique_ptr<VulkanComputePipeline> pipeline_;
+    std::unique_ptr<VulkanComputePipeline> replay_pipeline_;
     VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet                        replay_descriptor_set_ = VK_NULL_HANDLE;
 };

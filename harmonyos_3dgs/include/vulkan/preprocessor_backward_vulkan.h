@@ -9,9 +9,10 @@
 //   bwd.backward(g, num_gaussians, cam, cfg, cache, rgrad, raw, grads, alloc);
 //
 // Preconditions:
-//   - cache.eval_3D must be false (EVAL_3D=true path is not implemented)
-//   - cache.cov3D, cache.p_view must be non-null (populated by forward preprocessor)
-//   - grads.allocate_and_zero() is called internally
+//   - 2D backward requires cache.cov3D/cache.p_view populated by forward preprocess.
+//   - eval_3D backward requires the forward PreprocessOutput sideband and
+//     d_gauss2screen from rasterizer backward.
+//   - grads.allocate_and_zero() is called internally.
 
 #pragma once
 
@@ -24,6 +25,17 @@
 
 #include <memory>
 #include <vector>
+
+struct PreprocessBackwardGpuInputs {
+    VkBuffer positions = VK_NULL_HANDLE;
+    VkBuffer radii = VK_NULL_HANDLE;
+    VkBuffer sh_coeffs = VK_NULL_HANDLE;
+    VkBuffer scales = VK_NULL_HANDLE;
+    VkBuffer rotations = VK_NULL_HANDLE;
+    VkBuffer opacities = VK_NULL_HANDLE;
+    VkBuffer raw_rotations = VK_NULL_HANDLE;
+    VkBuffer filter_3D = VK_NULL_HANDLE;
+};
 
 class PreprocessorBackwardVulkan {
 public:
@@ -55,7 +67,7 @@ public:
     /// \param grads         Output gradients (allocated and zeroed internally)
     /// \param alloc         Frame allocator for grads arrays
     ///
-    /// \throws std::runtime_error if cache.pre->eval_3D is true (not supported)
+    /// \throws std::runtime_error if required forward cache fields are missing.
     void backward(const GaussianData& g,
                   int num_gaussians,
                   const Camera& cam,
@@ -80,12 +92,19 @@ public:
                               VkBuffer d_rgb_gpu,      // from rasterize_bwd dL_dcolors_buf()
                               VkBuffer d_means2D_gpu,  // from rasterize_bwd dL_dmeans2D_buf()
                               const RawGaussianParams& raw,
-                              VkBuffer d_gauss2screen_gpu = VK_NULL_HANDLE);
+                              VkBuffer d_gauss2screen_gpu = VK_NULL_HANDLE,
+                              const PreprocessBackwardGpuInputs* gpu_inputs = nullptr);
 
     /// Download gradient outputs to CPU after backward_record_into() + submit.
     /// grads is allocated from alloc and filled from persistent GPU output buffers.
     void download_grads(int num_gaussians, int max_coeffs,
                         GradientOutput& grads, FrameAllocator& alloc);
+
+    VkBuffer d_raw_positions_buf() const { return dm3d_buf_ ? dm3d_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer d_raw_sh_buf() const { return dsh_buf_ ? dsh_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer d_raw_scales_buf() const { return dsc_buf_ ? dsc_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer d_raw_rotations_buf() const { return drot_buf_ ? drot_buf_->handle() : VK_NULL_HANDLE; }
+    VkBuffer d_raw_opacities_buf() const { return d_raw_opa_buf_ ? d_raw_opa_buf_->handle() : VK_NULL_HANDLE; }
 
     /// Clear all gradient output buffers to zero before backward pass.
     /// Critical for correctness: backward shaders only write to active Gaussians,

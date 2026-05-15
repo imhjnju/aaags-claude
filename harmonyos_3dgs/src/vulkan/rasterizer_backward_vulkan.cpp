@@ -1,9 +1,9 @@
 // SP-3 T22: RasterizerBackwardVulkan — high-level backward rasterizer adapter.
 //
-// Uploads all CPU-side inputs to host-visible SSBOs, zero-fills gradient
-// output buffers explicitly (VulkanBuffer does not zero on allocation),
-// dispatches rasterize_backward.comp via RasterizeBackwardPass, then
-// downloads the resulting gradients into the caller-provided rgrad arrays.
+// Uses GPU-resident forward/preprocess buffers when supplied, uploads CPU
+// fallbacks to host-visible SSBOs, zero-fills gradient output buffers explicitly
+// (VulkanBuffer does not zero on allocation), dispatches rasterize_backward.comp
+// via RasterizeBackwardPass, then downloads gradients for synchronous callers.
 //
 // Buffer-size contract (matches the shader std430 layouts):
 //   tile_ranges    : num_tiles * 2 * sizeof(uint32)
@@ -117,6 +117,7 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
                                          RasterGradOutput& rgrad,
                                          FrameAllocator& alloc,
                                          const float* rendered_image) {
+    last_forward_gpu_cache_used_ = false;
     const int W  = cam.width;
     const int H  = cam.height;
     if (W <= 0 || H <= 0) return;
@@ -130,7 +131,7 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     // CPU-side destination for the downloaded gradients.
     rgrad.allocate_and_zero(alloc, N);
 
-    if (N == 0 || bin.total_pairs <= 0 || bin.values_sorted == nullptr) {
+    if (N == 0 || bin.total_pairs <= 0 || (bin.values_sorted == nullptr && bin.values_sorted_gpu == nullptr)) {
         // Empty scene: no Gaussians, nothing to back-propagate.
         return;
     }
@@ -175,39 +176,77 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
     const VkDeviceSize bytes_dL_g2s =
         static_cast<VkDeviceSize>(N) * 16u * sizeof(float);
+    const bool has_values_gpu = bin.values_sorted_gpu != nullptr;
 
     if (pre.eval_3D) {
-        if (!pre.gauss2screen)
+        const bool has_gauss2screen_gpu = cache.gauss2screen_gpu != nullptr;
+        const bool has_rgb_gpu = pre.rgb_gpu != nullptr;
+        const bool has_conic_opacity_gpu = pre.conic_opacity_packed_gpu != nullptr;
+        if (!has_gauss2screen_gpu && !pre.gauss2screen)
             throw std::runtime_error("RasterizerBackwardVulkan::backward: missing eval_3D gauss2screen");
-        if (!rendered_image)
-            throw std::runtime_error("RasterizerBackwardVulkan::backward: eval_3D requires rendered_image");
-
         if (bin.tile_ranges_gpu == nullptr) {
             tr_buf_->upload(bin.tile_ranges, static_cast<std::size_t>(bytes_tile_ranges));
         }
-        vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
-        g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
-        col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
-        tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
-        nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
-        img_buf_->upload(rendered_image, static_cast<std::size_t>(bytes_dL_dpix));
-        dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
-
-        std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
-        for (int i = 0; i < N; ++i) {
-            conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+        if (!has_values_gpu) {
+            vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
         }
-        co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+        VkBuffer gauss2screen_handle = has_gauss2screen_gpu
+            ? static_cast<VkBuffer>(cache.gauss2screen_gpu)
+            : g2s_buf_->handle();
+        if (!has_gauss2screen_gpu) {
+            g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
+        }
+        VkBuffer colors_handle = has_rgb_gpu
+            ? static_cast<VkBuffer>(pre.rgb_gpu)
+            : col_buf_->handle();
+        if (!has_rgb_gpu) {
+            col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
+        }
+        VkBuffer tfinal_handle = cache.T_final_gpu
+            ? static_cast<VkBuffer>(cache.T_final_gpu)
+            : tf_buf_->handle();
+        VkBuffer ncontrib_handle = cache.n_contrib_gpu
+            ? static_cast<VkBuffer>(cache.n_contrib_gpu)
+            : nc_buf_->handle();
+        VkBuffer dlpix_handle = cache.dL_dpixels_gpu
+            ? static_cast<VkBuffer>(cache.dL_dpixels_gpu)
+            : dlpix_buf_->handle();
+        last_forward_gpu_cache_used_ = cache.T_final_gpu != nullptr
+            || cache.n_contrib_gpu != nullptr
+            || has_gauss2screen_gpu
+            || has_rgb_gpu
+            || has_conic_opacity_gpu;
+        if (!cache.T_final_gpu) {
+            tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
+        }
+        if (!cache.n_contrib_gpu) {
+            nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
+        }
+        if (!cache.dL_dpixels_gpu) {
+            dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
+        }
 
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        const std::vector<float> zeros_col(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_g2s(static_cast<std::size_t>(N) * 16u, 0.0f);
-        dlopa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_dL_opa));
-        dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
-        dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
+        VkBuffer conic_opacity_handle = has_conic_opacity_gpu
+            ? static_cast<VkBuffer>(pre.conic_opacity_packed_gpu)
+            : co_buf_->handle();
+        if (!has_conic_opacity_gpu) {
+            std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
+            for (int i = 0; i < N; ++i) {
+                conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+            }
+            co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+        }
 
-        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
-        if (use_replay_order) {
+        dlopa_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_opa));
+        dlcol_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_col));
+        dlg2s_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_g2s));
+
+        const bool has_replay_cpu = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        const bool has_replay_gpu = cache.replay_order_offsets_gpu && cache.replay_order_gids_gpu && cache.replay_order_count > 0;
+        const bool use_replay_order = has_replay_cpu || has_replay_gpu;
+        VkBuffer replay_offsets_handle = dummy4_buf_->handle();
+        VkBuffer replay_gids_handle = dummy4_buf_->handle();
+        if (has_replay_cpu) {
             replay_offsets_buf_->upload(cache.replay_order_offsets,
                 (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
             if (cache.replay_order_count > buf_replay_count_) {
@@ -218,6 +257,11 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
             }
             replay_gids_buf_->upload(cache.replay_order_gids,
                 static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+            replay_offsets_handle = replay_offsets_buf_->handle();
+            replay_gids_handle = replay_gids_buf_->handle();
+        } else if (has_replay_gpu) {
+            replay_offsets_handle = static_cast<VkBuffer>(cache.replay_order_offsets_gpu);
+            replay_gids_handle = static_cast<VkBuffer>(cache.replay_order_gids_gpu);
         }
 
         RasterizeBackwardUBO ubo{};
@@ -234,21 +278,23 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         rb.tile_ranges = bin.tile_ranges_gpu
             ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
             : tr_buf_->handle();
-        rb.values_sorted = vs_buf_->handle();
-        rb.gauss2screen = g2s_buf_->handle();
-        rb.conic_opacity = co_buf_->handle();
-        rb.colors = col_buf_->handle();
-        rb.T_final = tf_buf_->handle();
-        rb.n_contrib = nc_buf_->handle();
-        rb.rendered_image = img_buf_->handle();
-        rb.dL_dpixels = dlpix_buf_->handle();
+        rb.values_sorted = has_values_gpu
+            ? static_cast<VkBuffer>(bin.values_sorted_gpu)
+            : vs_buf_->handle();
+        rb.gauss2screen = gauss2screen_handle;
+        rb.conic_opacity = conic_opacity_handle;
+        rb.colors = colors_handle;
+        rb.T_final = tfinal_handle;
+        rb.n_contrib = ncontrib_handle;
+        rb.rendered_image = dummy4_buf_->handle();
+        rb.dL_dpixels = dlpix_handle;
         rb.dL_dgauss2screen = dlg2s_buf_->handle();
         rb.dL_dopacity = dlopa_buf_->handle();
         rb.dL_dcolors = dlcol_buf_->handle();
-        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
-        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_offsets = replay_offsets_handle;
+        rb.replay_order_gids = replay_gids_handle;
         eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
-        eval3d_pass_->dispatch_sync(num_tiles_x, num_tiles_y);
+        eval3d_pass_->dispatch_sync(num_tiles_x, num_tiles_y, use_replay_order);
 
         dlopa_buf_->download(rgrad.d_opacities_2d, static_cast<std::size_t>(bytes_dL_opa));
         dlcol_buf_->download(rgrad.d_rgb, static_cast<std::size_t>(bytes_dL_col));
@@ -277,44 +323,46 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
         tr_buf_->upload(bin.tile_ranges,
                         static_cast<std::size_t>(bytes_tile_ranges));
     }
-    vs_buf_ ->upload(bin.values_sorted,
-                     static_cast<std::size_t>(bytes_vs));
+    if (!has_values_gpu) {
+        vs_buf_->upload(bin.values_sorted,
+                        static_cast<std::size_t>(bytes_vs));
+    }
     m2d_buf_->upload(pre.means2D,
                      static_cast<std::size_t>(bytes_m2d));
     co_buf_ ->upload(conic_opacity_packed.data(),
                      static_cast<std::size_t>(bytes_co));
     col_buf_->upload(pre.rgb,
                      static_cast<std::size_t>(bytes_colors));
-    tf_buf_ ->upload(cache.T_final,
-                     static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
-    nc_buf_ ->upload(cache.n_contrib,
-                     static_cast<std::size_t>(bytes_ncontrib));
-    dlpix_buf_->upload(dL_dpixels,
-                       static_cast<std::size_t>(bytes_dL_dpix));
+    VkBuffer tfinal_handle = cache.T_final_gpu
+        ? static_cast<VkBuffer>(cache.T_final_gpu)
+        : tf_buf_->handle();
+    VkBuffer ncontrib_handle = cache.n_contrib_gpu
+        ? static_cast<VkBuffer>(cache.n_contrib_gpu)
+        : nc_buf_->handle();
+    VkBuffer dlpix_handle = cache.dL_dpixels_gpu
+        ? static_cast<VkBuffer>(cache.dL_dpixels_gpu)
+        : dlpix_buf_->handle();
+    last_forward_gpu_cache_used_ = cache.T_final_gpu != nullptr
+        || cache.n_contrib_gpu != nullptr;
+    if (!cache.T_final_gpu) {
+        tf_buf_->upload(cache.T_final,
+                        static_cast<std::size_t>(bytes_tfinal));
+    }
+    if (!cache.n_contrib_gpu) {
+        // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
+        nc_buf_->upload(cache.n_contrib,
+                        static_cast<std::size_t>(bytes_ncontrib));
+    }
+    if (!cache.dL_dpixels_gpu) {
+        dlpix_buf_->upload(dL_dpixels,
+                           static_cast<std::size_t>(bytes_dL_dpix));
+    }
 
     // Zero-fill gradient output buffers (atomicAdd accumulates into them).
-    {
-        const std::vector<float> zeros_m2d(
-            static_cast<std::size_t>(N) * 2u, 0.0f);
-        dlm2d_buf_->upload(zeros_m2d.data(),
-                           static_cast<std::size_t>(bytes_dL_m2d));
-
-        const std::vector<float> zeros_con(
-            static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcon_buf_->upload(zeros_con.data(),
-                           static_cast<std::size_t>(bytes_dL_con));
-
-        const std::vector<float> zeros_opa(
-            static_cast<std::size_t>(N), 0.0f);
-        dlopa_buf_->upload(zeros_opa.data(),
-                           static_cast<std::size_t>(bytes_dL_opa));
-
-        const std::vector<float> zeros_col(
-            static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcol_buf_->upload(zeros_col.data(),
-                           static_cast<std::size_t>(bytes_dL_col));
-    }
+    dlm2d_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_m2d));
+    dlcon_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_con));
+    dlopa_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_opa));
+    dlcol_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_col));
 
     // Upload UBO.
     RasterizeBackwardUBO ubo{};
@@ -335,13 +383,15 @@ void RasterizerBackwardVulkan::backward(const PreprocessOutput& pre,
     rb.tile_ranges   = bin.tile_ranges_gpu
         ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
         : tr_buf_->handle();
-    rb.values_sorted = vs_buf_   ->handle();
+    rb.values_sorted = has_values_gpu
+        ? static_cast<VkBuffer>(bin.values_sorted_gpu)
+        : vs_buf_->handle();
     rb.means2D       = m2d_buf_  ->handle();
     rb.conic_opacity = co_buf_   ->handle();
     rb.colors        = col_buf_  ->handle();
-    rb.T_final       = tf_buf_   ->handle();
-    rb.n_contrib     = nc_buf_   ->handle();
-    rb.dL_dpixels    = dlpix_buf_->handle();
+    rb.T_final       = tfinal_handle;
+    rb.n_contrib     = ncontrib_handle;
+    rb.dL_dpixels    = dlpix_handle;
     rb.dL_dmeans2D   = dlm2d_buf_->handle();
     rb.dL_dconics    = dlcon_buf_->handle();
     rb.dL_dopacity   = dlopa_buf_->handle();
@@ -398,16 +448,13 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                      const ForwardCache& cache,
                                                      const float* dL_dpixels,
                                                      const float* rendered_image) {
+    last_forward_gpu_cache_used_ = false;
     const int W  = cam.width;
     const int H  = cam.height;
     if (W <= 0 || H <= 0) return;
 
     const int N = num_gaussians;
-
-    if (N == 0 || bin.total_pairs <= 0 || bin.values_sorted == nullptr) {
-        // Empty scene: no Gaussians, nothing to back-propagate.
-        return;
-    }
+    if (N == 0) return;
 
     const uint32_t num_tiles_x =
         static_cast<uint32_t>((W + cfg.tile_w - 1) / cfg.tile_w);
@@ -416,6 +463,19 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
 
     const int R   = bin.total_pairs;
     const int HW  = H * W;
+
+    if (R <= 0) {
+        prepare_for_n(N, 1, static_cast<int>(num_tiles_x * num_tiles_y), HW);
+        dlm2d_buf_->zero_fill(static_cast<std::size_t>(N) * 2u * sizeof(float));
+        dlcon_buf_->zero_fill(static_cast<std::size_t>(N) * 3u * sizeof(float));
+        dlopa_buf_->zero_fill(static_cast<std::size_t>(N) * sizeof(float));
+        dlcol_buf_->zero_fill(static_cast<std::size_t>(N) * 3u * sizeof(float));
+        dlg2s_buf_->zero_fill(static_cast<std::size_t>(N) * 16u * sizeof(float));
+        return;
+    }
+    if (bin.values_sorted == nullptr && bin.values_sorted_gpu == nullptr) {
+        throw std::runtime_error("RasterizerBackwardVulkan::backward_record_into: missing sorted gaussian ids");
+    }
 
     // Ensure persistent buffers are large enough for this call.
     prepare_for_n(N, R, static_cast<int>(num_tiles_x * num_tiles_y), HW);
@@ -449,39 +509,77 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         static_cast<VkDeviceSize>(N) * 3u * sizeof(float);
     const VkDeviceSize bytes_dL_g2s =
         static_cast<VkDeviceSize>(N) * 16u * sizeof(float);
+    const bool has_values_gpu = bin.values_sorted_gpu != nullptr;
 
     if (pre.eval_3D) {
-        if (!pre.gauss2screen)
+        const bool has_gauss2screen_gpu = cache.gauss2screen_gpu != nullptr;
+        const bool has_rgb_gpu = pre.rgb_gpu != nullptr;
+        const bool has_conic_opacity_gpu = pre.conic_opacity_packed_gpu != nullptr;
+        if (!has_gauss2screen_gpu && !pre.gauss2screen)
             throw std::runtime_error("RasterizerBackwardVulkan::backward_record_into: missing eval_3D gauss2screen");
-        if (!rendered_image)
-            throw std::runtime_error("RasterizerBackwardVulkan::backward_record_into: eval_3D requires rendered_image");
-
         if (bin.tile_ranges_gpu == nullptr) {
             tr_buf_->upload(bin.tile_ranges, static_cast<std::size_t>(bytes_tile_ranges));
         }
-        vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
-        g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
-        col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
-        tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
-        nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
-        img_buf_->upload(rendered_image, static_cast<std::size_t>(bytes_dL_dpix));
-        dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
-
-        std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
-        for (int i = 0; i < N; ++i) {
-            conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+        if (!has_values_gpu) {
+            vs_buf_->upload(bin.values_sorted, static_cast<std::size_t>(bytes_vs));
         }
-        co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+        VkBuffer gauss2screen_handle = has_gauss2screen_gpu
+            ? static_cast<VkBuffer>(cache.gauss2screen_gpu)
+            : g2s_buf_->handle();
+        if (!has_gauss2screen_gpu) {
+            g2s_buf_->upload(pre.gauss2screen, static_cast<std::size_t>(bytes_dL_g2s));
+        }
+        VkBuffer colors_handle = has_rgb_gpu
+            ? static_cast<VkBuffer>(pre.rgb_gpu)
+            : col_buf_->handle();
+        if (!has_rgb_gpu) {
+            col_buf_->upload(pre.rgb, static_cast<std::size_t>(bytes_colors));
+        }
+        VkBuffer tfinal_handle = cache.T_final_gpu
+            ? static_cast<VkBuffer>(cache.T_final_gpu)
+            : tf_buf_->handle();
+        VkBuffer ncontrib_handle = cache.n_contrib_gpu
+            ? static_cast<VkBuffer>(cache.n_contrib_gpu)
+            : nc_buf_->handle();
+        VkBuffer dlpix_handle = cache.dL_dpixels_gpu
+            ? static_cast<VkBuffer>(cache.dL_dpixels_gpu)
+            : dlpix_buf_->handle();
+        last_forward_gpu_cache_used_ = cache.T_final_gpu != nullptr
+            || cache.n_contrib_gpu != nullptr
+            || has_gauss2screen_gpu
+            || has_rgb_gpu
+            || has_conic_opacity_gpu;
+        if (!cache.T_final_gpu) {
+            tf_buf_->upload(cache.T_final, static_cast<std::size_t>(bytes_tfinal));
+        }
+        if (!cache.n_contrib_gpu) {
+            nc_buf_->upload(cache.n_contrib, static_cast<std::size_t>(bytes_ncontrib));
+        }
+        if (!cache.dL_dpixels_gpu) {
+            dlpix_buf_->upload(dL_dpixels, static_cast<std::size_t>(bytes_dL_dpix));
+        }
 
-        const std::vector<float> zeros_opa(static_cast<std::size_t>(N), 0.0f);
-        const std::vector<float> zeros_col(static_cast<std::size_t>(N) * 3u, 0.0f);
-        const std::vector<float> zeros_g2s(static_cast<std::size_t>(N) * 16u, 0.0f);
-        dlopa_buf_->upload(zeros_opa.data(), static_cast<std::size_t>(bytes_dL_opa));
-        dlcol_buf_->upload(zeros_col.data(), static_cast<std::size_t>(bytes_dL_col));
-        dlg2s_buf_->upload(zeros_g2s.data(), static_cast<std::size_t>(bytes_dL_g2s));
+        VkBuffer conic_opacity_handle = has_conic_opacity_gpu
+            ? static_cast<VkBuffer>(pre.conic_opacity_packed_gpu)
+            : co_buf_->handle();
+        if (!has_conic_opacity_gpu) {
+            std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N) * 4u, 0.0f);
+            for (int i = 0; i < N; ++i) {
+                conic_opacity_packed[static_cast<std::size_t>(i) * 4u + 3u] = pre.opacities_2d[i];
+            }
+            co_buf_->upload(conic_opacity_packed.data(), static_cast<std::size_t>(bytes_co));
+        }
 
-        const bool use_replay_order = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
-        if (use_replay_order) {
+        dlopa_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_opa));
+        dlcol_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_col));
+        dlg2s_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_g2s));
+
+        const bool has_replay_cpu = cache.replay_order_offsets && cache.replay_order_gids && cache.replay_order_count > 0;
+        const bool has_replay_gpu = cache.replay_order_offsets_gpu && cache.replay_order_gids_gpu && cache.replay_order_count > 0;
+        const bool use_replay_order = has_replay_cpu || has_replay_gpu;
+        VkBuffer replay_offsets_handle = dummy4_buf_->handle();
+        VkBuffer replay_gids_handle = dummy4_buf_->handle();
+        if (has_replay_cpu) {
             replay_offsets_buf_->upload(cache.replay_order_offsets,
                 (static_cast<size_t>(HW) + 1u) * sizeof(uint32_t));
             if (cache.replay_order_count > buf_replay_count_) {
@@ -492,6 +590,11 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
             }
             replay_gids_buf_->upload(cache.replay_order_gids,
                 static_cast<size_t>(cache.replay_order_count) * sizeof(uint32_t));
+            replay_offsets_handle = replay_offsets_buf_->handle();
+            replay_gids_handle = replay_gids_buf_->handle();
+        } else if (has_replay_gpu) {
+            replay_offsets_handle = static_cast<VkBuffer>(cache.replay_order_offsets_gpu);
+            replay_gids_handle = static_cast<VkBuffer>(cache.replay_order_gids_gpu);
         }
 
         RasterizeBackwardUBO ubo{};
@@ -508,21 +611,28 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         rb.tile_ranges = bin.tile_ranges_gpu
             ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
             : tr_buf_->handle();
-        rb.values_sorted = vs_buf_->handle();
-        rb.gauss2screen = g2s_buf_->handle();
-        rb.conic_opacity = co_buf_->handle();
-        rb.colors = col_buf_->handle();
-        rb.T_final = tf_buf_->handle();
-        rb.n_contrib = nc_buf_->handle();
-        rb.rendered_image = img_buf_->handle();
-        rb.dL_dpixels = dlpix_buf_->handle();
+        rb.values_sorted = has_values_gpu
+            ? static_cast<VkBuffer>(bin.values_sorted_gpu)
+            : vs_buf_->handle();
+        rb.gauss2screen = gauss2screen_handle;
+        rb.conic_opacity = conic_opacity_handle;
+        rb.colors = colors_handle;
+        rb.T_final = tfinal_handle;
+        rb.n_contrib = ncontrib_handle;
+        rb.rendered_image = dummy4_buf_->handle();
+        rb.dL_dpixels = dlpix_handle;
         rb.dL_dgauss2screen = dlg2s_buf_->handle();
         rb.dL_dopacity = dlopa_buf_->handle();
         rb.dL_dcolors = dlcol_buf_->handle();
-        rb.replay_order_offsets = use_replay_order ? replay_offsets_buf_->handle() : dummy4_buf_->handle();
-        rb.replay_order_gids = use_replay_order ? replay_gids_buf_->handle() : dummy4_buf_->handle();
+        rb.replay_order_offsets = replay_offsets_handle;
+        rb.replay_order_gids = replay_gids_handle;
         eval3d_pass_->bind_buffers(rb, ubo_buf_->handle());
-        eval3d_pass_->record(cmd, num_tiles_x, num_tiles_y);
+        if (bin.tile_ranges_gpu || has_values_gpu || cache.T_final_gpu || cache.n_contrib_gpu
+            || cache.dL_dpixels_gpu || has_gauss2screen_gpu || has_rgb_gpu
+            || has_conic_opacity_gpu || has_replay_gpu) {
+            insert_compute_barrier(cmd);
+        }
+        eval3d_pass_->record(cmd, num_tiles_x, num_tiles_y, use_replay_order);
         return;
     }
 
@@ -547,44 +657,46 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         tr_buf_->upload(bin.tile_ranges,
                         static_cast<std::size_t>(bytes_tile_ranges));
     }
-    vs_buf_ ->upload(bin.values_sorted,
-                     static_cast<std::size_t>(bytes_vs));
+    if (!has_values_gpu) {
+        vs_buf_->upload(bin.values_sorted,
+                        static_cast<std::size_t>(bytes_vs));
+    }
     m2d_buf_->upload(pre.means2D,
                      static_cast<std::size_t>(bytes_m2d));
     co_buf_ ->upload(conic_opacity_packed.data(),
                      static_cast<std::size_t>(bytes_co));
     col_buf_->upload(pre.rgb,
                      static_cast<std::size_t>(bytes_colors));
-    tf_buf_ ->upload(cache.T_final,
-                     static_cast<std::size_t>(bytes_tfinal));
-    // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
-    nc_buf_ ->upload(cache.n_contrib,
-                     static_cast<std::size_t>(bytes_ncontrib));
-    dlpix_buf_->upload(dL_dpixels,
-                       static_cast<std::size_t>(bytes_dL_dpix));
+    VkBuffer tfinal_handle = cache.T_final_gpu
+        ? static_cast<VkBuffer>(cache.T_final_gpu)
+        : tf_buf_->handle();
+    VkBuffer ncontrib_handle = cache.n_contrib_gpu
+        ? static_cast<VkBuffer>(cache.n_contrib_gpu)
+        : nc_buf_->handle();
+    VkBuffer dlpix_handle = cache.dL_dpixels_gpu
+        ? static_cast<VkBuffer>(cache.dL_dpixels_gpu)
+        : dlpix_buf_->handle();
+    last_forward_gpu_cache_used_ = cache.T_final_gpu != nullptr
+        || cache.n_contrib_gpu != nullptr;
+    if (!cache.T_final_gpu) {
+        tf_buf_->upload(cache.T_final,
+                        static_cast<std::size_t>(bytes_tfinal));
+    }
+    if (!cache.n_contrib_gpu) {
+        // n_contrib is int*; reinterpret as uint32 (same width, positions < 2^31).
+        nc_buf_->upload(cache.n_contrib,
+                        static_cast<std::size_t>(bytes_ncontrib));
+    }
+    if (!cache.dL_dpixels_gpu) {
+        dlpix_buf_->upload(dL_dpixels,
+                           static_cast<std::size_t>(bytes_dL_dpix));
+    }
 
     // Zero-fill gradient output buffers (atomicAdd accumulates into them).
-    {
-        const std::vector<float> zeros_m2d(
-            static_cast<std::size_t>(N) * 2u, 0.0f);
-        dlm2d_buf_->upload(zeros_m2d.data(),
-                           static_cast<std::size_t>(bytes_dL_m2d));
-
-        const std::vector<float> zeros_con(
-            static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcon_buf_->upload(zeros_con.data(),
-                           static_cast<std::size_t>(bytes_dL_con));
-
-        const std::vector<float> zeros_opa(
-            static_cast<std::size_t>(N), 0.0f);
-        dlopa_buf_->upload(zeros_opa.data(),
-                           static_cast<std::size_t>(bytes_dL_opa));
-
-        const std::vector<float> zeros_col(
-            static_cast<std::size_t>(N) * 3u, 0.0f);
-        dlcol_buf_->upload(zeros_col.data(),
-                           static_cast<std::size_t>(bytes_dL_col));
-    }
+    dlm2d_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_m2d));
+    dlcon_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_con));
+    dlopa_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_opa));
+    dlcol_buf_->zero_fill(static_cast<std::size_t>(bytes_dL_col));
 
     // Upload UBO.
     RasterizeBackwardUBO ubo{};
@@ -605,18 +717,23 @@ void RasterizerBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
     rb.tile_ranges   = bin.tile_ranges_gpu
         ? static_cast<VkBuffer>(bin.tile_ranges_gpu)
         : tr_buf_->handle();
-    rb.values_sorted = vs_buf_   ->handle();
+    rb.values_sorted = has_values_gpu
+        ? static_cast<VkBuffer>(bin.values_sorted_gpu)
+        : vs_buf_->handle();
     rb.means2D       = m2d_buf_  ->handle();
     rb.conic_opacity = co_buf_   ->handle();
     rb.colors        = col_buf_  ->handle();
-    rb.T_final       = tf_buf_   ->handle();
-    rb.n_contrib     = nc_buf_   ->handle();
-    rb.dL_dpixels    = dlpix_buf_->handle();
+    rb.T_final       = tfinal_handle;
+    rb.n_contrib     = ncontrib_handle;
+    rb.dL_dpixels    = dlpix_handle;
     rb.dL_dmeans2D   = dlm2d_buf_->handle();
     rb.dL_dconics    = dlcon_buf_->handle();
     rb.dL_dopacity   = dlopa_buf_->handle();
     rb.dL_dcolors    = dlcol_buf_->handle();
 
     pass_->bind_buffers(rb, ubo_buf_->handle());
+    if (bin.tile_ranges_gpu || has_values_gpu || cache.T_final_gpu || cache.n_contrib_gpu || cache.dL_dpixels_gpu) {
+        insert_compute_barrier(cmd);
+    }
     pass_->record(cmd, num_tiles_x, num_tiles_y);
 }

@@ -22,6 +22,7 @@
 class VulkanBuffer;
 class VulkanAlignedBuffer;
 class RadixSortFuchsia;
+class PackedKeyvalExtractPass;
 
 class SorterVulkan : public Sorter {
 public:
@@ -72,13 +73,16 @@ private:
     std::unique_ptr<TileRangePass> range_pass_;
 
     std::unique_ptr<RadixSortFuchsia>      fuchsia_;
-    uint32_t                                fuchsia_max_keyvals_ = 0;
+    uint32_t                                f_keyvals_count_capacity_ = 0;
     std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_even_;
     std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_scratch_;
     std::unique_ptr<VulkanAlignedBuffer>    f_internal_scratch_;
+    std::unique_ptr<VulkanBuffer>           f_values_sorted_;
     std::unique_ptr<VulkanBuffer>           f_tile_ranges_;
-    uint32_t                                f_keyvals_capacity_ = 0;
-    uint32_t                                f_internal_capacity_ = 0;
+    std::unique_ptr<PackedKeyvalExtractPass> f_extract_pass_;
+    VkDeviceSize                            f_keyvals_byte_capacity_ = 0;
+    VkDeviceSize                            f_internal_byte_capacity_ = 0;
+    uint32_t                                f_values_sorted_capacity_ = 0;
     uint32_t                                f_tile_ranges_capacity_ = 0;
     VkBuffer                                f_last_sorted_ = VK_NULL_HANDLE;
 

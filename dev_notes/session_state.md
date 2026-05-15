@@ -1,7 +1,22 @@
 # Session State
 
-## Current Phase (merge-training-master — 2026-05-08)
-Training/profiling sync into the master cascade/config line is integrated in isolated branch `worktree-merge-training-master`. Training-priority non-parity `eval_3D` replay-order support has now been ported and validated while preserving master `SplattingSettings`, cascade trace/config validation, rasterize specialization IDs, and the non-trace HEAD_W=8 fallback. Current test inventory is **327 tests / 73 .cpp files**.
+## Current Phase (Raw/grad transfer elimination — 2026-05-15)
+The `/goal` to improve `raw_download_ms` and `grad_upload_ms` by >100x is satisfied on the high-N 20-step smoke after adding the opt-in GPU raw-activation path (`GS3D_TRAIN_GPU_RAW_ACTIVATE=1`) on top of GPU Grad Adam (`GS3D_TRAIN_GPU_GRAD_ADAM=1`). Post-clean report: `harmonyos_3dgs/reports/gpu_raw_activate_highN_smoke_20260515_postclean/summary.json`, exit 0, 20 stage rows, `backward_download_ms`, `grad_upload_ms`, and `raw_download_ms` all **0.000 ms** (mean/p50/max). The fix also threads `PreprocessBackwardGpuInputs` through the non-eval3D preprocess-backward record path so GPU raw activation does not feed stale CPU activated/raw buffers into 2D backward. Validation after clean rebuild: `VulkanTrainer.GpuGradientAdamMatchesCpuGradientUploadStep` + `VulkanTrainer.GpuRawActivationMatchesCpuActivationAfterTwoSteps` **2/2 PASS**, `VkVsPyReference` **8/8 PASS**, and `VkVsCudaFirstLoss` **12/12 PASS**.
+
+## Release+Fuchsia Multi-View Benchmark (2026-05-14)
+- Confirmed `profiling_0512`'s 243.4s result came from `build_release/gs3d_vk_train` with Fuchsia default on a cam0-only 5000-step eval_3D/proper_ewa/MCMC workload; rejected replay-order/atomic/GPU-resident experiments were not ported.
+- Created current-worktree `harmonyos_3dgs/build_release` with `CMAKE_BUILD_TYPE=Release` and cached FetchContent dependency sources after an initial GitHub SSL download failure.
+- 5-step Release+Fuchsia smoke loaded 76 cameras, consumed the deterministic view schedule, emitted `[GS3D_STAGE_TIMING]` rows, wrote PLY/render output, and exited 0.
+- Full report: `harmonyos_3dgs/reports/basketball_vk_5000_cap30000_release_fuchsia_20260514_191705/summary.md`; raw artifacts include `vk_train_release_fuchsia.log`, `vk_train_release_fuchsia.time.txt`, `stage_timing.csv`, and `stage_timing_summary.json`.
+- Dominant all-step stages: `backward_gpu_ms` mean **40.906 ms** (**59.6%**), `forward_total_ms` **25.994 ms** (**37.9%**), `raster_ms` **11.095 ms** (**16.2%**), `preprocess_process_ms` **7.272 ms** (**10.6%**), `sort_ms` **3.583 ms** (**5.2%**).
+- 10000-step / `cap_max=200000` stress sample reran with a report-local 10000-entry schedule after the first attempt correctly failed on the old 5000-entry schedule. Clean result: `harmonyos_3dgs/reports/basketball_vk_10000_cap200000_release_fuchsia_20260514_193728/summary.md`, **1049.00s** trainer / **1049.79s** elapsed, **104.900 ms/step**, final loss **0.024686**, final count **200000**. Tail grew sharply: all-step p50 **88.197 ms**, `step >= 9000` p50 **201.740 ms**, final tail p50 **211.811 ms**; late costs are led by backward, forward, raw download, and grad upload.
+
+## High-Count Fuchsia Sort Performance (2026-05-13)
+- Expanded `SorterVulkan`'s opt-in `GS3D_USE_FUCHSIA_SORT=1` route beyond the old project-side `1 << 22` cap, using the vendored Fuchsia library contract of `count < 1 << 30` and persistent buffers sized by Fuchsia memory requirements.
+- Tightened `RadixSortFuchsia` constructor/count/key-bit validation and added high-count wrapper/e2e coverage, including a gated sorter route above the old cap and an explicit 7.5M-pair run.
+- Validation completed: build PASS; targeted `Fuchsia|Sorter|TileRange` PASS with default large test skip; explicit `GS3D_RUN_LARGE_FUCHSIA_TEST=1 GS3D_LARGE_FUCHSIA_R=7500000` route PASS; external review PASS/no blockers; `ctest -N` reports **330 tests**.
+- Performance A/B: Fuchsia high-count log `harmonyos_3dgs/reports/basketball_stage_timing_cam0_5200step_mcmc_fuchsia.log` produced 201 rows for `step 5000..5200`, `N 25914..27209`, `R 6483779..7152290`; total median **437.539 ms** and sort median **166.510 ms**. Report: `harmonyos_3dgs/reports/basketball_stage_timing_step5000plus_N10000plus_fuchsia.md`.
+- Remaining caveat: the Fuchsia path still preserves host-materialized `values_sorted` contracts for rasterizer/backward, so `sort_ms` includes current sorted-keyval host materialization; zero-copy sorted-id consumption remains a future optimization, not required for the 4x goal.
 
 ## Training Replay-Order Sync (2026-05-08)
 - Ported training's exact non-parity `eval_3D` replay sideband: `ForwardCache` owns replay offsets/GIDs, `RasterizerVulkan` materializes replay order with a second forward sideband dispatch, and eval_3D backward uploads/consumes replay order when present.

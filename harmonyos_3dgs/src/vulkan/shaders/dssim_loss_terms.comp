@@ -1,0 +1,113 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Rendered { float rendered[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Target { float target[]; };
+layout(std430, set = 0, binding = 2) buffer DLDpixels { float dL_dpixels[]; };
+layout(std430, set = 0, binding = 3) buffer Partials { float partials[]; };
+layout(std430, set = 0, binding = 4) buffer Alpha { float alpha[]; };
+layout(std430, set = 0, binding = 5) buffer Beta { float beta[]; };
+layout(std430, set = 0, binding = 6) buffer Gamma { float gamma[]; };
+
+layout(push_constant) uniform PC {
+    uint W;
+    uint H;
+    uint num_elements;
+    float lambda_dssim;
+} pc;
+
+const float C1 = 0.0001;
+const float C2 = 0.0009;
+const float K[11] = float[11](
+    0.0010283801,
+    0.0075987581,
+    0.0360007721,
+    0.1093606895,
+    0.2130055377,
+    0.2660117249,
+    0.2130055377,
+    0.1093606895,
+    0.0360007721,
+    0.0075987581,
+    0.0010283801);
+
+shared float local_loss[256];
+
+uint clamp_u(int v, uint hi) {
+    return uint(clamp(v, 0, int(hi)));
+}
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    float partial = 0.0;
+
+    if (gid < pc.num_elements) {
+        uint HW = pc.W * pc.H;
+        uint ch = gid / HW;
+        uint p = gid - ch * HW;
+        uint x = p % pc.W;
+        uint y = p / pc.W;
+        uint base = ch * HW;
+
+        float r0 = rendered[gid];
+        float t0 = target[gid];
+        float d = r0 - t0;
+        float invN = 1.0 / float(pc.num_elements);
+        float w_l1 = 1.0 - pc.lambda_dssim;
+        float w_ssim = pc.lambda_dssim;
+        dL_dpixels[gid] = w_l1 * (d > 0.0 ? invN : (d < 0.0 ? -invN : 0.0));
+
+        float mu1 = 0.0;
+        float mu2 = 0.0;
+        float ex2 = 0.0;
+        float ey2 = 0.0;
+        float exy = 0.0;
+        for (int dy = -5; dy <= 5; ++dy) {
+            uint yy = clamp_u(int(y) + dy, pc.H - 1u);
+            float wy = K[dy + 5];
+            for (int dx = -5; dx <= 5; ++dx) {
+                uint xx = clamp_u(int(x) + dx, pc.W - 1u);
+                float w = wy * K[dx + 5];
+                uint idx = base + yy * pc.W + xx;
+                float r = rendered[idx];
+                float t = target[idx];
+                mu1 += w * r;
+                mu2 += w * t;
+                ex2 += w * r * r;
+                ey2 += w * t * t;
+                exy += w * r * t;
+            }
+        }
+
+        float s1sq = ex2 - mu1 * mu1;
+        float s2sq = ey2 - mu2 * mu2;
+        float s12 = exy - mu1 * mu2;
+        float A = 2.0 * mu1 * mu2 + C1;
+        float B = 2.0 * s12 + C2;
+        float D = mu1 * mu1 + mu2 * mu2 + C1;
+        float E = s1sq + s2sq + C2;
+        float ssim_val = A * B / (D * E);
+        float inv_de = 1.0 / (D * E);
+        beta[gid] = 2.0 * A * inv_de;
+        gamma[gid] = -2.0 * ssim_val / E;
+        alpha[gid] = 2.0 * mu2 * B * inv_de
+                   - 2.0 * ssim_val * mu1 / D
+                   - beta[gid] * mu2
+                   - gamma[gid] * mu1;
+        partial = w_l1 * abs(d) * invN - w_ssim * ssim_val * invN;
+    }
+
+    local_loss[local_id] = partial;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (local_id < stride) {
+            local_loss[local_id] += local_loss[local_id + stride];
+        }
+        barrier();
+    }
+    if (local_id == 0u) {
+        partials[gl_WorkGroupID.x] = local_loss[0];
+    }
+}

@@ -45,6 +45,19 @@ public:
                              const RenderConfig& cfg, FrameAllocator& alloc,
                              ForwardCache* cache = nullptr) override;
 
+    PreprocessOutput process_gpu_inputs(int N,
+                                        int max_coeffs,
+                                        VkBuffer positions,
+                                        VkBuffer scales,
+                                        VkBuffer rotations,
+                                        VkBuffer opacities,
+                                        VkBuffer sh,
+                                        VkBuffer filter_3D,
+                                        const Camera& cam,
+                                        const RenderConfig& cfg,
+                                        FrameAllocator& alloc,
+                                        ForwardCache* cache = nullptr);
+
     // Layer 2: allocate persistent GPU buffers, upload inputs, and bind to
     // the PreprocessPass. Must be called before record(). Buffers live until
     // the next prepare_record() call or destruction. Hard-errors on SP-2
@@ -76,8 +89,9 @@ public:
     VkBuffer cov3D_inv_buffer() const;
     VkBuffer mean_offset_buffer() const;
 
-    // Download the 5 ForwardCache fields populated during process().
+    // Download the CPU ForwardCache fields populated during process().
     // Must be called after process(); throws if process() hasn't run yet.
+    // eval_3D also publishes gauss2screen_gpu, valid until the next process() call or destruction.
     // cache fields cov3D, p_view, p_hom_w, cov2D, cov2D_det are allocated from alloc and filled.
     void download_cache(int num_gaussians, ForwardCache& cache, FrameAllocator& alloc);
 
@@ -95,7 +109,14 @@ private:
     std::unique_ptr<VulkanBuffer> p_hom_w_buf_;
     std::unique_ptr<VulkanBuffer> cov2d_buf_;
     std::unique_ptr<VulkanBuffer> cov2d_det_buf_;
-    // Layer-1 eval_3D output buffers.
+    // Layer-1 output buffers published as producer-owned handles in PreprocessOutput.
+    std::unique_ptr<VulkanBuffer> means2d_buf_;
+    std::unique_ptr<VulkanBuffer> depths_buf_;
+    std::unique_ptr<VulkanBuffer> conic_opacity_packed_buf_;
+    std::unique_ptr<VulkanBuffer> rgb_buf_;
+    std::unique_ptr<VulkanBuffer> radii_buf_;
+    std::unique_ptr<VulkanBuffer> tiles_touched_buf_;
+    std::unique_ptr<VulkanBuffer> radius_f_buf_;
     std::unique_ptr<VulkanBuffer> gauss2screen_buf_;
     std::unique_ptr<VulkanBuffer> cov3d_inv_buf_;
     std::unique_ptr<VulkanBuffer> mean_offset_buf_;

@@ -30,7 +30,7 @@ constexpr uint32_t COV3D_INV    = 20; // WO float[N*6]  inverse 3D covariance up
 constexpr uint32_t MEAN_OFFSET  = 21; // WO float[N*3]  world-space (pos - cam_pos) (eval_3D only)
 }  // namespace preprocess_bind
 
-// Push constants (24 bytes, spec §4.8.1)
+// Push constants (32 bytes, spec §4.8.1 + opt-in perf flag)
 struct PreprocessPushConstants {
     uint32_t num_gaussians;
     uint32_t sh_degree;
@@ -38,9 +38,11 @@ struct PreprocessPushConstants {
     uint32_t num_tiles_x;
     uint32_t num_tiles_y;
     float    scale_modifier;
+    uint32_t compact_eval3D_tiles;
+    uint32_t _pad;
 };
-static_assert(sizeof(PreprocessPushConstants) == 24,
-              "PreprocessPushConstants must be exactly 24 bytes per spec §4.8.1");
+static_assert(sizeof(PreprocessPushConstants) == 32,
+              "PreprocessPushConstants must be exactly 32 bytes");
 
 // Specialization constant IDs (spec §4.5)
 namespace preprocess_spec {
@@ -78,6 +80,7 @@ constexpr uint32_t MEAN_OFFSET  = 9;  // RO float[N*3]  world-space (pos - cam_p
 constexpr uint32_t SCATTER_UBO  = 10; // UB ScatterUBO  (inverse_vp + eval_3D flag)
 constexpr uint32_t GAUSS2SCREEN = 11; // RO float[N*16] gauss2screen row-major (eval_3D sort key)
 constexpr uint32_t CONIC_OPACITY_PACKED = 12; // RO float[N*4]  {a,b,c,opacity} per Gaussian (eval_3D tile culling)
+constexpr uint32_t KEYVALS_UNSORTED = 13; // WO uint64[R] packed keyvals for Fuchsia radix input
 }
 struct ScatterPushConstants {
     uint32_t num_gaussians;
@@ -86,8 +89,10 @@ struct ScatterPushConstants {
     uint32_t tile_w;
     uint32_t tile_h;
     uint32_t eval_3D;   // 1 = use depthAlongRay per-tile, 0 = use view-space z
+    uint32_t compact_eval3D_tiles;
+    uint32_t _pad;
 };
-static_assert(sizeof(ScatterPushConstants) == 24, "ScatterPushConstants must be 24 bytes");
+static_assert(sizeof(ScatterPushConstants) == 32, "ScatterPushConstants must be 32 bytes");
 struct alignas(16) ScatterUBO {
     float inverse_vp[16];   // 64B: inverse viewproj matrix (column-major)
     float cam_pos[4];       // 16B: xyz=cam_pos, w=0
@@ -128,6 +133,20 @@ struct TileRangePushConstants {
     uint32_t _pad1;
 };
 static_assert(sizeof(TileRangePushConstants) == 16, "TileRangePushConstants must be 16 bytes per spec §4.8.6");
+
+namespace packed_keyval_extract_bind {
+constexpr uint32_t KEYVALS_SORTED = 0;
+constexpr uint32_t VALUES_SORTED  = 1;
+constexpr uint32_t TILE_RANGES    = 2;
+}
+struct PackedKeyvalExtractPushConstants {
+    uint32_t num_elements;
+    uint32_t num_tiles;
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+static_assert(sizeof(PackedKeyvalExtractPushConstants) == 16,
+              "PackedKeyvalExtractPushConstants must be 16 bytes");
 
 // --- rasterize.comp bindings (spec §4.8.7) ---
 namespace rasterize_bind {

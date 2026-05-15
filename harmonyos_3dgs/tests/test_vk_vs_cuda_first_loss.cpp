@@ -2039,17 +2039,17 @@ TEST(VkVsCudaFirstLoss, Gate_P5_SortedIds) {
                 hi0 <= UINT32_MAX - ulp_window ? hi0 + ulp_window : UINT32_MAX,
             };
         };
-        auto vk_pos_for = [&](int gid) {
-            const auto it = std::find(vk_ids.begin(), vk_ids.end(), gid);
-            return it == vk_ids.end() ? vk_ids.size() : static_cast<size_t>(it - vk_ids.begin());
-        };
-        for (size_t i = 0; i < cuda_ids.size(); ++i) {
-            if (vk_pos_for(cuda_ids[i]) == vk_ids.size()) return false;
+        std::vector<size_t> vk_pos(static_cast<size_t>(model.data.count), vk_ids.size());
+        for (size_t i = 0; i < vk_ids.size(); ++i) {
+            vk_pos[static_cast<size_t>(vk_ids[i])] = i;
         }
         for (size_t i = 0; i < cuda_ids.size(); ++i) {
-            const size_t vk_i = vk_pos_for(cuda_ids[i]);
+            if (vk_pos[static_cast<size_t>(cuda_ids[i])] == vk_ids.size()) return false;
+        }
+        for (size_t i = 0; i < cuda_ids.size(); ++i) {
+            const size_t vk_i = vk_pos[static_cast<size_t>(cuda_ids[i])];
             for (size_t j = i + 1; j < cuda_ids.size(); ++j) {
-                const size_t vk_j = vk_pos_for(cuda_ids[j]);
+                const size_t vk_j = vk_pos[static_cast<size_t>(cuda_ids[j])];
                 if (vk_i <= vk_j) continue;
                 const DepthWindow a = depth_window_for(cuda_ids[i]);
                 const DepthWindow b = depth_window_for(cuda_ids[j]);
@@ -2387,17 +2387,17 @@ TEST(VkVsCudaFirstLoss, Gate_P6_TFinalNContrib) {
                 hi0 <= UINT32_MAX - ulp_window ? hi0 + ulp_window : UINT32_MAX,
             };
         };
-        auto vk_pos_for = [&](int gid) {
-            const auto it = std::find(vk_ids.begin(), vk_ids.end(), gid);
-            return it == vk_ids.end() ? vk_ids.size() : static_cast<size_t>(it - vk_ids.begin());
-        };
+        std::vector<size_t> vk_pos(static_cast<size_t>(model.data.count), vk_ids.size());
+        for (size_t i = 0; i < vk_ids.size(); ++i) {
+            vk_pos[static_cast<size_t>(vk_ids[i])] = i;
+        }
         for (int gid : cuda_ids) {
-            if (vk_pos_for(gid) == vk_ids.size()) return false;
+            if (vk_pos[static_cast<size_t>(gid)] == vk_ids.size()) return false;
         }
         for (size_t i = 0; i < cuda_ids.size(); ++i) {
-            const size_t vk_i = vk_pos_for(cuda_ids[i]);
+            const size_t vk_i = vk_pos[static_cast<size_t>(cuda_ids[i])];
             for (size_t j = i + 1; j < cuda_ids.size(); ++j) {
-                const size_t vk_j = vk_pos_for(cuda_ids[j]);
+                const size_t vk_j = vk_pos[static_cast<size_t>(cuda_ids[j])];
                 if (vk_i <= vk_j) continue;
                 const auto a = depth_window_for(cuda_ids[i]);
                 const auto b = depth_window_for(cuda_ids[j]);

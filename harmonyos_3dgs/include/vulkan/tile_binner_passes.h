@@ -110,6 +110,7 @@ public:
         VkBuffer scatter_ubo;     // UB ScatterUBO   (binding 10, eval_3D only)
         VkBuffer gauss2screen;    // RO float[N*16]  (binding 11, eval_3D sort key)
         VkBuffer conic_opacity_packed; // RO float[N*4]  (binding 12, eval_3D tile culling: opacity at [i*4+3])
+        VkBuffer keyvals_unsorted; // WO uint64[R]     (binding 13, packed Fuchsia input)
     };
 
     explicit ScatterPass(VulkanContext& ctx);
@@ -126,14 +127,16 @@ public:
     void dispatch_sync(uint32_t num_gaussians,
                        uint32_t num_tiles_x,
                        uint32_t num_tiles_y,
-                       bool eval_3D = false);
+                       bool eval_3D = false,
+                       bool compact_eval3D_tiles = false);
 
     /// Layer 2: record into an external cmd buffer.
     void record(VkCommandBuffer cmd,
                 uint32_t num_gaussians,
                 uint32_t num_tiles_x,
                 uint32_t num_tiles_y,
-                bool eval_3D = false);
+                bool eval_3D = false,
+                bool compact_eval3D_tiles = false);
 
 private:
     VulkanContext& ctx_;

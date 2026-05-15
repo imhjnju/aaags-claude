@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Rendered {
+    float rendered[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer Target {
+    float target[];
+};
+layout(std430, set = 0, binding = 2) writeonly buffer DLDpixels {
+    float dL_dpixels[];
+};
+layout(std430, set = 0, binding = 3) writeonly buffer Partials {
+    float partials[];
+};
+
+layout(push_constant) uniform PC {
+    uint num_elements;
+    float scale;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+shared float local_abs[256];
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    float abs_d = 0.0;
+    if (gid < pc.num_elements) {
+        float d = rendered[gid] - target[gid];
+        abs_d = abs(d);
+        dL_dpixels[gid] = d > 0.0 ? pc.scale : (d < 0.0 ? -pc.scale : 0.0);
+    }
+    local_abs[local_id] = abs_d;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (local_id < stride) {
+            local_abs[local_id] += local_abs[local_id + stride];
+        }
+        barrier();
+    }
+    if (local_id == 0u) {
+        partials[gl_WorkGroupID.x] = local_abs[0] * pc.scale;
+    }
+}

@@ -391,6 +391,13 @@ void main() {
         }
     }
 
+    uint active_coeffs = (ubo.sh_degree + 1u) * (ubo.sh_degree + 1u);
+    for (uint coeff = active_coeffs; coeff < ubo.sh_coeffs_per_g; ++coeff) {
+        uint off = sh_base + coeff * 3u;
+        d_sh[off + 0u] = 0.0;
+        d_sh[off + 1u] = 0.0;
+        d_sh[off + 2u] = 0.0;
+    }
 
     d_means3D[base3 + 0u] = d_pos.x;
     d_means3D[base3 + 1u] = d_pos.y;

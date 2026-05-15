@@ -13,6 +13,10 @@
 #include "vulkan/rasterizer_vulkan.h"
 #include "vulkan/rasterizer_backward_vulkan.h"
 #include "vulkan/preprocessor_backward_vulkan.h"
+#include "vulkan/l1_loss_pass.h"
+#include "vulkan/dssim_loss_pass.h"
+#include "vulkan/sh_grad_split_pass.h"
+#include "vulkan/raw_activation_pass.h"
 
 #include <vector>
 #include <memory>
@@ -65,7 +69,7 @@ public:
     int active_sh_degree() const { return active_sh_degree_; }
 
     // Access current raw parameters (for inspection/checkpointing).
-    const RawGaussianParams& raw_params() const { return raw_view_; }
+    const RawGaussianParams& raw_params() const;
     const std::vector<float>& filter_3D() const { return act_filter_3D_; }
 
 #ifdef GS3D_TESTING
@@ -75,6 +79,14 @@ public:
         const mcmc::DensifySamplePlan& plan);
     const std::vector<float>& filter_3D_for_test() const { return act_filter_3D_; }
     size_t last_replay_order_count_for_test() const { return last_replay_order_count_; }
+    bool last_gpu_l1_used_for_test() const { return last_gpu_l1_used_; }
+    bool last_gpu_dssim_used_for_test() const { return last_gpu_dssim_used_; }
+    bool last_forward_gpu_cache_used_for_test() const { return last_forward_gpu_cache_used_; }
+    bool last_forward_gpu_resident_outputs_for_test() const { return last_forward_gpu_resident_outputs_; }
+    bool last_forward_cpu_image_downloaded_for_test() const { return last_forward_cpu_image_downloaded_; }
+    bool last_forward_cpu_cache_downloaded_for_test() const { return last_forward_cpu_cache_downloaded_; }
+    bool last_gpu_grad_adam_used_for_test() const { return last_gpu_grad_adam_used_; }
+    bool last_gpu_raw_activation_used_for_test() const { return last_gpu_raw_activation_used_; }
 #endif
 
     void download_adam_moments(int group_idx,
@@ -85,7 +97,10 @@ public:
 
     // Access the last rendered image (CHW [3*H*W] float in [0,1]).
     // Valid after the first call to step(). Size is cam_height * cam_width * 3.
-    const float* rendered_image() const { return image_.data(); }
+    const float* rendered_image() const {
+        ensure_rendered_image_downloaded();
+        return image_.data();
+    }
     int rendered_image_size() const { return static_cast<int>(image_.size()); }
 
     // Reset params and zero Adam state for oracle per-step testing.
@@ -142,6 +157,9 @@ public:
 
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
+    void activate_params_gpu();
+    void materialize_raw_params() const;
+    bool can_use_gpu_raw_activation() const;
     // Re-allocate GPU buffers after Gaussian count changes.
     void reallocate_for_n(int new_N, int old_N = -1);
 
@@ -162,6 +180,9 @@ private:
                                PreprocessOutput& out_pre,
                                BinningOutput& out_bin,
                                ForwardCache& out_cache);
+    float run_gpu_l1_loss(const float* target, int W, int H, ForwardCache& out_cache);
+    float run_gpu_dssim_loss(const float* target, int W, int H, ForwardCache& out_cache);
+    void ensure_rendered_image_downloaded() const;
     // Inject covariance-scaled Gaussian noise into positions of near-dead Gaussians.
     // Called after GPU Adam download. Matches train.py:141-148.
     void inject_position_noise(float pos_lr);
@@ -173,14 +194,15 @@ private:
     // Raw parameters — GPU Adam updates these in-place (via GPU bufs), then
     // downloads back to CPU for activation.
     // Stored as vectors so they own the memory.
-    std::vector<float> raw_positions_;    // [N*3]
-    std::vector<float> raw_scales_;       // [N*3]
-    std::vector<float> raw_rotations_;   // [N*4]
-    std::vector<float> raw_sh_coeffs_;   // [N*max_coeffs*3]
-    std::vector<float> raw_opacities_;   // [N]
+    mutable std::vector<float> raw_positions_;    // [N*3]
+    mutable std::vector<float> raw_scales_;       // [N*3]
+    mutable std::vector<float> raw_rotations_;   // [N*4]
+    mutable std::vector<float> raw_sh_coeffs_;   // [N*max_coeffs*3]
+    mutable std::vector<float> raw_opacities_;   // [N]
 
     // Non-owning view into the above vectors.
-    RawGaussianParams raw_view_;
+    mutable RawGaussianParams raw_view_;
+    mutable bool raw_cpu_dirty_ = false;
 
     // Activated parameters (rebuilt each step from raw_).
     std::vector<float> act_positions_;   // [N*3]   (= raw, no activation)
@@ -192,11 +214,49 @@ private:
     GaussianData       g_;               // non-owning view into act_* buffers
 
     // Per-frame output buffers.
-    std::vector<float> image_;           // [H*W*3]
+    mutable std::vector<float> image_;  // [H*W*3]
     std::vector<float> dL_dpixels_;     // [H*W*3]
+    uint32_t image_W_ = 0;
+    uint32_t image_H_ = 0;
+    mutable bool image_gpu_pending_download_ = false;
+    std::unique_ptr<VulkanBuffer> gpu_l1_target_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_l1_dlpix_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_l1_partials_buf_;
+    std::vector<float> gpu_l1_partials_;
+    size_t gpu_l1_elements_capacity_ = 0;
+    size_t gpu_l1_partials_capacity_ = 0;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_target_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_dlpix_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_partials_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_alpha_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_beta_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_gamma_buf_;
+    std::vector<float> gpu_dssim_partials_;
+    size_t gpu_dssim_elements_capacity_ = 0;
+    size_t gpu_dssim_partials_capacity_ = 0;
+    bool gpu_l1_fast_path_allowed_ = false;
+    bool forward_gpu_cache_allowed_ = false;
+    bool last_gpu_l1_used_ = false;
+    bool last_gpu_dssim_used_ = false;
+    bool last_forward_gpu_cache_used_ = false;
+    bool last_forward_gpu_resident_outputs_ = false;
+    bool last_forward_cpu_image_downloaded_ = false;
+    bool last_forward_cpu_cache_downloaded_ = false;
+    bool last_gpu_grad_adam_used_ = false;
+    bool last_gpu_raw_activation_used_ = false;
 
     FrameAllocator alloc_;
     float          last_loss_ = 0.0f;
+
+    bool           stage_timing_header_printed_ = false;
+    double         stage_timing_arena_activate_ms_ = 0.0;
+    double         stage_timing_preprocess_process_ms_ = 0.0;
+    double         stage_timing_preprocess_cache_refresh_ms_ = 0.0;
+    double         stage_timing_bin_ms_ = 0.0;
+    double         stage_timing_sort_ms_ = 0.0;
+    double         stage_timing_raster_ms_ = 0.0;
+    double         stage_timing_capture_ms_ = 0.0;
+    double         stage_timing_loss_ms_ = 0.0;
 
     // GPU Adam optimizer (one pipeline shared across 6 groups).
     VulkanAdam vulkan_adam_;
@@ -217,6 +277,12 @@ private:
     std::unique_ptr<VulkanBuffer> grad_opacities_gpu_;   // [N]
     std::unique_ptr<VulkanBuffer> grad_scales_gpu_;      // [N*3]
     std::unique_ptr<VulkanBuffer> grad_rotations_gpu_;   // [N*4]
+
+    std::unique_ptr<VulkanBuffer> active_scales_gpu_;
+    std::unique_ptr<VulkanBuffer> active_rotations_gpu_;
+    std::unique_ptr<VulkanBuffer> active_opacities_gpu_;
+    std::unique_ptr<VulkanBuffer> active_sh_gpu_;
+    std::unique_ptr<VulkanBuffer> filter_3D_gpu_;
 
     // Per-Gaussian accumulated gradient norm of means2D (proxy: |d_raw_positions|).
     // Size N_, reset to zeros after each densification step.
@@ -293,4 +359,8 @@ private:
     RasterizerVulkan          rasterizer_;
     RasterizerBackwardVulkan  rasterizer_bwd_;
     PreprocessorBackwardVulkan preprocessor_bwd_;
+    L1LossPass                l1_loss_pass_;
+    std::unique_ptr<DssimLossPass> dssim_loss_pass_;
+    ShGradSplitPass           sh_grad_split_pass_;
+    RawActivationPass         raw_activation_pass_;
 };

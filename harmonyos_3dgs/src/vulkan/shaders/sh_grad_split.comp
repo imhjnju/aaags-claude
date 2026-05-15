@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Interleaved {
+    float d_sh[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer DC {
+    float d_sh_dc[];
+};
+layout(std430, set = 0, binding = 2) writeonly buffer Rest {
+    float d_sh_rest[];
+};
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint K;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.N) return;
+
+    uint src_base = gid * pc.K * 3u;
+    uint dc_base = gid * 3u;
+    d_sh_dc[dc_base + 0u] = d_sh[src_base + 0u];
+    d_sh_dc[dc_base + 1u] = d_sh[src_base + 1u];
+    d_sh_dc[dc_base + 2u] = d_sh[src_base + 2u];
+
+    if (pc.K <= 1u) return;
+    uint rest_stride = (pc.K - 1u) * 3u;
+    uint rest_base = gid * rest_stride;
+    for (uint k = 1u; k < pc.K; ++k) {
+        uint src = src_base + k * 3u;
+        uint dst = rest_base + (k - 1u) * 3u;
+        d_sh_rest[dst + 0u] = d_sh[src + 0u];
+        d_sh_rest[dst + 1u] = d_sh[src + 1u];
+        d_sh_rest[dst + 2u] = d_sh[src + 2u];
+    }
+}

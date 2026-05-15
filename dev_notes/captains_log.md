@@ -1,5 +1,33 @@
 # Captain's Log
 
+## Session 22 — 2026-05-15 — Raw/grad transfer elimination fast path
+
+Implemented the opt-in GPU raw-activation path for Vulkan training. With `GS3D_TRAIN_GPU_RAW_ACTIVATE=1` and the existing `GS3D_TRAIN_GPU_GRAD_ADAM=1`, raw parameters stay GPU-authoritative across non-densification/non-opacity-reset steps: `raw_activation.comp` activates scales, rotations, opacities, and SH into GPU buffers, `VulkanTrainer::run_forward_and_loss()` feeds those buffers into preprocess, and post-Adam raw CPU materialization is skipped unless a CPU-side boundary needs it.
+
+Fixed the correctness bug found by the two-step regression: the non-eval3D `PreprocessorBackwardVulkan::backward_record_into()` path now honors `PreprocessBackwardGpuInputs` for positions/radii/SH/scales/rotations/opacities/raw rotations instead of uploading stale CPU `g_`/`raw_view_` buffers. Before that fix, the GPU raw-activation path could produce second-step loss drift and NaNs when `raw_params()` materialized the poisoned raw buffers.
+
+Validation after a clean Release rebuild: `VulkanTrainer.GpuGradientAdamMatchesCpuGradientUploadStep` and `VulkanTrainer.GpuRawActivationMatchesCpuActivationAfterTwoSteps` **2/2 PASS**, `VkVsPyReference` **8/8 PASS**, and `VkVsCudaFirstLoss` **12/12 PASS**. The transient `Gate_I3_RawParams` double-free was diagnosed with Valgrind as stale-object ABI fallout after adding the `RawActivationPass` member; clean rebuild cleared it. High-N post-clean smoke at `harmonyos_3dgs/reports/gpu_raw_activate_highN_smoke_20260515_postclean` exited 0 with 20 stage rows and `backward_download_ms`, `grad_upload_ms`, `raw_download_ms` all **0.000 ms** mean/p50/max; total mean **117.513 ms** and p50 **116.998 ms**.
+
+External review found no blocker in the raw-activation/backward path. Remaining caution: the existing CMake `spirv-opt -O` hook optimizes all shaders when available, not only the new raw activation shader, so it should remain tracked as a broader build-determinism/perf variable rather than being attributed solely to this fast path.
+
+## Session 21 — 2026-05-14 — Release+Fuchsia multi-view benchmark hygiene
+
+Confirmed the earlier **243.4s / 20.5 it/s** record from `profiling_0512` was real Vulkan training, not CTest, but it was a cam0-only Release+Fuchsia run. The accepted optimization there was benchmark/build hygiene: `build_release/gs3d_vk_train` with `CMAKE_BUILD_TYPE=Release` and `GS3D_USE_FUCHSIA_SORT=1`; nearby replay-order, workgroup-atomic, and GPU-resident replay experiments were recorded as rejected and were not ported.
+
+Applied that accepted scope to the current 76-view basketball GT benchmark without copying old `profiling_0512` source. Created `harmonyos_3dgs/build_release` using cached FetchContent dependencies after the first configure hit a GitHub SSL download failure. A 5-step Release+Fuchsia multi-view smoke loaded all 76 cameras, used the deterministic schedule, emitted stage rows, wrote outputs, and exited cleanly.
+
+The full 5000-step multi-view Release+Fuchsia run completed cleanly at `harmonyos_3dgs/reports/basketball_vk_5000_cap30000_release_fuchsia_20260514_191705`: **343.70s** trainer time / **344.41s** elapsed, **68.740 ms/step**, 5000 stage rows, final loss **0.032813**, final count **24680**. This is **1.29x** faster than the prior current-worktree 76-view trainer baseline (**444.20s**) and **1.30x** faster than its elapsed time (**448.58s**). The cam0-only 243.4s reference remains context only, not apples-to-apples.
+
+Ran the requested 10000-step / `cap_max=200000` stress sample with the same Release+Fuchsia 76-view scope. The first attempt failed fast because the old schedule had only 5000 entries; the rerun generated a report-local 10000-entry seed-42 schedule and completed cleanly at `harmonyos_3dgs/reports/basketball_vk_10000_cap200000_release_fuchsia_20260514_193728`: **1049.00s** trainer / **1049.79s** elapsed, **104.900 ms/step**, 10000 stage rows, final loss **0.024686**, final count **200000**. Tail cost increased substantially after growth: all-step p50 **88.197 ms**, `step >= 9000` p50 **201.740 ms**, final-tail p50 **211.811 ms**.
+
+## Session 20 — 2026-05-13 — Fuchsia high-count sort reaches 4x basketball target
+
+Expanded the opt-in Fuchsia GPU radix-sort route for high-count basketball training. `SorterVulkan` no longer rejects counts above the old project cap of `1 << 22`; it grows the Fuchsia wrapper and persistent buffers by required capacity while preserving the existing host-materialized `values_sorted`/`tile_ranges` contract. `RadixSortFuchsia` now enforces constructor/count/key-bit limits against the vendored library's `count < 1 << 30` contract.
+
+Added high-count Fuchsia coverage: wrapper memory requirements now include `(1 << 22) + 1` and 7.5M keyvals, invalid max/count/key-bit paths throw, and the e2e sorter route has an explicit large-test gate with configurable `GS3D_LARGE_FUCHSIA_R`. Validation completed for this change: build PASS; targeted `Fuchsia|Sorter|TileRange` PASS; explicit 7.5M large route PASS; external review PASS/no blockers; CTest discovery reports **330 tests**. Full CTest was not claimed because the long CUDA first-loss gates were not rerun to completion after the change.
+
+The high-count basketball A/B with `GS3D_TRAIN_STAGE_TIMING=1 GS3D_USE_FUCHSIA_SORT=1` produced 201 rows for `step >= 5000 && N >= 10000` (`N 25914..27209`, `R 6483779..7152290`). Median total time improved from **1974.840 ms/step** to **437.539 ms/step** (**4.51x**), passing the requested 4x target; median sort time improved from **1610.384 ms** to **166.510 ms** (**9.67x**). The report is `harmonyos_3dgs/reports/basketball_stage_timing_step5000plus_N10000plus_fuchsia.md`.
+
 ## Session 19 — 2026-05-08 — Training-priority eval_3D replay-order sync
 
 Ported the remaining training replay-order sideband into the merge worktree after the priority decision that training should win over trace binding preservation. Forward replay-order now owns rasterize bindings 14/15; cascade trace shifted to 16..32 and remained functional. Specialization IDs stayed compatible with the merge contract: `EVAL_3D=0`, `TRACE_ENABLED=1`, `SORT_MODE=2`, `EVAL3D_RAW_REPLAY=3`.

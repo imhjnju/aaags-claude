@@ -28,16 +28,26 @@
 
 #include "vulkan/rasterizer_vulkan.h"
 #include "vulkan/vk_buffer.h"
+#include "vulkan/vk_pipeline.h"
 #include "vulkan/preprocess_bindings.h"   // RasterEval3DUBO
 #include "math_utils.h"                   // invertMatrix4x4
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+bool replay_gpu_only_enabled() {
+    const char* env = std::getenv("GS3D_EVAL3D_REPLAY_GPU_ONLY");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+}
+
+}
 
 RasterizerVulkan::RasterizerVulkan(VulkanContext& ctx,
                                    bool eval_3D,
@@ -93,6 +103,11 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
 
     const int R = binning.total_pairs;
     const int HW = H * W;
+    const bool has_values_gpu = binning.values_sorted_gpu != nullptr;
+#ifdef GS3D_TESTING
+    last_layer1_image_downloaded_ = false;
+    last_layer1_cache_downloaded_ = false;
+#endif
 
     // -------------------------------------------------------------------
     // Empty-scene fast path.
@@ -100,7 +115,7 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // rasterize.comp's final contribution for every pixel is T*bg_color.
     // With no Gaussians to blend, T stays at 1 and the whole image is
     // bg_color. We short-circuit on the host to avoid a GPU round-trip.
-    if (R <= 0 || binning.values_sorted == nullptr) {
+    if (R <= 0 || (binning.values_sorted == nullptr && !has_values_gpu)) {
         for (int ch = 0; ch < 3; ++ch) {
             const float bg = config.bg_color[ch];
             float* plane = output_image + static_cast<std::size_t>(ch) * HW;
@@ -120,6 +135,13 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
             cache->replay_order_offsets = nullptr;
             cache->replay_order_gids = nullptr;
             cache->replay_order_count = 0u;
+            cache->replay_order_offsets_gpu = nullptr;
+            cache->replay_order_gids_gpu = nullptr;
+            cache->rendered_image_gpu = nullptr;
+            cache->T_final_gpu = nullptr;
+            cache->n_contrib_gpu = nullptr;
+            cache->dL_dpixels_gpu = nullptr;
+            cache->gpu_resident_outputs = false;
         }
         return;
     }
@@ -128,30 +150,43 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // Compute N_eff: 1 + max index referenced in values_sorted.
     // -------------------------------------------------------------------
     // The shader only reads per-Gaussian data at indices appearing in
-    // values_sorted, so we only need to upload up to max_gid+1. This keeps
-    // uploads tight on sparse scenes.
-    uint32_t max_gid = 0u;
-    for (int i = 0; i < R; ++i) {
-        const uint32_t g = binning.values_sorted[i];
-        if (g > max_gid) max_gid = g;
+    // values_sorted, so host values keep uploads tight on sparse scenes. The
+    // GPU-resident sort path cannot scan on the host, so it uploads all current
+    // preprocess outputs instead.
+    uint32_t N_eff = 0u;
+    if (binning.values_sorted != nullptr) {
+        uint32_t max_gid = 0u;
+        for (int i = 0; i < R; ++i) {
+            const uint32_t g = binning.values_sorted[i];
+            if (g > max_gid) max_gid = g;
+        }
+        N_eff = max_gid + 1u;
+    } else {
+        if (preprocess.num_gaussians <= 0) {
+            throw std::runtime_error("RasterizerVulkan::rasterize: GPU values_sorted requires preprocess.num_gaussians");
+        }
+        N_eff = static_cast<uint32_t>(preprocess.num_gaussians);
     }
-    const uint32_t N_eff = max_gid + 1u;
 
-    // -------------------------------------------------------------------
-    // Repack per-Gaussian conics (Nx3) + opacities_2d (Nx1) → packed (Nx4).
-    // -------------------------------------------------------------------
-    // PreprocessOutput stores these separately (conics[N*3] = {a,b,c},
-    // opacities_2d[N]). rasterize.comp reads them as one interleaved buffer
-    // conic_opacity[N*4] = {a, b, c, opacity}. Matches the layout produced by
-    // preprocess.comp (binding CONIC_OPACITY_PACKED).
-    std::vector<float> conic_opacity_packed(static_cast<std::size_t>(N_eff) * 4u);
-    for (uint32_t i = 0; i < N_eff; ++i) {
-        const std::size_t dst = static_cast<std::size_t>(i) * 4u;
-        const std::size_t src = static_cast<std::size_t>(i) * 3u;
-        conic_opacity_packed[dst + 0] = preprocess.conics[src + 0];
-        conic_opacity_packed[dst + 1] = preprocess.conics[src + 1];
-        conic_opacity_packed[dst + 2] = preprocess.conics[src + 2];
-        conic_opacity_packed[dst + 3] = preprocess.opacities_2d[i];
+    const bool has_means2D_gpu = preprocess.means2D_gpu != nullptr;
+    const bool has_conic_opacity_gpu = preprocess.conic_opacity_packed_gpu != nullptr;
+    const bool has_rgb_gpu = preprocess.rgb_gpu != nullptr;
+    const bool has_gauss2screen_gpu = preprocess.gauss2screen_gpu != nullptr
+        || (cache && cache->gauss2screen_gpu != nullptr);
+    const bool has_cov3D_inv_gpu = preprocess.cov3D_inv_gpu != nullptr;
+    const bool has_mean_offset_gpu = preprocess.mean_offset_gpu != nullptr;
+
+    std::vector<float> conic_opacity_packed;
+    if (!has_conic_opacity_gpu) {
+        conic_opacity_packed.resize(static_cast<std::size_t>(N_eff) * 4u);
+        for (uint32_t i = 0; i < N_eff; ++i) {
+            const std::size_t dst = static_cast<std::size_t>(i) * 4u;
+            const std::size_t src = static_cast<std::size_t>(i) * 3u;
+            conic_opacity_packed[dst + 0] = preprocess.conics[src + 0];
+            conic_opacity_packed[dst + 1] = preprocess.conics[src + 1];
+            conic_opacity_packed[dst + 2] = preprocess.conics[src + 2];
+            conic_opacity_packed[dst + 3] = preprocess.opacities_2d[i];
+        }
     }
 
     // -------------------------------------------------------------------
@@ -174,16 +209,31 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     const VkDeviceSize bytes_ncontrib =
         static_cast<VkDeviceSize>(HW) * sizeof(uint32_t);
 
-    auto vs_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_vs,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto tr_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tr,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto m2d_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_m2d,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto co_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_co,       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto rgb_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_rgb,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<VulkanBuffer> vs_buf;
+    std::unique_ptr<VulkanBuffer> tr_buf;
+    std::unique_ptr<VulkanBuffer> m2d_buf;
+    std::unique_ptr<VulkanBuffer> co_buf;
+    std::unique_ptr<VulkanBuffer> rgb_buf;
+    if (!has_values_gpu) {
+        vs_buf = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_vs, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    if (binning.tile_ranges_gpu == nullptr) {
+        tr_buf = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_tr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    if (!has_means2D_gpu) {
+        m2d_buf = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_m2d, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    if (!has_conic_opacity_gpu) {
+        co_buf = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_co, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    if (!has_rgb_gpu) {
+        rgb_buf = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_rgb, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
     auto img_buf = std::make_unique<VulkanBuffer>(
         ctx_, bytes_img,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     auto t_buf   = std::make_unique<VulkanBuffer>(
@@ -197,18 +247,26 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // -------------------------------------------------------------------
     // Upload inputs.
     // -------------------------------------------------------------------
-    vs_buf ->upload(binning.values_sorted,
-                    static_cast<std::size_t>(bytes_vs));
+    if (!has_values_gpu) {
+        vs_buf->upload(binning.values_sorted,
+                       static_cast<std::size_t>(bytes_vs));
+    }
     if (binning.tile_ranges_gpu == nullptr) {
         tr_buf->upload(binning.tile_ranges,
                        static_cast<std::size_t>(bytes_tr));
     }
-    m2d_buf->upload(preprocess.means2D,
-                    static_cast<std::size_t>(bytes_m2d));
-    co_buf ->upload(conic_opacity_packed.data(),
-                    static_cast<std::size_t>(bytes_co));
-    rgb_buf->upload(preprocess.rgb,
-                    static_cast<std::size_t>(bytes_rgb));
+    if (!has_means2D_gpu) {
+        m2d_buf->upload(preprocess.means2D,
+                        static_cast<std::size_t>(bytes_m2d));
+    }
+    if (!has_conic_opacity_gpu) {
+        co_buf->upload(conic_opacity_packed.data(),
+                       static_cast<std::size_t>(bytes_co));
+    }
+    if (!has_rgb_gpu) {
+        rgb_buf->upload(preprocess.rgb,
+                        static_cast<std::size_t>(bytes_rgb));
+    }
 
     RasterizeUBO ubo{};
     ubo.bg_r = config.bg_color[0];
@@ -217,41 +275,36 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     ubo_buf->upload(&ubo, sizeof(ubo));
 
     // -------------------------------------------------------------------
-    // eval_3D rasterize buffers (gauss2screen, opacities_2d, cov3D_inv,
-    // mean_offset, RasterEval3DUBO).
+    // eval_3D rasterize buffers (gauss2screen, cov3D_inv, mean_offset,
+    // RasterEval3DUBO). Opacity is read from conic_opacity_packed slot 3.
     // -------------------------------------------------------------------
-    std::unique_ptr<VulkanBuffer> g2s_buf, opa2d_buf, r_cov3d_buf, r_mo_buf;
+    std::unique_ptr<VulkanBuffer> g2s_buf, r_cov3d_buf, r_mo_buf;
     std::unique_ptr<VulkanBuffer> eval3d_ubo_buf;
-    std::unique_ptr<VulkanBuffer> dummy4_buf;
+    auto dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    if (eval_3D_ && preprocess.gauss2screen && preprocess.opacities_2d) {
-        g2s_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 16u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        g2s_buf->upload(preprocess.gauss2screen,
-            static_cast<std::size_t>(N_eff) * 16u * sizeof(float));
-        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        opa2d_buf->upload(preprocess.opacities_2d,
-            static_cast<std::size_t>(N_eff) * sizeof(float));
-        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 6u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_cov3d_buf->upload(preprocess.cov3D_inv,
-            static_cast<std::size_t>(N_eff) * 6u * sizeof(float));
-        r_mo_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_mo_buf->upload(preprocess.mean_offset,
-            static_cast<std::size_t>(N_eff) * 3u * sizeof(float));
-    } else {
-        dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        g2s_buf   = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        opa2d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        r_mo_buf  = std::make_unique<VulkanBuffer>(ctx_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (eval_3D_) {
+        if (!has_gauss2screen_gpu) {
+            g2s_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_eff) * 16u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            g2s_buf->upload(preprocess.gauss2screen,
+                static_cast<std::size_t>(N_eff) * 16u * sizeof(float));
+        }
+        if (!has_cov3D_inv_gpu) {
+            r_cov3d_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_eff) * 6u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            r_cov3d_buf->upload(preprocess.cov3D_inv,
+                static_cast<std::size_t>(N_eff) * 6u * sizeof(float));
+        }
+        if (!has_mean_offset_gpu) {
+            r_mo_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N_eff) * 3u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            r_mo_buf->upload(preprocess.mean_offset,
+                static_cast<std::size_t>(N_eff) * 3u * sizeof(float));
+        }
     }
     // Build RasterEval3DUBO.
     RasterEval3DUBO eubo{};
@@ -280,21 +333,35 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // Bind and dispatch.
     // -------------------------------------------------------------------
     RasterizePass::Buffers rb{};
-    rb.values_sorted        = vs_buf ->handle();
+    rb.values_sorted        = has_values_gpu
+        ? static_cast<VkBuffer>(binning.values_sorted_gpu)
+        : vs_buf->handle();
     rb.tile_ranges          = binning.tile_ranges_gpu
         ? static_cast<VkBuffer>(binning.tile_ranges_gpu)
         : tr_buf->handle();
-    rb.means2D              = m2d_buf->handle();
-    rb.conic_opacity_packed = co_buf ->handle();
-    rb.rgb                  = rgb_buf->handle();
+    rb.means2D              = has_means2D_gpu
+        ? static_cast<VkBuffer>(preprocess.means2D_gpu)
+        : m2d_buf->handle();
+    rb.conic_opacity_packed = has_conic_opacity_gpu
+        ? static_cast<VkBuffer>(preprocess.conic_opacity_packed_gpu)
+        : co_buf->handle();
+    rb.rgb                  = has_rgb_gpu
+        ? static_cast<VkBuffer>(preprocess.rgb_gpu)
+        : rgb_buf->handle();
     rb.out_image            = img_buf->handle();
     rb.transmittance        = t_buf  ->handle();
     rb.n_contrib            = nc_buf ->handle();
     rb.raster_ubo           = ubo_buf->handle();
-    rb.gauss2screen         = g2s_buf->handle();
-    rb.opacities_2d         = opa2d_buf->handle();
-    rb.cov3D_inv            = r_cov3d_buf->handle();
-    rb.mean_offset          = r_mo_buf->handle();
+    rb.gauss2screen         = has_gauss2screen_gpu
+        ? static_cast<VkBuffer>(preprocess.gauss2screen_gpu ? preprocess.gauss2screen_gpu : cache->gauss2screen_gpu)
+        : (g2s_buf ? g2s_buf->handle() : dummy4_buf->handle());
+    rb.opacities_2d         = dummy4_buf->handle();
+    rb.cov3D_inv            = has_cov3D_inv_gpu
+        ? static_cast<VkBuffer>(preprocess.cov3D_inv_gpu)
+        : (r_cov3d_buf ? r_cov3d_buf->handle() : dummy4_buf->handle());
+    rb.mean_offset          = has_mean_offset_gpu
+        ? static_cast<VkBuffer>(preprocess.mean_offset_gpu)
+        : (r_mo_buf ? r_mo_buf->handle() : dummy4_buf->handle());
     rb.raster_eval3d_ubo    = eval3d_ubo_buf->handle();
     rb.replay_order_offsets = replay_offsets_buf->handle();
     rb.replay_order_gids    = replay_gids_buf->handle();
@@ -304,21 +371,51 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
                          num_tiles_x, num_tiles_y);
 
     // -------------------------------------------------------------------
-    // Download outputs.
+    // Download outputs unless the caller explicitly keeps them GPU-resident.
     // -------------------------------------------------------------------
-    img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+#ifdef GS3D_TESTING
+    last_layer1_image_downloaded_ = false;
+    last_layer1_cache_downloaded_ = false;
+#endif
+    r_W_ = static_cast<uint32_t>(W);
+    r_H_ = static_cast<uint32_t>(H);
+    const bool gpu_resident_outputs = cache && cache->gpu_resident_outputs;
+    const bool retain_gpu_outputs = cache && (cache->gpu_resident_outputs || cache->retain_gpu_outputs);
+    if (!gpu_resident_outputs) {
+        img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
+#ifdef GS3D_TESTING
+        last_layer1_image_downloaded_ = true;
+#endif
+    }
 
     if (cache) {
-        if (cache->T_final) {
+        cache->rendered_image_gpu = retain_gpu_outputs ? img_buf->handle() : nullptr;
+        cache->T_final_gpu = retain_gpu_outputs ? t_buf->handle() : nullptr;
+        cache->n_contrib_gpu = retain_gpu_outputs ? nc_buf->handle() : nullptr;
+        cache->dL_dpixels_gpu = nullptr;
+
+        if (cache->T_final && !gpu_resident_outputs) {
             t_buf->download(cache->T_final,
                             static_cast<std::size_t>(bytes_tfinal));
+#ifdef GS3D_TESTING
+            last_layer1_cache_downloaded_ = true;
+#endif
         }
-        if (cache->n_contrib) {
+        constexpr uint32_t kReplayScanMaxElements = 256u * 256u * 256u;
+        const bool use_gpu_replay_offsets = eval_3D_ && !eval3d_raw_replay_
+            && gpu_resident_outputs && replay_gpu_only_enabled()
+            && HW > 0u && HW <= kReplayScanMaxElements;
+        const bool need_cpu_n_contrib = !gpu_resident_outputs
+            || (eval_3D_ && !eval3d_raw_replay_ && !use_gpu_replay_offsets);
+        if (cache->n_contrib && need_cpu_n_contrib) {
             // ForwardCache::n_contrib is int*; the shader writes uint32 of the
             // same width so a raw copy is correct — no sign-reinterp happens
             // because counts fit well under 2^31.
             nc_buf->download(cache->n_contrib,
                              static_cast<std::size_t>(bytes_ncontrib));
+#ifdef GS3D_TESTING
+            last_layer1_cache_downloaded_ = true;
+#endif
         }
 
         cache->replay_order_offsets_storage.clear();
@@ -326,54 +423,141 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         cache->replay_order_offsets = nullptr;
         cache->replay_order_gids = nullptr;
         cache->replay_order_count = 0u;
+        cache->replay_order_offsets_gpu = nullptr;
+        cache->replay_order_gids_gpu = nullptr;
 
-        if (eval_3D_ && !eval3d_raw_replay_ && cache->n_contrib) {
+        if (eval_3D_ && !eval3d_raw_replay_ && (cache->n_contrib || use_gpu_replay_offsets)) {
             const size_t HW_size = static_cast<size_t>(HW);
-            cache->replay_order_offsets_storage.assign(HW_size + 1u, 0u);
-            cache->replay_order_offsets = cache->replay_order_offsets_storage.data();
-
-            uint64_t total_replay = 0u;
-            for (size_t px = 0; px < HW_size; ++px) {
-                const int n_px = cache->n_contrib[px];
-                if (n_px < 0) {
-                    throw std::runtime_error("RasterizerVulkan::rasterize: negative n_contrib");
+            if (use_gpu_replay_offsets) {
+                const uint32_t num_wg1 = (HW + 255u) / 256u;
+                const uint32_t num_wg2 = (num_wg1 + 255u) / 256u;
+                if (!replay_scan_pass_) {
+                    replay_scan_pass_ = std::make_unique<PrefixScanPass>(ctx_);
                 }
-                total_replay += static_cast<uint32_t>(n_px);
+                if (replay_offsets_gpu_capacity_ < HW_size + 1u) {
+                    replay_offsets_gpu_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                        static_cast<VkDeviceSize>(HW_size + 1u) * sizeof(uint32_t),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    replay_offsets_gpu_capacity_ = HW_size + 1u;
+                }
+                if (replay_scan_wg_capacity_ < num_wg1) {
+                    replay_scan_wg_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                        static_cast<VkDeviceSize>(num_wg1) * sizeof(uint32_t),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    replay_scan_wg_capacity_ = num_wg1;
+                }
+                if (replay_scan_wg2_capacity_ < num_wg2) {
+                    replay_scan_wg2_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                        static_cast<VkDeviceSize>(num_wg2) * sizeof(uint32_t),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    replay_scan_wg2_capacity_ = num_wg2;
+                }
+                replay_scan_pass_->bind_buffers_2level(nc_buf->handle(),
+                                                       replay_offsets_gpu_buf_->handle(),
+                                                       replay_scan_wg_buf_->handle(),
+                                                       replay_scan_wg2_buf_->handle());
+
+                VkCommandBuffer scan_cmd = ctx_.allocatePrimary();
+                VkCommandBufferBeginInfo bi{};
+                bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                VK_CHECK(vkBeginCommandBuffer(scan_cmd, &bi));
+                insert_compute_barrier(scan_cmd);
+                replay_scan_pass_->record(scan_cmd, HW);
+                VK_CHECK(vkEndCommandBuffer(scan_cmd));
+                ctx_.submitAndWait(scan_cmd);
+                ctx_.freePrimary(scan_cmd);
+
+                uint32_t last_offset = 0u;
+                uint32_t last_count = 0u;
+                replay_offsets_gpu_buf_->download(&last_offset,
+                    sizeof(uint32_t),
+                    static_cast<VkDeviceSize>(HW_size - 1u) * sizeof(uint32_t));
+                nc_buf->download(&last_count,
+                    sizeof(uint32_t),
+                    static_cast<VkDeviceSize>(HW_size - 1u) * sizeof(uint32_t));
+                const uint64_t total_replay = static_cast<uint64_t>(last_offset) + last_count;
                 if (total_replay > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
                     throw std::runtime_error("RasterizerVulkan::rasterize: eval_3D replay order exceeds uint32 capacity");
                 }
-                cache->replay_order_offsets[px + 1u] = static_cast<uint32_t>(total_replay);
+                cache->replay_order_count = static_cast<size_t>(total_replay);
+                const uint32_t total_replay_u32 = static_cast<uint32_t>(total_replay);
+                replay_offsets_gpu_buf_->upload(&total_replay_u32,
+                    sizeof(uint32_t),
+                    static_cast<VkDeviceSize>(HW_size) * sizeof(uint32_t));
+            } else {
+                cache->replay_order_offsets_storage.assign(HW_size + 1u, 0u);
+                cache->replay_order_offsets = cache->replay_order_offsets_storage.data();
+
+                uint64_t total_replay = 0u;
+                for (size_t px = 0; px < HW_size; ++px) {
+                    const int n_px = cache->n_contrib[px];
+                    if (n_px < 0) {
+                        throw std::runtime_error("RasterizerVulkan::rasterize: negative n_contrib");
+                    }
+                    total_replay += static_cast<uint32_t>(n_px);
+                    if (total_replay > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                        throw std::runtime_error("RasterizerVulkan::rasterize: eval_3D replay order exceeds uint32 capacity");
+                    }
+                    cache->replay_order_offsets[px + 1u] = static_cast<uint32_t>(total_replay);
+                }
+
+                cache->replay_order_count = static_cast<size_t>(total_replay);
+                cache->replay_order_gids_storage.resize(cache->replay_order_count);
+                cache->replay_order_gids = cache->replay_order_gids_storage.empty()
+                    ? nullptr
+                    : cache->replay_order_gids_storage.data();
+
+                if (replay_offsets_gpu_capacity_ < HW_size + 1u) {
+                    replay_offsets_gpu_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                        static_cast<VkDeviceSize>(HW_size + 1u) * sizeof(uint32_t),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    replay_offsets_gpu_capacity_ = HW_size + 1u;
+                }
+                replay_offsets_gpu_buf_->upload(cache->replay_order_offsets,
+                    (HW_size + 1u) * sizeof(uint32_t));
             }
-
-            cache->replay_order_count = static_cast<size_t>(total_replay);
-            cache->replay_order_gids_storage.resize(cache->replay_order_count);
-            cache->replay_order_gids = cache->replay_order_gids_storage.empty()
-                ? nullptr
-                : cache->replay_order_gids_storage.data();
-
-            replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_,
-                static_cast<VkDeviceSize>(HW_size + 1u) * sizeof(uint32_t),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            replay_offsets_buf->upload(cache->replay_order_offsets,
-                (HW_size + 1u) * sizeof(uint32_t));
-            replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_,
-                static_cast<VkDeviceSize>(cache->replay_order_count == 0u ? 4u : cache->replay_order_count * sizeof(uint32_t)),
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            if (cache->replay_order_count > replay_gids_gpu_capacity_) {
+                replay_gids_gpu_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+                    static_cast<VkDeviceSize>(cache->replay_order_count == 0u ? 4u : cache->replay_order_count * sizeof(uint32_t)),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                replay_gids_gpu_capacity_ = cache->replay_order_count;
+            } else if (!replay_gids_gpu_buf_) {
+                replay_gids_gpu_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            }
 
             eubo.img_size[2] = 1.0f;
             eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
             rb.raster_eval3d_ubo = eval3d_ubo_buf->handle();
-            rb.replay_order_offsets = replay_offsets_buf->handle();
-            rb.replay_order_gids = replay_gids_buf->handle();
+            rb.replay_order_offsets = replay_offsets_gpu_buf_->handle();
+            rb.replay_order_gids = replay_gids_gpu_buf_->handle();
             pass_->bind_buffers(rb);
             pass_->dispatch_sync(N_eff,
                                  static_cast<uint32_t>(W), static_cast<uint32_t>(H),
                                  num_tiles_x, num_tiles_y);
+            cache->replay_order_offsets_gpu = replay_offsets_gpu_buf_->handle();
+            cache->replay_order_gids_gpu = replay_gids_gpu_buf_->handle();
             if (cache->replay_order_count > 0u) {
-                replay_gids_buf->download(cache->replay_order_gids,
-                    cache->replay_order_count * sizeof(uint32_t));
+                if (use_gpu_replay_offsets) {
+                    cache->replay_order_gids_storage.clear();
+                    cache->replay_order_gids = nullptr;
+                } else {
+                    replay_gids_gpu_buf_->download(cache->replay_order_gids,
+                        cache->replay_order_count * sizeof(uint32_t));
+                }
             }
         }
+    }
+
+    if (retain_gpu_outputs) {
+        r_img_ = std::move(img_buf);
+        r_tfinal_ = std::move(t_buf);
+        r_ncontrib_ = std::move(nc_buf);
+    } else {
+        r_img_.reset();
+        r_tfinal_.reset();
+        r_ncontrib_.reset();
     }
 }
 
@@ -501,10 +685,13 @@ void RasterizerVulkan::record(VkCommandBuffer cmd,
     pass_->record(cmd, N_eff, W, H, num_tiles_x, num_tiles_y);
 }
 
-void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) {
+void RasterizerVulkan::download_image(float* dst, uint32_t W, uint32_t H) const {
     if (!r_img_)
         throw std::runtime_error(
             "RasterizerVulkan::download_image called before prepare_record()");
+    if (W != r_W_ || H != r_H_)
+        throw std::runtime_error(
+            "RasterizerVulkan::download_image called with mismatched dimensions");
     const uint32_t HW = H * W;
     const std::size_t bytes =
         static_cast<std::size_t>(HW) * 3u * sizeof(float);

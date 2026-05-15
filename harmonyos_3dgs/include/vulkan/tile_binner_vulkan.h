@@ -77,6 +77,7 @@ public:
     // the first prepare_record() call.
     VkBuffer keys_unsorted_buf()   const;
     VkBuffer values_unsorted_buf() const;
+    VkBuffer keyvals_unsorted_buf() const;
 
 private:
     VulkanContext& ctx_;
@@ -89,6 +90,7 @@ private:
     std::unique_ptr<VulkanBuffer> r_ws2_buf_;     // level-2 wg sums [ceil(ceil(N/256)/256)]
     std::unique_ptr<VulkanBuffer> r_keys_buf_;    // keys_unsorted [R_max] u64
     std::unique_ptr<VulkanBuffer> r_vals_buf_;    // values_unsorted [R_max] u32
+    std::unique_ptr<VulkanBuffer> r_keyvals_buf_; // packed keyvals_unsorted [R_max] u64
     std::unique_ptr<VulkanBuffer> r_scatter_ubo_; // ScatterUBO (eval_3D inverse_vp + cam_pos + img_size)
     std::unique_ptr<VulkanBuffer> r_dummy4_;      // 4-byte dummy for unbound eval_3D SSBOs
     bool r_eval_3D_ = false;                      // stashed for record()
@@ -111,6 +113,7 @@ private:
     std::unique_ptr<VulkanBuffer> bin_rf_buf_;    // radius_f [N*2] f32 (extent_x, extent_y)
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
+    std::unique_ptr<VulkanBuffer> bin_keyvals_buf_; // packed keyvals_unsorted [R] u64
 
     // Allocate/grow the 7 N-sized + 1 wg-sized scan buffers.
     void prepare_for_bin(uint32_t N, uint32_t num_wgs);

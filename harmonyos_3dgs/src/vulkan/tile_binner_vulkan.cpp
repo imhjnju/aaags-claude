@@ -1,12 +1,10 @@
 // SP-2 T10: TileBinnerVulkan — scan + scatter half of the tile-binner.
 //
 // Phase-1 (sync) pipeline, mirroring PreprocessorVulkan::process()'s shape:
-//   1. Upload per-Gaussian host arrays to fresh host-visible SSBOs.
+//   1. Bind producer-owned GPU handles when present, otherwise upload CPU arrays.
 //   2. Run PrefixScanPass over tiles_touched → point_offsets (exclusive).
-//   3. Download point_offsets[N-1] + tiles_touched[N-1] to recover total
-//      pairs R (single short round-trip — the alternative is a 1-byte
-//      host-readback of a uint, which is not a measurable cost on the
-//      Phase-1 host-visible path).
+//   3. Recover total pairs R from the preprocessor sideband for GPU-handle
+//      inputs, or from point_offsets[N-1] + tiles_touched[N-1] on CPU fallback.
 //   4. Allocate keys_unsorted[R] (uint64) and values_unsorted[R] (uint32)
 //      SSBOs, run ScatterPass.
 //   5. Download keys_unsorted / values_unsorted into allocator-backed arrays
@@ -95,6 +93,9 @@ void TileBinnerVulkan::prepare_for_scatter(uint64_t R) {
     bin_vals_buf_ = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(R) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bin_keyvals_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+        static_cast<VkDeviceSize>(R) * sizeof(uint64_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 }
 
 BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
@@ -123,6 +124,10 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         return out;
     }
 
+    if (static_cast<uint32_t>(N) > keyval_pack::MAX_GAUSS) {
+        throw std::runtime_error("TileBinnerVulkan: packed keyval gaussian id exceeds 20-bit range");
+    }
+
     // -------------------------------------------------------------------
     // 1. Ensure persistent SSBOs are large enough, then upload inputs.
     // -------------------------------------------------------------------
@@ -138,27 +143,48 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     // prepare_for_scatter() after we know actual R from the scan.
     prepare_for_bin(static_cast<uint32_t>(N), std::max(num_wgs, 1u));
 
-    bin_tt_buf_->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
+    const bool has_tiles_touched_gpu = pre.tiles_touched_gpu != nullptr;
+    const bool has_means2D_gpu = pre.means2D_gpu != nullptr;
+    const bool has_depths_gpu = pre.depths_gpu != nullptr;
+    const bool has_radii_gpu = pre.radii_gpu != nullptr;
+    const bool has_radius_f_gpu = pre.radius_f_gpu != nullptr;
+    const bool has_cov3D_inv_gpu = pre.cov3D_inv_gpu != nullptr;
+    const bool has_mean_offset_gpu = pre.mean_offset_gpu != nullptr;
+    const bool has_gauss2screen_gpu = pre.gauss2screen_gpu != nullptr;
+    const bool has_conic_opacity_gpu = pre.conic_opacity_packed_gpu != nullptr;
+
+    VkBuffer tiles_touched_handle = has_tiles_touched_gpu
+        ? static_cast<VkBuffer>(pre.tiles_touched_gpu)
+        : bin_tt_buf_->handle();
+    if (!has_tiles_touched_gpu) {
+        bin_tt_buf_->upload(pre.tiles_touched, static_cast<std::size_t>(bytes_int_N));
+    }
 
     // -------------------------------------------------------------------
     // 2. Exclusive prefix scan: tiles_touched -> point_offsets.
     // -------------------------------------------------------------------
-    scan_pass_->bind_buffers_2level(bin_tt_buf_->handle(),
+    scan_pass_->bind_buffers_2level(tiles_touched_handle,
                                     bin_po_buf_->handle(),
                                     bin_ws_buf_->handle(),
                                     bin_ws2_buf_->handle());
     scan_pass_->scan_sync(static_cast<uint32_t>(N));
 
     // -------------------------------------------------------------------
-    // 3. Compute R (total pairs) = point_offsets[N-1] + tiles_touched[N-1].
+    // 3. Compute R (total pairs). GPU-handle inputs use the preprocessor
+    //    sideband so stale CPU tiles_touched cannot affect allocation/counts.
     // -------------------------------------------------------------------
-    uint32_t last_offset = 0u;
-    uint32_t last_count  = 0u;
-    bin_po_buf_->download(&last_offset,
-                          sizeof(uint32_t),
-                          /*offset=*/static_cast<VkDeviceSize>(N - 1) * sizeof(uint32_t));
-    // tiles_touched is stored as int32 but non-negative; read as uint32.
-    {
+    uint32_t R = 0u;
+    if (has_tiles_touched_gpu) {
+        if (pre.num_tile_pairs < 0) {
+            throw std::runtime_error("TileBinnerVulkan: GPU tiles_touched requires num_tile_pairs sideband");
+        }
+        R = static_cast<uint32_t>(pre.num_tile_pairs);
+    } else {
+        uint32_t last_offset = 0u;
+        uint32_t last_count  = 0u;
+        bin_po_buf_->download(&last_offset,
+                              sizeof(uint32_t),
+                              /*offset=*/static_cast<VkDeviceSize>(N - 1) * sizeof(uint32_t));
         int32_t tmp = 0;
         bin_tt_buf_->download(&tmp,
                               sizeof(int32_t),
@@ -167,8 +193,8 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
             throw std::runtime_error(
                 "TileBinnerVulkan: tiles_touched[N-1] is negative — preprocess bug?");
         last_count = static_cast<uint32_t>(tmp);
+        R = last_offset + last_count;
     }
-    const uint32_t R = last_offset + last_count;
     out.total_pairs  = static_cast<int>(R);
 
     // Allocate/grow scatter output GPU buffers to exactly R entries.
@@ -193,20 +219,27 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     //    keys_unsorted[R_max] / values_unsorted[R_max] are pre-allocated
     //    (R_max >= R by construction); we only download R valid elements.
     // -------------------------------------------------------------------
-    bin_m2d_buf_->upload(pre.means2D, static_cast<std::size_t>(bytes_float_N2));
-    bin_dep_buf_->upload(pre.depths,  static_cast<std::size_t>(bytes_float_N));
-    bin_rad_buf_->upload(pre.radii,   static_cast<std::size_t>(bytes_int_N));
-    if (pre.radius_f != nullptr) {
-        bin_rf_buf_->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N) * 2u);
-    } else {
-        // Fallback: no float extents from preprocess, use int radius for both x/y.
-        std::vector<float> rf_host(static_cast<std::size_t>(N) * 2u);
-        for (int k = 0; k < N; ++k) {
-            float r = static_cast<float>(pre.radii[k]);
-            rf_host[static_cast<std::size_t>(k) * 2u + 0u] = r;
-            rf_host[static_cast<std::size_t>(k) * 2u + 1u] = r;
+    if (!has_means2D_gpu) {
+        bin_m2d_buf_->upload(pre.means2D, static_cast<std::size_t>(bytes_float_N2));
+    }
+    if (!has_depths_gpu) {
+        bin_dep_buf_->upload(pre.depths, static_cast<std::size_t>(bytes_float_N));
+    }
+    if (!has_radii_gpu) {
+        bin_rad_buf_->upload(pre.radii, static_cast<std::size_t>(bytes_int_N));
+    }
+    if (!has_radius_f_gpu) {
+        if (pre.radius_f != nullptr) {
+            bin_rf_buf_->upload(pre.radius_f, static_cast<std::size_t>(bytes_float_N) * 2u);
+        } else {
+            std::vector<float> rf_host(static_cast<std::size_t>(N) * 2u);
+            for (int k = 0; k < N; ++k) {
+                float r = static_cast<float>(pre.radii[k]);
+                rf_host[static_cast<std::size_t>(k) * 2u + 0u] = r;
+                rf_host[static_cast<std::size_t>(k) * 2u + 1u] = r;
+            }
+            bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N) * 2u);
         }
-        bin_rf_buf_->upload(rf_host.data(), static_cast<std::size_t>(bytes_float_N) * 2u);
     }
 
     // eval_3D scatter buffers: upload cov3D_inv, mean_offset, gauss2screen, and
@@ -216,48 +249,47 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
     std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
     std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf;
+    auto dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const bool use_eval3d_tile_binning = cfg.eval_3D && !cfg.eval_3D_parity_mode;
-    if (use_eval3d_tile_binning && pre.cov3D_inv && pre.mean_offset && pre.gauss2screen) {
-        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_cov3d_inv_buf->upload(pre.cov3D_inv,
-            static_cast<std::size_t>(N) * 6u * sizeof(float));
-        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 3u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_mean_offset_buf->upload(pre.mean_offset,
-            static_cast<std::size_t>(N) * 3u * sizeof(float));
-        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 16u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_gauss2screen_buf->upload(pre.gauss2screen,
-            static_cast<std::size_t>(N) * 16u * sizeof(float));
-        // Pack {conic.a, conic.b, conic.c, opacity} per Gaussian for scatter
-        // tile-based culling predicate. Matches preprocess_bind::CONIC_OPACITY_PACKED layout.
-        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_,
-            static_cast<VkDeviceSize>(N) * 4u * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        if (pre.conics && pre.opacities_2d) {
-            std::vector<float> packed(static_cast<std::size_t>(N) * 4u);
-            for (int k = 0; k < N; ++k) {
-                packed[static_cast<std::size_t>(k) * 4u + 0u] = pre.conics[static_cast<std::size_t>(k) * 3u + 0u];
-                packed[static_cast<std::size_t>(k) * 4u + 1u] = pre.conics[static_cast<std::size_t>(k) * 3u + 1u];
-                packed[static_cast<std::size_t>(k) * 4u + 2u] = pre.conics[static_cast<std::size_t>(k) * 3u + 2u];
-                packed[static_cast<std::size_t>(k) * 4u + 3u] = pre.opacities_2d[k];
-            }
-            bin_conic_opacity_packed_buf->upload(packed.data(),
-                static_cast<std::size_t>(N) * 4u * sizeof(float));
+    if (use_eval3d_tile_binning) {
+        if (!has_cov3D_inv_gpu) {
+            bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N) * 6u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_cov3d_inv_buf->upload(pre.cov3D_inv,
+                static_cast<std::size_t>(N) * 6u * sizeof(float));
         }
-    } else {
-        bin_cov3d_inv_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (!has_mean_offset_gpu) {
+            bin_mean_offset_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N) * 3u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_mean_offset_buf->upload(pre.mean_offset,
+                static_cast<std::size_t>(N) * 3u * sizeof(float));
+        }
+        if (!has_gauss2screen_gpu) {
+            bin_gauss2screen_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N) * 16u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            bin_gauss2screen_buf->upload(pre.gauss2screen,
+                static_cast<std::size_t>(N) * 16u * sizeof(float));
+        }
+        if (!has_conic_opacity_gpu) {
+            bin_conic_opacity_packed_buf = std::make_unique<VulkanBuffer>(ctx_,
+                static_cast<VkDeviceSize>(N) * 4u * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            if (pre.conics && pre.opacities_2d) {
+                std::vector<float> packed(static_cast<std::size_t>(N) * 4u);
+                for (int k = 0; k < N; ++k) {
+                    packed[static_cast<std::size_t>(k) * 4u + 0u] = pre.conics[static_cast<std::size_t>(k) * 3u + 0u];
+                    packed[static_cast<std::size_t>(k) * 4u + 1u] = pre.conics[static_cast<std::size_t>(k) * 3u + 1u];
+                    packed[static_cast<std::size_t>(k) * 4u + 2u] = pre.conics[static_cast<std::size_t>(k) * 3u + 2u];
+                    packed[static_cast<std::size_t>(k) * 4u + 3u] = pre.opacities_2d[k];
+                }
+                bin_conic_opacity_packed_buf->upload(packed.data(),
+                    static_cast<std::size_t>(N) * 4u * sizeof(float));
+            }
+        }
     }
     // Build ScatterUBO with inverse_vp, cam_pos, img_size.
     ScatterUBO subo{};
@@ -281,24 +313,42 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     bin_scatter_ubo_buf->upload(&subo, sizeof(ScatterUBO));
 
     ScatterPass::Buffers sb{};
-    sb.means2D         = bin_m2d_buf_->handle();
-    sb.depths          = bin_dep_buf_->handle();
-    sb.radii           = bin_rad_buf_->handle();
+    sb.means2D         = has_means2D_gpu
+        ? static_cast<VkBuffer>(pre.means2D_gpu)
+        : bin_m2d_buf_->handle();
+    sb.depths          = has_depths_gpu
+        ? static_cast<VkBuffer>(pre.depths_gpu)
+        : bin_dep_buf_->handle();
+    sb.radii           = has_radii_gpu
+        ? static_cast<VkBuffer>(pre.radii_gpu)
+        : bin_rad_buf_->handle();
     sb.point_offsets   = bin_po_buf_ ->handle();
-    sb.tiles_touched   = bin_tt_buf_ ->handle();
+    sb.tiles_touched   = tiles_touched_handle;
     sb.keys_unsorted   = bin_keys_buf_->handle();
     sb.values_unsorted = bin_vals_buf_->handle();
-    sb.radius_f        = bin_rf_buf_ ->handle();
-    sb.cov3D_inv       = bin_cov3d_inv_buf->handle();
-    sb.mean_offset     = bin_mean_offset_buf->handle();
+    sb.radius_f        = has_radius_f_gpu
+        ? static_cast<VkBuffer>(pre.radius_f_gpu)
+        : bin_rf_buf_->handle();
+    sb.cov3D_inv       = has_cov3D_inv_gpu
+        ? static_cast<VkBuffer>(pre.cov3D_inv_gpu)
+        : (bin_cov3d_inv_buf ? bin_cov3d_inv_buf->handle() : dummy4_buf->handle());
+    sb.mean_offset     = has_mean_offset_gpu
+        ? static_cast<VkBuffer>(pre.mean_offset_gpu)
+        : (bin_mean_offset_buf ? bin_mean_offset_buf->handle() : dummy4_buf->handle());
     sb.scatter_ubo          = bin_scatter_ubo_buf->handle();
-    sb.gauss2screen         = bin_gauss2screen_buf->handle();
-    sb.conic_opacity_packed = bin_conic_opacity_packed_buf->handle();
+    sb.gauss2screen         = has_gauss2screen_gpu
+        ? static_cast<VkBuffer>(pre.gauss2screen_gpu)
+        : (bin_gauss2screen_buf ? bin_gauss2screen_buf->handle() : dummy4_buf->handle());
+    sb.conic_opacity_packed = has_conic_opacity_gpu
+        ? static_cast<VkBuffer>(pre.conic_opacity_packed_gpu)
+        : (bin_conic_opacity_packed_buf ? bin_conic_opacity_packed_buf->handle() : dummy4_buf->handle());
+    sb.keyvals_unsorted     = bin_keyvals_buf_->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
                                  num_tiles_x,
                                  num_tiles_y,
-                                 use_eval3d_tile_binning);
+                                 use_eval3d_tile_binning,
+                                 use_eval3d_tile_binning && cfg.compact_eval3D_tiles);
 
     // -------------------------------------------------------------------
     // 5. Download R valid pairs into FrameAllocator-backed output.
@@ -308,6 +358,7 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     out.keys_sorted     = nullptr;   // SorterVulkan (T14)
     out.values_sorted   = nullptr;
     out.tile_ranges     = nullptr;
+    out.keyvals_unsorted_gpu = bin_keyvals_buf_->handle();
 
     bin_keys_buf_->download(out.keys_unsorted,
                             static_cast<std::size_t>(R) * sizeof(uint64_t));
@@ -349,6 +400,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     r_ws2_buf_.reset();
     r_keys_buf_.reset();
     r_vals_buf_.reset();
+    r_keyvals_buf_.reset();
     r_scatter_ubo_.reset();
     r_dummy4_.reset();
 
@@ -374,6 +426,9 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     r_vals_buf_ = std::make_unique<VulkanBuffer>(
         ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    r_keyvals_buf_ = std::make_unique<VulkanBuffer>(
+        ctx_, static_cast<VkDeviceSize>(R_max) * sizeof(uint64_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 
     // Build ScatterUBO with inverse_vp, cam_pos, img_size.
     ScatterUBO subo{};
@@ -432,6 +487,7 @@ void TileBinnerVulkan::prepare_record(uint32_t N, uint32_t R_max,
     sb.scatter_ubo          = r_scatter_ubo_->handle();
     sb.gauss2screen         = g2s_handle;
     sb.conic_opacity_packed = cop_handle;
+    sb.keyvals_unsorted     = r_keyvals_buf_->handle();
     scatter_pass_->bind_buffers(sb);
 
     (void)num_tiles_x;
@@ -450,7 +506,7 @@ void TileBinnerVulkan::record(VkCommandBuffer cmd,
     // dependency.
     scan_pass_->record(cmd, N);
     insert_compute_barrier(cmd);
-    scatter_pass_->record(cmd, N, num_tiles_x, num_tiles_y, r_eval_3D_);
+    scatter_pass_->record(cmd, N, num_tiles_x, num_tiles_y, r_eval_3D_, false);
 }
 
 VkBuffer TileBinnerVulkan::keys_unsorted_buf() const {
@@ -458,4 +514,7 @@ VkBuffer TileBinnerVulkan::keys_unsorted_buf() const {
 }
 VkBuffer TileBinnerVulkan::values_unsorted_buf() const {
     return r_vals_buf_ ? r_vals_buf_->handle() : VK_NULL_HANDLE;
+}
+VkBuffer TileBinnerVulkan::keyvals_unsorted_buf() const {
+    return r_keyvals_buf_ ? r_keyvals_buf_->handle() : VK_NULL_HANDLE;
 }

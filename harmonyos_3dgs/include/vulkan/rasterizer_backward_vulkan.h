@@ -68,6 +68,9 @@ public:
     VkBuffer dL_dopacity_buf() const { return dlopa_buf_ ? dlopa_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dcolors_buf()  const { return dlcol_buf_ ? dlcol_buf_->handle() : VK_NULL_HANDLE; }
     VkBuffer dL_dgauss2screen_buf() const { return dlg2s_buf_ ? dlg2s_buf_->handle() : VK_NULL_HANDLE; }
+#ifdef GS3D_TESTING
+    bool last_forward_gpu_cache_used_for_test() const { return last_forward_gpu_cache_used_; }
+#endif
 
     void download_outputs(int num_gaussians,
                           std::vector<float>& d_means2D,
@@ -122,6 +125,7 @@ private:
     std::unique_ptr<VulkanBuffer> replay_gids_buf_;    // [sum(n_contrib)] u32 eval_3D exact replay gids
     std::unique_ptr<VulkanBuffer> dummy4_buf_;          // 4-byte dummy for optional replay bindings
     std::unique_ptr<VulkanBuffer> ubo_buf_;    // RasterizeBackwardUBO (32B)
+    bool last_forward_gpu_cache_used_ = false;
 
     void prepare_for_n(int N, int R, int num_tiles, int HW);
 };

@@ -13,6 +13,7 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
                                           ForwardCache* cache) {
     int N = g.count;
     PreprocessOutput out;
+    out.num_gaussians = N;
     out.means2D = alloc.allocate_array<float>(N * 2);
     out.depths = alloc.allocate_array<float>(N);
     out.conics = alloc.allocate_array<float>(N * 3);
@@ -285,6 +286,10 @@ PreprocessOutput PreprocessorCPU::process(const GaussianData& g, const Camera& c
                 cache->cov2D_det[i]  = det;       // det after +0.3 filter
             }
         }
+    }
+    out.num_tile_pairs = 0;
+    for (int i = 0; i < N; ++i) {
+        out.num_tile_pairs += out.tiles_touched[i];
     }
     return out;
 }

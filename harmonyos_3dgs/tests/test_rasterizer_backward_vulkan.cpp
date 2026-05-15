@@ -27,6 +27,10 @@
 #include "cpu/rasterizer_cpu.h"
 #include "cpu/rasterizer_backward_cpu.h"
 #include "vulkan/vk_context.h"
+#include "vulkan/preprocessor_vulkan.h"
+#include "vulkan/tile_binner_vulkan.h"
+#include "vulkan/sorter_vulkan.h"
+#include "vulkan/rasterizer_vulkan.h"
 #include "vulkan/rasterizer_backward_vulkan.h"
 
 #include "golden/npy_reader.h"
@@ -237,4 +241,180 @@ TEST(RasterizerBackwardVulkan, MatchesCPU_TinyFixture) {
             << "d_rgb[" << i << "]: vk=" << rgrad_vk.d_rgb[i]
             << " cpu=" << rgrad_cpu.d_rgb[i];
     }
+}
+
+TEST(RasterizerBackwardVulkan, Eval3DBackwardUsesPreprocessGpuHandles) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    const std::string root = tiny_cam0_dir();
+    auto pos_npy  = load_npy(root + "/input_positions.npy");
+    auto scl_npy  = load_npy(root + "/input_scales.npy");
+    auto rot_npy  = load_npy(root + "/input_rotations.npy");
+    auto opa_npy  = load_npy(root + "/input_opacities.npy");
+    auto sh_npy   = load_npy(root + "/input_sh.npy");
+    auto f3d_npy  = load_npy(root + "/input_filter_3D.npy");
+    auto vm_npy   = load_npy(root + "/input_viewmatrix.npy");
+    auto pm_npy   = load_npy(root + "/input_projmatrix.npy");
+    auto fov_npy  = load_npy(root + "/input_fov_size.npy");
+    auto cp_npy   = load_npy(root + "/input_campos.npy");
+    auto meta_npy = load_npy(root + "/input_meta.npy");
+    auto dL_npy   = load_npy(root + "/backward_dL_dout_color.npy");
+
+    const int N = static_cast<int>(pos_npy.shape[0]);
+    const int sh_degree = static_cast<int>(meta_npy.f32()[0]);
+    const int sh_coeffs_per_g = static_cast<int>(meta_npy.f32()[1]);
+    const int H = static_cast<int>(meta_npy.f32()[2]);
+    const int W = static_cast<int>(meta_npy.f32()[3]);
+
+    std::vector<float> positions = npy_to_f32_vec(pos_npy);
+    std::vector<float> scales = npy_to_f32_vec(scl_npy);
+    std::vector<float> rotations = npy_to_f32_vec(rot_npy);
+    std::vector<float> opacities = npy_to_f32_vec(opa_npy);
+    std::vector<float> sh_coeffs = npy_to_f32_vec(sh_npy);
+    std::vector<float> filter_3d = npy_to_f32_vec(f3d_npy);
+    std::vector<float> d_image(dL_npy.f32(), dL_npy.f32() + dL_npy.numel());
+
+    Camera cam{};
+    std::memcpy(cam.view_matrix, vm_npy.f32(), 16 * sizeof(float));
+    std::memcpy(cam.viewproj_matrix, pm_npy.f32(), 16 * sizeof(float));
+    cam.cam_pos[0] = cp_npy.f32()[0];
+    cam.cam_pos[1] = cp_npy.f32()[1];
+    cam.cam_pos[2] = cp_npy.f32()[2];
+    cam.tan_fovx = fov_npy.f32()[0];
+    cam.tan_fovy = fov_npy.f32()[1];
+    cam.width = W;
+    cam.height = H;
+
+    GaussianData g{};
+    g.count = N;
+    g.sh_degree = sh_degree;
+    g.max_coeffs = sh_coeffs_per_g;
+    g.positions = positions.data();
+    g.scales = scales.data();
+    g.rotations = rotations.data();
+    g.opacities = opacities.data();
+    g.sh_coeffs = sh_coeffs.data();
+    g.filter_3D = filter_3d.data();
+
+    RenderConfig cfg{};
+    cfg.sh_degree = sh_degree;
+    cfg.training = true;
+    cfg.eval_3D = true;
+    cfg.tile_w = 16;
+    cfg.tile_h = 16;
+    cfg.scale_modifier = 1.0f;
+    cfg.bg_color[0] = 0.25f;
+    cfg.bg_color[1] = 0.5f;
+    cfg.bg_color[2] = 0.75f;
+
+    FrameAllocator alloc(96u * 1024u * 1024u);
+    ForwardCache cache{};
+    cache.T_final = alloc.allocate_array<float>(static_cast<size_t>(H) * W);
+    cache.n_contrib = alloc.allocate_array<int>(static_cast<size_t>(H) * W);
+    cache.retain_gpu_outputs = true;
+    PreprocessorVulkan prep(ctx, /*eval_3D=*/true);
+    PreprocessOutput pre = prep.process(g, cam, cfg, alloc, &cache);
+    ASSERT_NE(pre.rgb_gpu, nullptr);
+    ASSERT_NE(pre.conic_opacity_packed_gpu, nullptr);
+
+    TileBinnerVulkan binner(ctx);
+    BinningOutput bin = binner.bin(pre, N, cam, cfg, alloc);
+    if (bin.total_pairs == 0) GTEST_SKIP() << "Tiny eval_3D fixture produced no pairs";
+    SorterVulkan sorter(ctx);
+    sorter.sort(bin, alloc);
+
+    std::vector<float> image(static_cast<size_t>(3) * H * W, 0.0f);
+    RasterizerVulkan raster(ctx, /*eval_3D=*/true);
+    raster.rasterize(pre, bin, cam, cfg, image.data(), nullptr, &cache, &alloc);
+
+    PreprocessOutput fallback_pre = pre;
+    fallback_pre.rgb_gpu = nullptr;
+    fallback_pre.conic_opacity_packed_gpu = nullptr;
+
+    FrameAllocator fallback_alloc(32u * 1024u * 1024u);
+    RasterGradOutput fallback_grad{};
+    RasterizerBackwardVulkan fallback_bwd(ctx);
+    fallback_bwd.backward(fallback_pre, bin, N, cam, cfg, cache, d_image.data(), fallback_grad, fallback_alloc);
+
+    std::fill(pre.rgb, pre.rgb + static_cast<size_t>(N) * 3u, 12345.0f);
+    std::fill(pre.opacities_2d, pre.opacities_2d + static_cast<size_t>(N), 0.0f);
+    std::fill(pre.conics, pre.conics + static_cast<size_t>(N) * 3u, 12345.0f);
+
+    FrameAllocator gpu_alloc(32u * 1024u * 1024u);
+    RasterGradOutput gpu_grad{};
+    RasterizerBackwardVulkan gpu_bwd(ctx);
+    gpu_bwd.backward(pre, bin, N, cam, cfg, cache, d_image.data(), gpu_grad, gpu_alloc);
+
+    const float tol = 1e-4f;
+    for (int i = 0; i < N; ++i) {
+        EXPECT_NEAR(gpu_grad.d_opacities_2d[i], fallback_grad.d_opacities_2d[i], tol)
+            << "d_opacities_2d[" << i << "]";
+    }
+    for (int i = 0; i < N * 3; ++i) {
+        EXPECT_NEAR(gpu_grad.d_rgb[i], fallback_grad.d_rgb[i], tol)
+            << "d_rgb[" << i << "]";
+    }
+    for (int i = 0; i < N * 16; ++i) {
+        EXPECT_NEAR(gpu_grad.d_gauss2screen[i], fallback_grad.d_gauss2screen[i], tol)
+            << "d_gauss2screen[" << i << "]";
+    }
+}
+
+TEST(RasterizerBackwardVulkan, RecordIntoZeroPairsPublishesZeroGradientBuffers) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    const int N = 3;
+    Camera cam{};
+    cam.width = 16;
+    cam.height = 16;
+
+    RenderConfig cfg{};
+    cfg.eval_3D = true;
+    cfg.tile_w = 16;
+    cfg.tile_h = 16;
+
+    PreprocessOutput pre{};
+    pre.num_gaussians = N;
+    pre.eval_3D = true;
+
+    BinningOutput bin{};
+    bin.total_pairs = 0;
+    bin.num_tiles = 1;
+
+    ForwardCache cache{};
+    float dL_dpixels[16 * 16 * 3] = {};
+
+    RasterizerBackwardVulkan bwd_vk(ctx);
+    VkCommandBuffer cmd = ctx.allocatePrimary();
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    ASSERT_EQ(vkBeginCommandBuffer(cmd, &bi), VK_SUCCESS);
+    bwd_vk.backward_record_into(cmd, pre, bin, N, cam, cfg, cache, dL_dpixels);
+    ASSERT_EQ(vkEndCommandBuffer(cmd), VK_SUCCESS);
+    ctx.freePrimary(cmd);
+
+    EXPECT_NE(bwd_vk.dL_dmeans2D_buf(), VK_NULL_HANDLE);
+    EXPECT_NE(bwd_vk.dL_dconics_buf(), VK_NULL_HANDLE);
+    EXPECT_NE(bwd_vk.dL_dopacity_buf(), VK_NULL_HANDLE);
+    EXPECT_NE(bwd_vk.dL_dcolors_buf(), VK_NULL_HANDLE);
+    EXPECT_NE(bwd_vk.dL_dgauss2screen_buf(), VK_NULL_HANDLE);
+
+    std::vector<float> d_means2D;
+    std::vector<float> d_conics;
+    std::vector<float> d_opacity;
+    std::vector<float> d_rgb;
+    std::vector<float> d_gauss2screen;
+    bwd_vk.download_outputs(N, d_means2D, d_conics, d_opacity, d_rgb, &d_gauss2screen);
+    for (float v : d_means2D) EXPECT_EQ(v, 0.0f);
+    for (float v : d_conics) EXPECT_EQ(v, 0.0f);
+    for (float v : d_opacity) EXPECT_EQ(v, 0.0f);
+    for (float v : d_rgb) EXPECT_EQ(v, 0.0f);
+    for (float v : d_gauss2screen) EXPECT_EQ(v, 0.0f);
 }
