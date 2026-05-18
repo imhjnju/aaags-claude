@@ -42,16 +42,20 @@ void validate_count(uint32_t count, uint32_t max_keyvals, const char* where) {
 }
 }
 
-RadixSortFuchsia::RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals)
-    : ctx_(ctx), max_keyvals_(max_keyvals) {
+RadixSortFuchsia::RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals,
+                                   uint32_t keyval_dwords)
+    : ctx_(ctx), max_keyvals_(max_keyvals), keyval_dwords_(keyval_dwords) {
     if (max_keyvals_ == 0u || max_keyvals_ >= kMaxFuchsiaKeyvals) {
         throw std::runtime_error("RadixSortFuchsia: max_keyvals must be in [1, 1<<30)");
     }
+    if (keyval_dwords_ == 0u || keyval_dwords_ > 4u) {
+        throw std::runtime_error("RadixSortFuchsia: keyval_dwords must be 1, 2, 3, or 4");
+    }
 
-    target_ = pick_target(ctx_);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(ctx_.physicalDevice(), &props);
+    target_ = radix_sort_vk_target_auto_detect(&props, keyval_dwords_);
     if (target_ == nullptr) {
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(ctx_.physicalDevice(), &props);
         throw std::runtime_error(
             std::string("RadixSortFuchsia: no vendored target matches device '") +
             props.deviceName + "' (vendorID=0x" +
@@ -110,8 +114,9 @@ void RadixSortFuchsia::record(VkCommandBuffer cmd,
         return;
     }
     validate_count(count, max_keyvals_, "RadixSortFuchsia::record");
-    if (key_bits > 64u) {
-        throw std::runtime_error("RadixSortFuchsia::record: key_bits must be <= 64");
+    const uint32_t max_key_bits = keyval_dwords_ * 32u;
+    if (key_bits > max_key_bits) {
+        throw std::runtime_error("RadixSortFuchsia::record: key_bits exceeds record width");
     }
 
     radix_sort_vk_memory_requirements_t mr{};

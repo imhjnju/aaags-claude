@@ -36,12 +36,13 @@
 #include <vector>
 
 namespace {
-// Shaders declare local_size_x=256. Single-WG variant: one dispatch group.
 constexpr uint32_t kRadixLocalSize = 256;
-// 4-bit radix => 16 buckets per pass. Histogram is 16 uint32s.
 constexpr uint32_t kRadixBuckets   = 16;
-// 64-bit keys / 4 bits per pass = 16 passes.
 constexpr uint32_t kRadixPasses    = 16;
+
+uint32_t ceil_div_u32(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
 }  // namespace
 
 RadixSortPass::RadixSortPass(VulkanContext& ctx)
@@ -103,90 +104,28 @@ RadixSortPass::RadixSortPass(VulkanContext& ctx)
 void RadixSortPass::sort_sync(VkBuffer keys_in_buf,  VkBuffer values_in_buf,
                               VkBuffer keys_out_buf, VkBuffer values_out_buf,
                               VkBuffer hist_count_buf, VkBuffer hist_scan_buf,
-                              VkBuffer wg_sums_buf,
+                              VkBuffer wg_sums_buf, VkBuffer wg_sums2_buf,
                               uint32_t num_elements) {
     if (num_elements == 0u) return;
-    if (num_elements > kRadixLocalSize)
-        throw std::runtime_error(
-            "RadixSortPass::sort_sync: num_elements > 256 — SP-2 Phase 1 "
-            "single-workgroup radix does not support larger inputs.");
 
-    // Ping-pong state. After each pass we swap so the "in" of the next pass
-    // is what the scatter just wrote.
-    VkBuffer cur_keys_in  = keys_in_buf;
-    VkBuffer cur_vals_in  = values_in_buf;
-    VkBuffer cur_keys_out = keys_out_buf;
-    VkBuffer cur_vals_out = values_out_buf;
+    VkCommandBuffer cmd = ctx_.allocatePrimary();
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
-    for (uint32_t pass = 0; pass < kRadixPasses; ++pass) {
-        const uint32_t current_bit = pass * 4u;
+    sort_record(cmd,
+                keys_in_buf, values_in_buf,
+                keys_out_buf, values_out_buf,
+                hist_count_buf, hist_scan_buf,
+                wg_sums_buf, wg_sums2_buf,
+                num_elements);
+    insert_compute_barrier(cmd);
 
-        // ---------- Step 1: count ----------
-        count_pipeline_->update_ssbo(count_ds_,
-                                     radix_count_bind::KEYS_IN,
-                                     cur_keys_in);
-        count_pipeline_->update_ssbo(count_ds_,
-                                     radix_count_bind::HISTOGRAMS,
-                                     hist_count_buf);
-        {
-            RadixSortPushConstants pc{};
-            pc.num_elements = num_elements;
-            pc.current_bit  = current_bit;
-            pc._pad0        = 0u;
-            pc._pad1        = 0u;
-            // Single WG: ceil(num_elements / 256) == 1 for num_elements <= 256.
-            count_pipeline_->dispatch_sync(count_ds_,
-                                           /*gx=*/1u, 1u, 1u,
-                                           &pc, sizeof(pc));
-        }
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    ctx_.submitAndWait(cmd);
+    ctx_.freePrimary(cmd);
 
-        // ---------- Step 2: exclusive scan over 16 histogram entries ----
-        // prefix_sum.comp does NOT scan in-place (phase 0 reads input_array,
-        // writes output_array), so we use two separate buffers: hist_count_buf
-        // (input) → hist_scan_buf (output). The scatter shader reads the scan
-        // result at binding 2 as bucket_offsets.
-        scan_pass_->bind_buffers(hist_count_buf, hist_scan_buf, wg_sums_buf);
-        scan_pass_->scan_sync(kRadixBuckets);
-
-        // ---------- Step 3: scatter ----------
-        scatter_pipeline_->update_ssbo(scatter_ds_,
-                                       radix_scatter_bind::KEYS_IN,
-                                       cur_keys_in);
-        scatter_pipeline_->update_ssbo(scatter_ds_,
-                                       radix_scatter_bind::VALUES_IN,
-                                       cur_vals_in);
-        scatter_pipeline_->update_ssbo(scatter_ds_,
-                                       radix_scatter_bind::BUCKET_OFFSETS,
-                                       hist_scan_buf);
-        scatter_pipeline_->update_ssbo(scatter_ds_,
-                                       radix_scatter_bind::KEYS_OUT,
-                                       cur_keys_out);
-        scatter_pipeline_->update_ssbo(scatter_ds_,
-                                       radix_scatter_bind::VALUES_OUT,
-                                       cur_vals_out);
-        {
-            RadixSortPushConstants pc{};
-            pc.num_elements = num_elements;
-            pc.current_bit  = current_bit;
-            pc._pad0        = 0u;
-            pc._pad1        = 0u;
-            scatter_pipeline_->dispatch_sync(scatter_ds_,
-                                             /*gx=*/1u, 1u, 1u,
-                                             &pc, sizeof(pc));
-        }
-
-        // ---------- Ping-pong for next pass ----------
-        std::swap(cur_keys_in,  cur_keys_out);
-        std::swap(cur_vals_in,  cur_vals_out);
-    }
-
-    // After 16 (even) swaps, cur_keys_in == keys_in_buf, cur_keys_out ==
-    // keys_out_buf. The last scatter wrote into cur_keys_out **before** the
-    // final swap, i.e. into keys_in_buf after the swap: so the sorted data is
-    // in keys_in_buf. This matches the API contract.
-    //
-    // NOTE: the API contract assumes an even number of passes. Changing
-    // kRadixPasses to an odd number would invert the final output buffer.
+    // After 16 even passes, sorted data is in keys_in_buf / values_in_buf.
 }
 
 // Layer-2 record-path variant of sort_sync(). Identical ping-pong structure,
@@ -205,18 +144,17 @@ void RadixSortPass::sort_record(VkCommandBuffer cmd,
                                 VkBuffer keys_in_buf,  VkBuffer values_in_buf,
                                 VkBuffer keys_out_buf, VkBuffer values_out_buf,
                                 VkBuffer hist_count_buf, VkBuffer hist_scan_buf,
-                                VkBuffer wg_sums_buf,
+                                VkBuffer wg_sums_buf, VkBuffer wg_sums2_buf,
                                 uint32_t num_elements) {
     if (num_elements == 0u) return;
-    if (num_elements > kRadixLocalSize)
-        throw std::runtime_error(
-            "RadixSortPass::sort_record: num_elements > 256 — SP-2 Phase 1 "
-            "single-workgroup radix does not support larger inputs.");
+
+    const uint32_t num_wgs = ceil_div_u32(num_elements, kRadixLocalSize);
+    const uint32_t hist_entries = num_wgs * kRadixBuckets;
 
     // Bind the inner scan's DS exactly once — the histogram buffers are
     // constant across all 16 passes (each pass's count writes them fresh,
     // each pass's scatter consumes them fresh, sequenced by barriers).
-    scan_pass_->bind_buffers(hist_count_buf, hist_scan_buf, wg_sums_buf);
+    scan_pass_->bind_buffers_2level(hist_count_buf, hist_scan_buf, wg_sums_buf, wg_sums2_buf);
 
     // Pre-populate per-pass descriptor sets. Each pass's cur_keys_in /
     // cur_vals_in / cur_keys_out / cur_vals_out is determined by ping-pong
@@ -261,22 +199,22 @@ void RadixSortPass::sort_record(VkCommandBuffer cmd,
         RadixSortPushConstants pc{};
         pc.num_elements = num_elements;
         pc.current_bit  = current_bit;
-        pc._pad0        = 0u;
+        pc.num_workgroups = num_wgs;
         pc._pad1        = 0u;
 
         // ---------- Step 1: count ----------
         count_pipeline_->record(cmd, count_ds_per_pass_[pass],
-                                /*gx=*/1u, 1u, 1u,
+                                /*gx=*/num_wgs, 1u, 1u,
                                 &pc, sizeof(pc));
         insert_compute_barrier(cmd);
 
-        // ---------- Step 2: exclusive scan over 16 histogram entries ----
-        scan_pass_->record(cmd, kRadixBuckets);
+        // ---------- Step 2: exclusive scan over bucket-major histogram entries ----
+        scan_pass_->record(cmd, hist_entries);
         insert_compute_barrier(cmd);
 
         // ---------- Step 3: scatter ----------
         scatter_pipeline_->record(cmd, scatter_ds_per_pass_[pass],
-                                  /*gx=*/1u, 1u, 1u,
+                                  /*gx=*/num_wgs, 1u, 1u,
                                   &pc, sizeof(pc));
         // Barrier between passes: next pass's count reads what this scatter
         // wrote. Skip the trailing barrier after the final scatter.

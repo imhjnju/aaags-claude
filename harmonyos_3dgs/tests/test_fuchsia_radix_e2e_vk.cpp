@@ -1,15 +1,8 @@
-// test_fuchsia_radix_e2e_vk.cpp -- Phase 2.3b e2e test.
+// test_fuchsia_radix_e2e_vk.cpp -- Fuchsia env compatibility tests.
 //
-// Validates the env-var routing from `GS3D_USE_FUCHSIA_SORT`:
-//   - env-on  : SorterVulkan goes through RadixSortFuchsia (GPU radix sort)
-//               and the binner/rasterizer pass GPU buffers without host bounce
-//   - env-off : SorterVulkan goes through std::sort (CPU fallback)
-//
-// Both paths sort the same packed u64 keyvals (Phase 2.3a 16/28/20 layout).
-// LSD radix on the full 64 bits matches std::sort on the same input bit-
-// exactly; the only divergence comes from buffer layout (GPU-resident vs
-// host-array) and reads through the rasterizer should produce IDENTICAL
-// pixels. Tolerance: very tight (max_abs <= 1e-6).
+// SorterVulkan always uses CUDA-style canonical key/value SortPairs. These tests
+// keep the old Fuchsia environment toggles covered as no-op compatibility inputs
+// and verify they do not route sorting through packed keyvals.
 //
 // Tiny fixture lives at harmonyos_3dgs/tests/golden/tiny/step000001/cam0000
 // and is the same one test_forward_pipeline_vk.cpp uses.
@@ -68,8 +61,8 @@ struct EnvVarGuard {
 };
 
 // Run a full forward pass on the tiny fixture using the Layer-1 sync path.
-// `env_value` is set on GS3D_USE_FUCHSIA_SORT for the duration of the call;
-// it is restored to whatever it was on entry.
+// `env_value` is set on the legacy Fuchsia sort env vars for the duration of
+// the call; SorterVulkan should still use canonical SortPairs.
 struct ForwardResult {
     std::vector<float> image;   // [3*H*W] CHW
     int W = 0, H = 0;
@@ -84,7 +77,8 @@ struct ForwardResult {
 ForwardResult run_forward_with_env(const char* env_value,
                                    bool poison_host_tile_ranges = false,
                                    bool drop_host_unsorted_pairs = false,
-                                   bool zero_copy = false) {
+                                   bool zero_copy = false,
+                                   bool force_zero_copy_off = false) {
     // Save current env, set ours.
     const char* saved = std::getenv("GS3D_USE_FUCHSIA_SORT");
     std::string saved_str = (saved != nullptr) ? std::string(saved) : std::string();
@@ -92,11 +86,19 @@ ForwardResult run_forward_with_env(const char* env_value,
     const char* saved_zero = std::getenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
     std::string saved_zero_str = (saved_zero != nullptr) ? std::string(saved_zero) : std::string();
     bool zero_was_set = (saved_zero != nullptr);
-    if (env_value != nullptr)
+    const char* saved_exp = std::getenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    std::string saved_exp_str = (saved_exp != nullptr) ? std::string(saved_exp) : std::string();
+    bool exp_was_set = (saved_exp != nullptr);
+    if (env_value != nullptr) {
         ::setenv("GS3D_USE_FUCHSIA_SORT", env_value, /*overwrite=*/1);
-    else
+        ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", env_value, /*overwrite=*/1);
+    } else {
         ::unsetenv("GS3D_USE_FUCHSIA_SORT");
-    if (zero_copy)
+        ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    }
+    if (force_zero_copy_off)
+        ::setenv("GS3D_FUCHSIA_SORT_ZERO_COPY", "0", /*overwrite=*/1);
+    else if (zero_copy)
         ::setenv("GS3D_FUCHSIA_SORT_ZERO_COPY", "1", /*overwrite=*/1);
     else
         ::unsetenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
@@ -170,6 +172,8 @@ ForwardResult run_forward_with_env(const char* env_value,
             // Restore env.
             if (was_set) ::setenv("GS3D_USE_FUCHSIA_SORT", saved_str.c_str(), 1);
             else         ::unsetenv("GS3D_USE_FUCHSIA_SORT");
+            if (exp_was_set) ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", saved_exp_str.c_str(), 1);
+            else             ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
             if (zero_was_set) ::setenv("GS3D_FUCHSIA_SORT_ZERO_COPY", saved_zero_str.c_str(), 1);
             else              ::unsetenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
             return res;
@@ -214,6 +218,8 @@ ForwardResult run_forward_with_env(const char* env_value,
     // Restore env.
     if (was_set) ::setenv("GS3D_USE_FUCHSIA_SORT", saved_str.c_str(), 1);
     else         ::unsetenv("GS3D_USE_FUCHSIA_SORT");
+    if (exp_was_set) ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", saved_exp_str.c_str(), 1);
+    else             ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
     if (zero_was_set) ::setenv("GS3D_FUCHSIA_SORT_ZERO_COPY", saved_zero_str.c_str(), 1);
     else              ::unsetenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
 
@@ -236,23 +242,21 @@ TEST(FuchsiaRadixE2E, EnvOnEnvOffSameImage) {
         << "this indicates a bug in the Fuchsia integration (likely missing "
         << "device feature, but env-off succeeded so device is OK).";
 
-    if (!on.fuchsia_features_available) {
-        GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
-    }
     ASSERT_FALSE(off.used_keyvals_gpu);
-    ASSERT_FALSE(off.used_tile_ranges_gpu);
     ASSERT_TRUE(on.used_unsorted_keyvals_gpu);
-    ASSERT_TRUE(on.used_keyvals_gpu);
-    ASSERT_TRUE(on.used_tile_ranges_gpu);
+    ASSERT_FALSE(on.used_keyvals_gpu);
+    ASSERT_EQ(off.used_tile_ranges_gpu, on.used_tile_ranges_gpu);
+    if (on.fuchsia_features_available) {
+        ASSERT_TRUE(on.used_tile_ranges_gpu);
+    }
 
     ASSERT_EQ(off.W, on.W);
     ASSERT_EQ(off.H, on.H);
     ASSERT_EQ(off.total_pairs, on.total_pairs)
         << "env-on/off disagree on R (total_pairs); a bug somewhere upstream";
 
-    // Pixel-wise comparison. Tight tolerance because both paths sort the same
-    // packed u64 keyvals — Fuchsia LSD radix and std::sort produce bit-equal
-    // output, so the rasterizer is fed identical inputs.
+    // Pixel-wise comparison. Tight tolerance because both paths sort by the
+    // same tile/depth ordering and preserve stable gaussian-index tie order.
     ASSERT_EQ(off.image.size(), on.image.size());
     double sse = 0.0;
     float max_abs = 0.0f;
@@ -266,30 +270,25 @@ TEST(FuchsiaRadixE2E, EnvOnEnvOffSameImage) {
     EXPECT_LE(max_abs, 1e-4f)
         << "env-on vs env-off image divergence: max_abs=" << max_abs
         << " sse=" << sse << " bad_pixels(>1e-6)=" << bad;
-    // Tighter check: with LSD radix on full 64 bits, sort output is a
-    // permutation that matches std::sort exactly when keys are unique — and
-    // the packed keyval encodes gauss_idx in the low bits making collisions
-    // impossible across the (tile, depth_q28, idx) tuple. So the images
-    // should be identical at the bit level (tiny float blending differences
-    // can creep in through atomic/non-atomic reductions but rasterize.comp
-    // is single-threaded per pixel — no atomics).
+    // Tighter check: both routes feed the rasterizer equivalent tile/depth order;
+    // tiny float blending differences can creep in through implementation details,
+    // but rasterize.comp is single-threaded per pixel.
     EXPECT_LT(sse, 1e-4)
         << "env-on vs env-off SSE too high: " << sse << " (expected ~0)";
 }
 
-TEST(FuchsiaRadixE2E, EnvOnSorterConsumesGpuUnsortedKeyvals) {
+TEST(FuchsiaRadixE2E, EnvOnDoesNotConsumeGpuUnsortedKeyvals) {
     auto off = run_forward_with_env("0");
     if (off.W == 0) {
-        GTEST_SKIP() << "No Vulkan device with Fuchsia features.";
+        GTEST_SKIP() << "No Vulkan device.";
     }
-    auto on = run_forward_with_env("1", false, true);
+    auto on = run_forward_with_env("1", false, false, false, true);
     ASSERT_GT(on.W, 0);
-    if (!on.fuchsia_features_available) {
-        GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
-    }
     ASSERT_TRUE(on.used_unsorted_keyvals_gpu);
-    ASSERT_TRUE(on.used_keyvals_gpu);
-    ASSERT_TRUE(on.used_tile_ranges_gpu);
+    ASSERT_FALSE(on.used_keyvals_gpu);
+    if (on.fuchsia_features_available) {
+        ASSERT_TRUE(on.used_tile_ranges_gpu);
+    }
 
     ASSERT_EQ(off.image.size(), on.image.size());
     double sse = 0.0;
@@ -303,19 +302,18 @@ TEST(FuchsiaRadixE2E, EnvOnSorterConsumesGpuUnsortedKeyvals) {
     EXPECT_LT(sse, 1e-4);
 }
 
-TEST(FuchsiaRadixE2E, EnvOnZeroCopyConsumesGpuUnsortedKeyvals) {
+TEST(FuchsiaRadixE2E, EnvOnZeroCopyStillUsesCanonicalSortPairs) {
     auto off = run_forward_with_env("0");
     if (off.W == 0) {
-        GTEST_SKIP() << "No Vulkan device with Fuchsia features.";
+        GTEST_SKIP() << "No Vulkan device.";
     }
-    auto on = run_forward_with_env("1", true, true, true);
+    auto on = run_forward_with_env("1", false, false, true);
     ASSERT_GT(on.W, 0);
-    if (!on.fuchsia_features_available) {
-        GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
-    }
     ASSERT_TRUE(on.used_unsorted_keyvals_gpu);
-    ASSERT_TRUE(on.used_keyvals_gpu);
-    ASSERT_TRUE(on.used_tile_ranges_gpu);
+    ASSERT_FALSE(on.used_keyvals_gpu);
+    if (on.fuchsia_features_available) {
+        ASSERT_TRUE(on.used_tile_ranges_gpu);
+    }
 
     ASSERT_EQ(off.image.size(), on.image.size());
     double sse = 0.0;
@@ -329,17 +327,16 @@ TEST(FuchsiaRadixE2E, EnvOnZeroCopyConsumesGpuUnsortedKeyvals) {
     EXPECT_LT(sse, 1e-4);
 }
 
-TEST(FuchsiaRadixE2E, EnvOnRasterizerUsesGpuTileRanges) {
+TEST(FuchsiaRadixE2E, EnvOnRasterizerUsesCanonicalGpuTileRanges) {
     auto off = run_forward_with_env("0");
     if (off.W == 0) {
-        GTEST_SKIP() << "No Vulkan device with Fuchsia features.";
+        GTEST_SKIP() << "No Vulkan device.";
     }
     auto on = run_forward_with_env("1", true);
     ASSERT_GT(on.W, 0);
-    if (!on.fuchsia_features_available) {
-        GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
+    if (!on.used_tile_ranges_gpu) {
+        GTEST_SKIP() << "Canonical GPU tile ranges are unavailable on this device.";
     }
-    ASSERT_TRUE(on.used_tile_ranges_gpu);
 
     ASSERT_EQ(off.image.size(), on.image.size());
     double sse = 0.0;
@@ -357,14 +354,14 @@ TEST(FuchsiaRadixE2E, EnvOnRasterizerUsesGpuTileRanges) {
 // 2. env-on tile_ranges contract: monotonic key order + valid tile_ranges.
 // ============================================================================
 TEST(FuchsiaRadixE2E, EnvOnTileRangesContract) {
-    // Same fixture, env-on. We run forward, then directly inspect the
-    // SorterVulkan-populated bin.keyvals_sorted (downloaded host array) to
-    // assert (a) monotonic ordering and (b) tile_ranges agrees with a
-    // recomputed-from-keys reference.
     const char* saved = std::getenv("GS3D_USE_FUCHSIA_SORT");
     std::string saved_str = (saved != nullptr) ? std::string(saved) : std::string();
     bool was_set = (saved != nullptr);
+    const char* saved_exp = std::getenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    std::string saved_exp_str = (saved_exp != nullptr) ? std::string(saved_exp) : std::string();
+    bool exp_was_set = (saved_exp != nullptr);
     ::setenv("GS3D_USE_FUCHSIA_SORT", "1", 1);
+    ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", "1", 1);
 
     bool ran = false;
     int total_pairs_seen = 0;
@@ -434,59 +431,41 @@ TEST(FuchsiaRadixE2E, EnvOnTileRangesContract) {
             ran = true;
             PreprocessorVulkan prep   (ctx);
             TileBinnerVulkan   binner (ctx);
-            const auto& caps = ctx.capabilities();
-            if (!(caps.has_shader_int16 && caps.has_buffer_device_address &&
-                  caps.has_vulkan_memory_model && caps.has_vulkan_memory_model_device_scope)) {
-                GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
-            }
-
             SorterVulkan       sorter (ctx);
             FrameAllocator     alloc  (32u * 1024u * 1024u);
 
             PreprocessOutput pre = prep.process(g, cam, cfg, alloc);
             BinningOutput    bin = binner.bin(pre, N, cam, cfg, alloc);
             sorter.sort(bin, alloc);
-            ASSERT_NE(bin.keyvals_sorted_gpu, nullptr);
-            ASSERT_NE(bin.tile_ranges_gpu, nullptr);
+            ASSERT_EQ(bin.keyvals_sorted_gpu, nullptr);
+            if (ctx.capabilities().has_shader_int16 &&
+                ctx.capabilities().has_buffer_device_address &&
+                ctx.capabilities().has_vulkan_memory_model &&
+                ctx.capabilities().has_vulkan_memory_model_device_scope) {
+                ASSERT_NE(bin.tile_ranges_gpu, nullptr);
+            }
+            ASSERT_NE(bin.keys_sorted, nullptr);
+            ASSERT_NE(bin.values_sorted, nullptr);
+            ASSERT_NE(bin.tile_ranges, nullptr);
 
             const int R = bin.total_pairs;
             total_pairs_seen = R;
             ASSERT_GT(R, 0);
 
-            // env-aware download: helper returns the host pointer directly when
-            // populated, otherwise stage-downloads from published VkBuffer handles.
-            // The
-            // contract being asserted (monotonicity + tile_ranges
-            // consistency) is unchanged.
-            std::vector<uint64_t> kv_host;
-            std::vector<uint32_t> tr_host;
-            const uint64_t* kv = test_helpers::keyvals_sorted_host_view(
-                ctx, bin, kv_host);
-            const uint32_t* tr = test_helpers::tile_ranges_host_view(
-                ctx, bin, tr_host);
-
-            // Monotonic.
             for (int i = 1; i < R; ++i) {
-                ASSERT_LE(kv[i - 1], kv[i])
-                    << "non-monotonic at i=" << i;
+                ASSERT_LE(bin.keys_sorted[i - 1], bin.keys_sorted[i])
+                    << "non-monotonic canonical key at i=" << i;
             }
 
-            // tile_ranges contract: for every tile t, [start, end) covers
-            // exactly the keyvals with tile_id == t (and they are consecutive
-            // in the sorted array because tile_id is the most-significant
-            // sort key).
-            constexpr uint64_t kTileMask = 0xFFFFu;
-            constexpr uint32_t kTileShift = 48u;
             for (int t = 0; t < bin.num_tiles; ++t) {
-                const uint32_t s = tr[t * 2];
-                const uint32_t e = tr[t * 2 + 1];
-                if (s == 0u && e == 0u) continue;  // empty tile
+                const uint32_t s = bin.tile_ranges[t * 2];
+                const uint32_t e = bin.tile_ranges[t * 2 + 1];
+                if (s == 0u && e == 0u) continue;
                 ASSERT_LE(s, e) << "tile " << t << ": start > end";
                 ASSERT_LE(static_cast<int>(e), R)
                     << "tile " << t << ": end out of range";
                 for (uint32_t i = s; i < e; ++i) {
-                    const uint32_t tid = static_cast<uint32_t>(
-                        (kv[i] >> kTileShift) & kTileMask);
+                    const uint32_t tid = static_cast<uint32_t>(bin.keys_sorted[i] >> 32u);
                     ASSERT_EQ(tid, static_cast<uint32_t>(t))
                         << "tile " << t << " range [" << s << "," << e
                         << ") contains a key with tid=" << tid;
@@ -495,34 +474,32 @@ TEST(FuchsiaRadixE2E, EnvOnTileRangesContract) {
         }
     }
 
-    // Restore env.
     if (was_set) ::setenv("GS3D_USE_FUCHSIA_SORT", saved_str.c_str(), 1);
     else         ::unsetenv("GS3D_USE_FUCHSIA_SORT");
+    if (exp_was_set) ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", saved_exp_str.c_str(), 1);
+    else             ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
 
-    if (!ran) GTEST_SKIP() << "No Vulkan device with Fuchsia features.";
+    if (!ran) GTEST_SKIP() << "No Vulkan device.";
     EXPECT_GT(total_pairs_seen, 0);
 }
 
-TEST(FuchsiaRadixE2E, LargeAboveOldCapSorterRoute) {
+TEST(FuchsiaRadixE2E, LargeAboveOldCapUsesCanonicalSortPairs) {
     const char* run_large = std::getenv("GS3D_RUN_LARGE_FUCHSIA_TEST");
     if (run_large == nullptr || std::strcmp(run_large, "1") != 0) {
-        GTEST_SKIP() << "set GS3D_RUN_LARGE_FUCHSIA_TEST=1 to run the >4M sorter route test";
+        GTEST_SKIP() << "set GS3D_RUN_LARGE_FUCHSIA_TEST=1 to run the large canonical sorter route test";
     }
 
     VulkanContext ctx;
     if (!ctx.init()) {
-        GTEST_SKIP() << "No Vulkan device with Fuchsia features.";
-    }
-    const auto& caps = ctx.capabilities();
-    if (!(caps.has_shader_int16 && caps.has_buffer_device_address &&
-          caps.has_vulkan_memory_model && caps.has_vulkan_memory_model_device_scope)) {
-        GTEST_SKIP() << "Vulkan device lacks Fuchsia sort features.";
+        GTEST_SKIP() << "No Vulkan device.";
     }
 
     EnvVarGuard guard("GS3D_USE_FUCHSIA_SORT");
+    EnvVarGuard experimental_guard("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
     EnvVarGuard zero_guard("GS3D_FUCHSIA_SORT_ZERO_COPY");
     ::setenv("GS3D_USE_FUCHSIA_SORT", "1", 1);
-    ::unsetenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
+    ::setenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT", "1", 1);
+    ::setenv("GS3D_FUCHSIA_SORT_ZERO_COPY", "1", 1);
 
     uint32_t R = (1u << 22) + 1u;
     if (const char* r_env = std::getenv("GS3D_LARGE_FUCHSIA_R")) {
@@ -535,35 +512,39 @@ TEST(FuchsiaRadixE2E, LargeAboveOldCapSorterRoute) {
         R = static_cast<uint32_t>(parsed);
     }
     constexpr uint32_t kNumTiles = 256u;
-    std::vector<uint64_t> keyvals(R);
+    std::vector<uint64_t> keys(R);
+    std::vector<uint32_t> values(R);
     for (uint32_t i = 0; i < R; ++i) {
         const uint32_t tile = (i * 17u) & (kNumTiles - 1u);
-        const uint32_t depth = (R - i) & keyval_pack::DEPTH_MASK;
-        keyvals[i] = keyval_pack::pack(tile, depth, i & keyval_pack::IDX_MASK);
+        const uint32_t depth = R - i;
+        keys[i] = (static_cast<uint64_t>(tile) << 32u) | depth;
+        values[i] = (1u << 20) + i;
     }
 
     BinningOutput bin{};
     bin.total_pairs = static_cast<int>(R);
-    bin.keyvals_unsorted = keyvals.data();
+    bin.keys_unsorted = keys.data();
+    bin.values_unsorted = values.data();
     bin.num_tiles = static_cast<int>(kNumTiles);
+    bin.max_value_exclusive = values.back() + 1u;
 
     FrameAllocator alloc(192u * 1024u * 1024u);
     SorterVulkan sorter(ctx);
     sorter.sort(bin, alloc);
 
-    ASSERT_NE(bin.keyvals_sorted_gpu, nullptr);
+    ASSERT_EQ(bin.keyvals_sorted_gpu, nullptr);
     ASSERT_NE(bin.tile_ranges_gpu, nullptr);
-    ASSERT_NE(bin.keyvals_sorted, nullptr);
+    ASSERT_NE(bin.keys_sorted, nullptr);
     ASSERT_NE(bin.values_sorted, nullptr);
     ASSERT_NE(bin.tile_ranges, nullptr);
 
     for (uint32_t i = 1; i < R; ++i) {
-        ASSERT_LE(bin.keyvals_sorted[i - 1], bin.keyvals_sorted[i])
-            << "non-monotonic at i=" << i;
+        ASSERT_LE(bin.keys_sorted[i - 1], bin.keys_sorted[i])
+            << "non-monotonic canonical key at i=" << i;
     }
     for (uint32_t i = 0; i < R; ++i) {
-        ASSERT_LT(bin.values_sorted[i], keyval_pack::MAX_GAUSS)
-            << "out-of-range gaussian id at i=" << i;
+        ASSERT_GE(bin.values_sorted[i], 1u << 20)
+            << "full uint32 gaussian id was not preserved at i=" << i;
     }
     for (uint32_t t = 0; t < kNumTiles; ++t) {
         const uint32_t s = bin.tile_ranges[t * 2u];
@@ -572,7 +553,7 @@ TEST(FuchsiaRadixE2E, LargeAboveOldCapSorterRoute) {
         ASSERT_LE(s, e) << "tile " << t << ": start > end";
         ASSERT_LE(e, R) << "tile " << t << ": end out of range";
         for (uint32_t i = s; i < e; ++i) {
-            ASSERT_EQ(keyval_pack::tile_of(bin.keyvals_sorted[i]), t)
+            ASSERT_EQ(static_cast<uint32_t>(bin.keys_sorted[i] >> 32u), t)
                 << "tile " << t << " range [" << s << "," << e
                 << ") contains key from another tile";
         }

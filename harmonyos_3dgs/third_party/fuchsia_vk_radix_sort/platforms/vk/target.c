@@ -8,8 +8,12 @@
 // vendors/devices instead of dispatching to a missing target.
 extern const struct radix_sort_vk_target bifrost8_u32_target;
 extern const struct radix_sort_vk_target bifrost8_u64_target;
+extern const struct radix_sort_vk_target bifrost8_u96_target;
+extern const struct radix_sort_vk_target bifrost8_u128_target;
 extern const struct radix_sort_vk_target sm35_u32_target;
 extern const struct radix_sort_vk_target sm35_u64_target;
+extern const struct radix_sort_vk_target sm35_u96_target;
+extern const struct radix_sort_vk_target sm35_u128_target;
 
 radix_sort_vk_target_t const *
 radix_sort_vk_target_auto_detect(VkPhysicalDeviceProperties const * props,
@@ -33,6 +37,10 @@ radix_sort_vk_target_auto_detect(VkPhysicalDeviceProperties const * props,
               return &sm35_u32_target;
             case 2:
               return &sm35_u64_target;
+            case 3:
+              return &sm35_u96_target;
+            case 4:
+              return &sm35_u128_target;
           }
 
       case 0x13B5:
@@ -48,6 +56,10 @@ radix_sort_vk_target_auto_detect(VkPhysicalDeviceProperties const * props,
               return &bifrost8_u32_target;
             case 2:
               return &bifrost8_u64_target;
+            case 3:
+              return &bifrost8_u96_target;
+            case 4:
+              return &bifrost8_u128_target;
           }
     }
   return NULL;

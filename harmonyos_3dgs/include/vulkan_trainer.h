@@ -17,6 +17,7 @@
 #include "vulkan/dssim_loss_pass.h"
 #include "vulkan/sh_grad_split_pass.h"
 #include "vulkan/raw_activation_pass.h"
+#include "vulkan/regularization_pass.h"
 
 #include <vector>
 #include <memory>
@@ -27,6 +28,12 @@
 // back to CPU for the next forward pass activation.
 class VulkanTrainer {
 public:
+    enum class RawMaterializationKind {
+        None,
+        PositionsOnly,
+        Full,
+    };
+
     // init_g: initial Gaussian parameters (activated values)
     // init_raw: initial raw (pre-activation) parameters — must be same count as init_g
     VulkanTrainer(VulkanContext& ctx,
@@ -87,6 +94,7 @@ public:
     bool last_forward_cpu_cache_downloaded_for_test() const { return last_forward_cpu_cache_downloaded_; }
     bool last_gpu_grad_adam_used_for_test() const { return last_gpu_grad_adam_used_; }
     bool last_gpu_raw_activation_used_for_test() const { return last_gpu_raw_activation_used_; }
+    RawMaterializationKind last_raw_materialization_kind_for_test() const { return last_raw_materialization_kind_; }
 #endif
 
     void download_adam_moments(int group_idx,
@@ -158,6 +166,8 @@ public:
 private:
     void activate_params();   // raw_ → g_ (exp/sigmoid/normalize)
     void activate_params_gpu();
+    void download_active_noise_inputs();
+    void materialize_raw_positions() const;
     void materialize_raw_params() const;
     bool can_use_gpu_raw_activation() const;
     // Re-allocate GPU buffers after Gaussian count changes.
@@ -244,6 +254,7 @@ private:
     bool last_forward_cpu_cache_downloaded_ = false;
     bool last_gpu_grad_adam_used_ = false;
     bool last_gpu_raw_activation_used_ = false;
+    mutable RawMaterializationKind last_raw_materialization_kind_ = RawMaterializationKind::None;
 
     FrameAllocator alloc_;
     float          last_loss_ = 0.0f;
@@ -363,4 +374,5 @@ private:
     std::unique_ptr<DssimLossPass> dssim_loss_pass_;
     ShGradSplitPass           sh_grad_split_pass_;
     RawActivationPass         raw_activation_pass_;
+    RegularizationPass        regularization_pass_;
 };

@@ -162,6 +162,14 @@ layout(push_constant) uniform block_push
 #define RS_KEYVAL_TYPE uint32_t
 #elif (RS_KEYVAL_DWORDS == 2)
 #define RS_KEYVAL_TYPE u32vec2
+#elif (RS_KEYVAL_DWORDS == 3)
+struct rs_keyval_u96
+{
+  uint32_t dword[3];
+};
+#define RS_KEYVAL_TYPE rs_keyval_u96
+#elif (RS_KEYVAL_DWORDS == 4)
+#define RS_KEYVAL_TYPE u32vec4
 #else
 #error "Error: Unsupported RS_KEYVAL_DWORDS"
 #endif
@@ -195,6 +203,8 @@ layout(push_constant) uniform block_push
 //
 #if (RS_KEYVAL_DWORDS == 1)
 #define RS_KV_DWORD(kv_, dword_) (kv_)
+#elif (RS_KEYVAL_DWORDS == 3)
+#define RS_KV_DWORD(kv_, dword_) (kv_).dword[dword_]
 #else
 #define RS_KV_DWORD(kv_, dword_) (kv_)[dword_]
 #endif
@@ -216,7 +226,7 @@ layout(push_constant) uniform block_push
 #define RS_KV_EXTRACT_DIGIT(kv_) bitfieldExtract(kv_, int32_t(push.pass_offset), RS_RADIX_LOG2)
 #else
 #define RS_KV_EXTRACT_DIGIT(kv_)                                                                   \
-  bitfieldExtract(kv_[RS_SCATTER_KEYVAL_DWORD_BASE], int32_t(push.pass_offset), RS_RADIX_LOG2)
+  bitfieldExtract(RS_KV_DWORD(kv_, RS_SCATTER_KEYVAL_DWORD_BASE), int32_t(push.pass_offset), RS_RADIX_LOG2)
 #endif
 //----------------------------------------------------------------------
 #else
@@ -233,7 +243,7 @@ layout(push_constant) uniform block_push
 #define RS_KV_EXTRACT_DIGIT(kv_) ((kv_ >> push.pass_offset) & RS_RADIX_MASK)
 #else
 #define RS_KV_EXTRACT_DIGIT(kv_)                                                                   \
-  ((kv_[RS_SCATTER_KEYVAL_DWORD_BASE] >> push.pass_offset) & RS_RADIX_MASK)
+  ((RS_KV_DWORD(kv_, RS_SCATTER_KEYVAL_DWORD_BASE) >> push.pass_offset) & RS_RADIX_MASK)
 #endif
 //----------------------------------------------------------------------
 #endif
@@ -298,7 +308,11 @@ layout(local_size_x = RS_WORKGROUP_SIZE) in;
 //
 layout(buffer_reference, std430) buffer buffer_rs_kv
 {
+#if (RS_KEYVAL_DWORDS == 3)
+  uint32_t extent[];
+#else
   RS_KEYVAL_TYPE extent[];
+#endif
 };
 
 layout(buffer_reference, std430) buffer buffer_rs_histogram  // single histogram
@@ -1479,7 +1493,14 @@ rs_load(out RS_KEYVAL_TYPE kv[RS_SCATTER_BLOCK_ROWS])
   //
   [[unroll]] for (uint32_t ii = 0; ii < RS_SCATTER_BLOCK_ROWS; ii++)
   {
+#if (RS_KEYVAL_DWORDS == 3)
+    const uint32_t base = ii * RS_SUBGROUP_SIZE * RS_KEYVAL_DWORDS;
+    kv[ii].dword[0] = rs_kv_in.extent[base + 0];
+    kv[ii].dword[1] = rs_kv_in.extent[base + 1];
+    kv[ii].dword[2] = rs_kv_in.extent[base + 2];
+#else
     kv[ii] = rs_kv_in.extent[ii * RS_SUBGROUP_SIZE];
+#endif
   }
 }
 
@@ -1520,7 +1541,14 @@ rs_store(const RS_KEYVAL_TYPE kv[RS_SCATTER_BLOCK_ROWS], const uint32_t kr[RS_SC
   //
   [[unroll]] for (uint32_t ii = 0; ii < RS_SCATTER_BLOCK_ROWS; ii++)
   {
+#if (RS_KEYVAL_DWORDS == 3)
+    const uint32_t base = kr[ii] * RS_KEYVAL_DWORDS;
+    rs_kv_out.extent[base + 0] = kv[ii].dword[0];
+    rs_kv_out.extent[base + 1] = kv[ii].dword[1];
+    rs_kv_out.extent[base + 2] = kv[ii].dword[2];
+#else
     rs_kv_out.extent[kr[ii]] = kv[ii];
+#endif
   }
 }
 

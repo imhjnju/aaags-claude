@@ -110,8 +110,11 @@ struct BinningOutput {
     uint64_t* keyvals_unsorted = nullptr;
     uint64_t* keyvals_sorted = nullptr;
     int num_tiles;
+    uint32_t max_value_exclusive = 0;  // optional upper bound for values_unsorted Gaussian ids
     uint32_t* tile_ranges;    // [num_tiles * 2] (start, end)
     void* device_data = nullptr;  // GPU: opaque handle to device buffers
+    void* keys_unsorted_gpu = nullptr;     // VkBuffer, optional GPU-resident CUDA-style keys
+    void* values_unsorted_gpu = nullptr;   // VkBuffer, optional GPU-resident gaussian ids
     void* keyvals_unsorted_gpu = nullptr;  // VkBuffer, optional GPU-resident packed keyvals
     void* keyvals_sorted_gpu = nullptr;    // VkBuffer, optional GPU-resident packed keyvals
     void* values_sorted_gpu = nullptr;     // VkBuffer, optional GPU-resident sorted gaussian ids

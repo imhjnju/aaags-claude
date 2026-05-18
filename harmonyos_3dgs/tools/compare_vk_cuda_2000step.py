@@ -220,6 +220,7 @@ def run_vk_training(outdir: str, ppm_dir: str) -> str:
         "--output",     vk_ply,
         "--iterations", str(STEPS),
         "--log_every",  "200",
+        "--training_preset", "fast",
     ]
     print(f"  Running: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=False, text=True)

@@ -237,6 +237,10 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(tile_range _hdr_tile_range)
         gs3d_compile_glsl(packed_keyval_extract _spv_packed_keyval_extract)
         gs3d_embed_spirv(packed_keyval_extract _hdr_packed_keyval_extract)
+        gs3d_compile_glsl(canonical_sortpair_pack _spv_canonical_sortpair_pack)
+        gs3d_embed_spirv(canonical_sortpair_pack _hdr_canonical_sortpair_pack)
+        gs3d_compile_glsl(canonical_sortpair_extract _spv_canonical_sortpair_extract)
+        gs3d_embed_spirv(canonical_sortpair_extract _hdr_canonical_sortpair_extract)
         gs3d_compile_glsl(l1_loss _spv_l1_loss)
         gs3d_embed_spirv(l1_loss _hdr_l1_loss)
         gs3d_compile_glsl(dssim_loss_terms _spv_dssim_loss_terms)
@@ -247,6 +251,8 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(sh_grad_split _hdr_sh_grad_split)
         gs3d_compile_glsl(raw_activation _spv_raw_activation)
         gs3d_embed_spirv(raw_activation _hdr_raw_activation)
+        gs3d_compile_glsl(regularization _spv_regularization)
+        gs3d_embed_spirv(regularization _hdr_regularization)
         gs3d_compile_glsl(rasterize _spv_rasterize)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
         gs3d_compile_glsl(rasterize_hierarchical _spv_rasterize_hierarchical)
@@ -275,11 +281,14 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_radix_scatter} ${_hdr_radix_scatter}
                     ${_spv_tile_range} ${_hdr_tile_range}
                     ${_spv_packed_keyval_extract} ${_hdr_packed_keyval_extract}
+                    ${_spv_canonical_sortpair_pack} ${_hdr_canonical_sortpair_pack}
+                    ${_spv_canonical_sortpair_extract} ${_hdr_canonical_sortpair_extract}
                     ${_spv_l1_loss} ${_hdr_l1_loss}
                     ${_spv_dssim_loss_terms} ${_hdr_dssim_loss_terms}
                     ${_spv_dssim_loss_grad} ${_hdr_dssim_loss_grad}
                     ${_spv_sh_grad_split} ${_hdr_sh_grad_split}
                     ${_spv_raw_activation} ${_hdr_raw_activation}
+                    ${_spv_regularization} ${_hdr_regularization}
                     ${_spv_rasterize} ${_hdr_rasterize}
                     ${_spv_rasterize_hierarchical} ${_hdr_rasterize_hierarchical}
                     ${_spv_rasterize_cascade_trace} ${_hdr_rasterize_cascade_trace}
@@ -309,6 +318,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/dssim_loss_pass.cpp
             src/vulkan/sh_grad_split_pass.cpp
             src/vulkan/raw_activation_pass.cpp
+            src/vulkan/regularization_pass.cpp
             src/vulkan/sorter_vulkan.cpp
             src/vulkan/rasterize_pass.cpp
             src/vulkan/rasterizer_vulkan.cpp
@@ -343,7 +353,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         add_dependencies(gs3d_vk_render gs3d_vulkan_shaders)
         target_link_libraries(gs3d_vk_render PRIVATE gs3d_vk_core gs3d_core)
 
-        add_executable(gs3d_vk_train src/vulkan/vk_train_main.cpp)
+        add_executable(gs3d_vk_train
+            src/vulkan/vk_train_main.cpp
+            src/vulkan/vk_train_args.cpp)
         add_dependencies(gs3d_vk_train gs3d_vulkan_shaders)
         target_link_libraries(gs3d_vk_train PRIVATE gs3d_vk_core gs3d_core)
 
@@ -388,7 +400,9 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_vk_vs_cuda_100step.cpp
                 tests/test_fuchsia_link.cpp
                 tests/test_fuchsia_radix_wrapper.cpp
-                tests/test_fuchsia_radix_e2e_vk.cpp)
+                tests/test_fuchsia_radix_e2e_vk.cpp
+                tests/test_vk_train_args.cpp
+                src/vulkan/vk_train_args.cpp)
             add_dependencies(gs3d_vk_tests gs3d_vulkan_shaders)
             # gs3d_core provides transformPoint4x3 (CPU oracle) and types.
             target_link_libraries(gs3d_vk_tests PRIVATE

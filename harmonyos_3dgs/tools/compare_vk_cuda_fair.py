@@ -267,6 +267,7 @@ def run_vk_training(outdir: str, steps: int) -> np.ndarray:
         "--output",     vk_ply,
         "--iterations", str(steps),
         "--log_every",  "200",
+        "--training_preset", "fast",
         "--eval_3d",    "1" if EVAL_3D else "0",
     ]
     print(f"  Running: {' '.join(cmd)}")

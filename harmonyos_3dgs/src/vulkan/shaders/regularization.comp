@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ActiveOpacities {
+    float active_opacities[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer ActiveScales {
+    float active_scales[];
+};
+layout(std430, set = 0, binding = 2) buffer DRawOpacities {
+    float d_raw_opacities[];
+};
+layout(std430, set = 0, binding = 3) buffer DRawScales {
+    float d_raw_scales[];
+};
+
+layout(push_constant) uniform PC {
+    uint N;
+    float opacity_reg;
+    float scale_reg;
+    float inv_N;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.N) return;
+
+    if (pc.opacity_reg > 0.0) {
+        float sig = active_opacities[gid];
+        d_raw_opacities[gid] += (pc.opacity_reg * pc.inv_N) * sig * (1.0 - sig);
+    }
+
+    if (pc.scale_reg > 0.0) {
+        float coeff = (pc.scale_reg * pc.inv_N) / 3.0;
+        uint base = gid * 3u;
+        d_raw_scales[base + 0u] += coeff * active_scales[base + 0u];
+        d_raw_scales[base + 1u] += coeff * active_scales[base + 1u];
+        d_raw_scales[base + 2u] += coeff * active_scales[base + 2u];
+    }
+}

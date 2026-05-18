@@ -66,11 +66,16 @@ TEST(TrainUtils, SpatialLrScaleIsNoop) {
     EXPECT_FLOAT_EQ(actual, expected);
 }
 
-TEST(VkTrainingConfig, SP6DefaultFields) {
+TEST(VkTrainingConfig, AaaDefaultFields) {
     VkTrainingConfig cfg{};
-    EXPECT_FLOAT_EQ(cfg.opacity_reg,      0.01f);
-    EXPECT_FLOAT_EQ(cfg.scale_reg,        0.01f);
-    EXPECT_FLOAT_EQ(cfg.noise_lr,         5e5f);
+    EXPECT_FLOAT_EQ(cfg.lambda_dssim, 0.2f);
+    EXPECT_FLOAT_EQ(cfg.pos_lr_init, 1.6e-4f);
+    EXPECT_FLOAT_EQ(cfg.pos_lr_final, 1.6e-6f);
+    EXPECT_EQ(cfg.sh_degree_warmup, 1000);
+    EXPECT_EQ(cfg.opacity_reset_interval, 3000);
+    EXPECT_FLOAT_EQ(cfg.opacity_reg, 0.01f);
+    EXPECT_FLOAT_EQ(cfg.scale_reg, 0.01f);
+    EXPECT_FLOAT_EQ(cfg.noise_lr, 5e5f);
     EXPECT_FLOAT_EQ(cfg.spatial_lr_scale, 1.0f);
 }
 

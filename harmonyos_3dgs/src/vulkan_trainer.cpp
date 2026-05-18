@@ -61,9 +61,8 @@ bool gpu_l1_loss_enabled() {
 }
 
 bool gpu_dssim_loss_enabled() {
-    const char* dssim = std::getenv("GS3D_TRAIN_GPU_DSSIM_LOSS");
-    if (dssim && dssim[0] == '1' && dssim[1] == '\0') return true;
-    return gpu_l1_loss_enabled();
+    const char* v = std::getenv("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    return v && v[0] == '1' && v[1] == '\0';
 }
 
 bool forward_gpu_cache_enabled() {
@@ -196,6 +195,7 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     , l1_loss_pass_(ctx)
     , sh_grad_split_pass_(ctx)
     , raw_activation_pass_(ctx)
+    , regularization_pass_(ctx)
 {
     // 1. Copy raw parameters into owned vectors.
     raw_positions_.assign(init_raw.raw_positions, init_raw.raw_positions + N_ * 3);
@@ -424,9 +424,6 @@ bool VulkanTrainer::can_use_gpu_raw_activation() const {
     return gpu_raw_activation_enabled()
         && gpu_grad_adam_enabled()
         && tcfg_.cap_max > 0
-        && tcfg_.noise_lr == 0.0f
-        && tcfg_.opacity_reg == 0.0f
-        && tcfg_.scale_reg == 0.0f
         && !capture_grads_
         && !capture_backward_diagnostics_;
 }
@@ -443,6 +440,21 @@ void VulkanTrainer::activate_params_gpu() {
                                       active_sh_gpu_->handle());
     raw_activation_pass_.dispatch_sync(static_cast<uint32_t>(N_), static_cast<uint32_t>(max_coeffs_));
     last_gpu_raw_activation_used_ = true;
+}
+
+void VulkanTrainer::download_active_noise_inputs() {
+    if (N_ == 0 || tcfg_.noise_lr == 0.0f) return;
+    active_scales_gpu_->download(act_scales_.data(), static_cast<size_t>(N_) * 3 * sizeof(float));
+    active_rotations_gpu_->download(act_rotations_.data(), static_cast<size_t>(N_) * 4 * sizeof(float));
+    active_opacities_gpu_->download(act_opacities_.data(), static_cast<size_t>(N_) * sizeof(float));
+}
+
+void VulkanTrainer::materialize_raw_positions() const {
+    if (!raw_cpu_dirty_) return;
+    raw_param_gpu_bufs_[0]->download(raw_positions_.data(),
+                                     static_cast<size_t>(N_) * 3 * sizeof(float));
+    // Keep raw_cpu_dirty_ set because non-position raw CPU vectors are still stale.
+    last_raw_materialization_kind_ = RawMaterializationKind::PositionsOnly;
 }
 
 void VulkanTrainer::materialize_raw_params() const {
@@ -476,6 +488,7 @@ void VulkanTrainer::materialize_raw_params() const {
     raw_view_.raw_sh_coeffs = raw_sh_coeffs_.data();
     raw_view_.raw_opacities = raw_opacities_.data();
     raw_cpu_dirty_ = false;
+    last_raw_materialization_kind_ = RawMaterializationKind::Full;
 }
 
 const RawGaussianParams& VulkanTrainer::raw_params() const {
@@ -701,6 +714,7 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     last_gpu_raw_activation_used_ = false;
     if (use_gpu_raw_activation) {
         activate_params_gpu();
+        download_active_noise_inputs();
     } else {
         materialize_raw_params();
         activate_params();
@@ -782,7 +796,9 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
 
     // 3. Sort
     if (timing) t_stage = StageClock::now();
+    sorter_.set_host_mirror_enabled(capture_intermediates_);
     sorter_.sort(out_bin, alloc_);
+    sorter_.set_host_mirror_enabled(true);
     if (timing) stage_timing_sort_ms_ = stage_elapsed_ms(t_stage);
 
     // 4. Rasterize (populates cache.T_final and cache.n_contrib since they are non-null)
@@ -966,8 +982,6 @@ float VulkanTrainer::step(const Camera& cam,
     const bool use_gpu_grad_adam = gpu_grad_adam_enabled()
         && N_ > 0
         && tcfg_.cap_max > 0
-        && tcfg_.opacity_reg == 0.0f
-        && tcfg_.scale_reg == 0.0f
         && !capture_grads_
         && !capture_backward_diagnostics_;
 
@@ -1214,6 +1228,17 @@ float VulkanTrainer::step(const Camera& cam,
             grad_opa = preprocessor_bwd_.d_raw_opacities_buf();
             grad_sc = preprocessor_bwd_.d_raw_scales_buf();
             grad_rot = preprocessor_bwd_.d_raw_rotations_buf();
+            if (tcfg_.opacity_reg > 0.0f || tcfg_.scale_reg > 0.0f) {
+                regularization_pass_.bind_buffers(active_opacities_gpu_->handle(),
+                                                  active_scales_gpu_->handle(),
+                                                  grad_opa,
+                                                  grad_sc);
+                regularization_pass_.record(adam_cmd,
+                                            static_cast<uint32_t>(N_),
+                                            tcfg_.opacity_reg,
+                                            tcfg_.scale_reg);
+                insert_compute_barrier(adam_cmd);
+            }
             sh_grad_split_pass_.bind_buffers(preprocessor_bwd_.d_raw_sh_buf(), grad_sh_dc, grad_sh_rest);
             sh_grad_split_pass_.record(adam_cmd, static_cast<uint32_t>(N_), static_cast<uint32_t>(max_coeffs_));
             insert_compute_barrier(adam_cmd);
@@ -1264,12 +1289,15 @@ float VulkanTrainer::step(const Camera& cam,
         densification_enabled && tcfg_.opacity_reset_interval > 0 &&
         step_count_ > 0 && step_count_ <= tcfg_.densify_until_step &&
         (step_count_ % tcfg_.opacity_reset_interval == 0);
-    const bool skip_raw_download = can_use_gpu_raw_activation() && !should_densify && !should_reset_opacity;
+    const bool skip_full_raw_download = can_use_gpu_raw_activation() && !should_densify && !should_reset_opacity;
 
     if (timing) t_stage = StageClock::now();
     raw_cpu_dirty_ = true;
-    if (!skip_raw_download) {
+    last_raw_materialization_kind_ = RawMaterializationKind::None;
+    if (!skip_full_raw_download) {
         materialize_raw_params();
+    } else if (tcfg_.noise_lr != 0.0f) {
+        materialize_raw_positions();
     }
     if (timing) raw_download_ms = stage_elapsed_ms(t_stage);
 

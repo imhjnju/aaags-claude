@@ -22,6 +22,12 @@ DEFAULT_CAM_JSON = pathlib.Path("/home/robota/Downloads/basketball/_sp0_dump_out
 DEFAULT_IMAGE_DIR = pathlib.Path("/home/robota/Downloads/basketball/images")
 SH_DEGREE = 3
 LR_POS = 1.6e-4
+AAA_LAMBDA_DSSIM = 0.2
+AAA_LR_POS_FINAL = 1.6e-6
+AAA_SH_DEGREE_WARMUP = 1000
+AAA_OPACITY_REG = 0.01
+AAA_SCALE_REG = 0.01
+AAA_NOISE_LR = 5e5
 LR_SH_DC = 2.5e-3
 LR_SH_REST = 1.25e-4
 LR_OP = 0.05
@@ -435,7 +441,7 @@ def run_cuda(outdir, init_ply, train_dataset, render_dataset, schedule, steps, d
 
 
 def run_vk(outdir, init_ply, train_dataset, render_dataset, schedule, steps, vk_from_step, densify_until_iter,
-           densify_interval, cap_max, opacity_reset_interval, proper_ewa, lambda_dssim,
+           densify_interval, cap_max, opacity_reset_interval, proper_ewa, training_preset, lambda_dssim,
            pos_lr_init, pos_lr_final, spatial_lr_scale, sh_degree_warmup,
            opacity_reg, scale_reg, noise_lr, vk_parity_mode, save_render_npy):
     train_cam_json = outdir / "cameras_train.json"
@@ -483,6 +489,7 @@ def run_vk(outdir, init_ply, train_dataset, render_dataset, schedule, steps, vk_
         "--densify_interval", str(densify_interval),
         "--cap_max", str(cap_max),
         "--opacity_reset_interval", str(opacity_reset_interval),
+        "--training_preset", training_preset,
         "--lambda_dssim", str(lambda_dssim),
         "--pos_lr_init", str(pos_lr_init),
         "--pos_lr_final", str(pos_lr_final),
@@ -539,6 +546,30 @@ def run_vk(outdir, init_ply, train_dataset, render_dataset, schedule, steps, vk_
     return renders, train_render, ply_count(vk_ply), vk_from_arg, vk_until_arg, timing, vk_final_loss, render_failures
 
 
+def apply_training_preset(args, provided):
+    if args.training_preset == "fast":
+        defaults = {
+            "lambda_dssim": 0.0,
+            "pos_lr_final": args.pos_lr_init,
+            "sh_degree_warmup": 0,
+            "opacity_reg": 0.0,
+            "scale_reg": 0.0,
+            "noise_lr": 0.0,
+        }
+    else:
+        defaults = {
+            "lambda_dssim": AAA_LAMBDA_DSSIM,
+            "pos_lr_final": AAA_LR_POS_FINAL,
+            "sh_degree_warmup": AAA_SH_DEGREE_WARMUP,
+            "opacity_reg": AAA_OPACITY_REG,
+            "scale_reg": AAA_SCALE_REG,
+            "noise_lr": AAA_NOISE_LR,
+        }
+    for key, value in defaults.items():
+        if not provided[key]:
+            setattr(args, key, value)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", required=True)
@@ -556,14 +587,15 @@ def main():
     ap.add_argument("--opacity_reset_interval", type=int, default=0)
     ap.add_argument("--proper_ewa", type=int, default=1, choices=[0, 1])
     ap.add_argument("--vk_parity_mode", type=int, default=1, choices=[0, 1])
-    ap.add_argument("--lambda_dssim", type=float, default=0.0)
+    ap.add_argument("--training_preset", choices=["aaa", "fast"], default="aaa")
+    ap.add_argument("--lambda_dssim", type=float, default=None)
     ap.add_argument("--pos_lr_init", type=float, default=LR_POS)
-    ap.add_argument("--pos_lr_final", type=float, default=LR_POS)
+    ap.add_argument("--pos_lr_final", type=float, default=None)
     ap.add_argument("--spatial_lr_scale", type=float, default=1.0)
-    ap.add_argument("--sh_degree_warmup", type=int, default=0)
-    ap.add_argument("--opacity_reg", type=float, default=0.0)
-    ap.add_argument("--scale_reg", type=float, default=0.0)
-    ap.add_argument("--noise_lr", type=float, default=0.0)
+    ap.add_argument("--sh_degree_warmup", type=int, default=None)
+    ap.add_argument("--opacity_reg", type=float, default=None)
+    ap.add_argument("--scale_reg", type=float, default=None)
+    ap.add_argument("--noise_lr", type=float, default=None)
     ap.add_argument("--label", default="")
     ap.add_argument("--save_render_npy", type=int, default=0, choices=[0, 1])
     ap.add_argument("--eval_split", type=int, default=0, choices=[0, 1], help="Use AAA-GS llffhold train/test split")
@@ -571,6 +603,15 @@ def main():
     ap.add_argument("--min_vk_cuda_psnr", type=float, default=20.0)
     ap.add_argument("--max_gt_psnr_gap", type=float, default=2.0)
     args = ap.parse_args()
+    provided = {
+        "lambda_dssim": args.lambda_dssim is not None,
+        "pos_lr_final": args.pos_lr_final is not None,
+        "sh_degree_warmup": args.sh_degree_warmup is not None,
+        "opacity_reg": args.opacity_reg is not None,
+        "scale_reg": args.scale_reg is not None,
+        "noise_lr": args.noise_lr is not None,
+    }
+    apply_training_preset(args, provided)
 
     if not args.init_ply.exists():
         raise RuntimeError(f"missing filtered init PLY: {args.init_ply}")
@@ -620,6 +661,7 @@ def main():
         "seed": args.seed,
         "proper_ewa": int(proper_ewa),
         "vk_parity_mode": args.vk_parity_mode,
+        "training_preset": args.training_preset,
         "lambda_dssim": args.lambda_dssim,
         "pos_lr_init": args.pos_lr_init,
         "pos_lr_final": args.pos_lr_final,
@@ -652,7 +694,7 @@ def main():
     vk, vk_train_final, vk_n, vk_from_arg, vk_until_arg, vk_timing, vk_final_loss, vk_render_failures = run_vk(
         outdir, args.init_ply, train_dataset, render_dataset, schedule, args.steps,
         args.vk_densify_from_step, args.densify_until, args.densify_interval,
-        args.cap_max, args.opacity_reset_interval, proper_ewa, args.lambda_dssim,
+        args.cap_max, args.opacity_reset_interval, proper_ewa, args.training_preset, args.lambda_dssim,
         args.pos_lr_init, args.pos_lr_final, args.spatial_lr_scale,
         args.sh_degree_warmup, args.opacity_reg, args.scale_reg, args.noise_lr,
         bool(args.vk_parity_mode), save_render_npy)
@@ -777,6 +819,7 @@ def main():
   Seed        : {args.seed}
   proper_ewa  : {int(proper_ewa)}
   VK parity   : {args.vk_parity_mode}
+  preset      : {args.training_preset}
   lambda_dssim: {args.lambda_dssim:.3f}
   pos LR      : {args.pos_lr_init:.8f} -> {args.pos_lr_final:.8f} (scale={args.spatial_lr_scale:.3f})
   opacity_reg : {args.opacity_reg:g}

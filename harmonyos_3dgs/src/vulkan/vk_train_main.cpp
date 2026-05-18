@@ -2,6 +2,7 @@
 #include "image_io.h"
 #include "vulkan/vk_context.h"
 #include "vulkan_trainer.h"
+#include "vulkan/vk_train_args.h"
 #include "train_types.h"
 #include <cstdio>
 #include <cstdlib>
@@ -401,143 +402,6 @@ static std::vector<CameraWithImage> loadCamerasJson(const char* json_path) {
     return cameras;
 }
 
-// ---------------------------------------------------------------------------
-// CLI argument parsing
-// ---------------------------------------------------------------------------
-struct TrainArgs {
-    const char* ply_path = nullptr;
-    const char* gt_path = nullptr;
-    const char* cameras_json = nullptr;
-    const char* gt_dir = nullptr;
-    const char* view_schedule_path = nullptr;
-    const char* output_path = "trained.ply";
-    int iterations = 30000;
-    int width = 512;
-    int height = 512;
-    float cam_x = 0, cam_y = 0, cam_z = 0;
-    float look_x = 0, look_y = 0, look_z = 5;
-    float fov = 50.0f;
-    int sh_degree = -1;
-    int save_every = 0;
-    int log_every = 100;
-    bool eval_3D = false;
-    bool parity_mode = false;
-    bool parity_mode_provided = false;
-    bool proper_ewa = false;
-    bool require_all_gt = false;
-    float lambda_dssim = 0.0f;
-    float opacity_reg = 0.0f;
-    float scale_reg = 0.0f;
-    float noise_lr = 0.0f;
-    float pos_lr_init = 1.6e-4f;
-    float pos_lr_final = 1.6e-4f;
-    float spatial_lr_scale = 1.0f;
-    int sh_degree_warmup = 0;
-    bool densify = false;
-    int densify_from_step = 500;
-    int densify_until_step = 15000;
-    int densify_interval = 100;
-    int cap_max = 0;
-    bool cap_max_provided = false;
-    int opacity_reset_interval = 3000;
-    std::string parse_error;
-};
-
-static TrainArgs parseArgs(int argc, char** argv) {
-    TrainArgs args;
-    auto require_value = [&](int& i, const char* flag) -> const char* {
-        if (i + 1 >= argc || strncmp(argv[i + 1], "--", 2) == 0) {
-            args.parse_error = std::string("missing value for ") + flag;
-            return nullptr;
-        }
-        return argv[++i];
-    };
-    auto parse_int = [&](int& i, const char* flag, int& out) -> bool {
-        const char* value = require_value(i, flag);
-        if (!value) return false;
-        errno = 0;
-        char* end = nullptr;
-        long parsed = std::strtol(value, &end, 10);
-        if (errno != 0 || end == value || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
-            args.parse_error = std::string("invalid integer for ") + flag + ": " + value;
-            return false;
-        }
-        out = static_cast<int>(parsed);
-        return true;
-    };
-    auto parse_float = [&](int& i, const char* flag, float& out) -> bool {
-        const char* value = require_value(i, flag);
-        if (!value) return false;
-        errno = 0;
-        char* end = nullptr;
-        float parsed = std::strtof(value, &end);
-        if (errno != 0 || end == value || *end != '\0' || !std::isfinite(parsed)) {
-            args.parse_error = std::string("invalid finite float for ") + flag + ": " + value;
-            return false;
-        }
-        out = parsed;
-        return true;
-    };
-    auto parse_bool = [&](int& i, const char* flag, bool& out) -> bool {
-        int v = 0;
-        if (!parse_int(i, flag, v)) return false;
-        if (v != 0 && v != 1) {
-            args.parse_error = std::string("invalid boolean for ") + flag + ": expected 0 or 1";
-            return false;
-        }
-        out = (v != 0);
-        return true;
-    };
-
-    for (int i = 1; i < argc && args.parse_error.empty(); i++) {
-        if (strcmp(argv[i], "--ply") == 0)            args.ply_path = require_value(i, "--ply");
-        else if (strcmp(argv[i], "--gt") == 0)        args.gt_path = require_value(i, "--gt");
-        else if (strcmp(argv[i], "--cameras") == 0)   args.cameras_json = require_value(i, "--cameras");
-        else if (strcmp(argv[i], "--gt_dir") == 0)    args.gt_dir = require_value(i, "--gt_dir");
-        else if (strcmp(argv[i], "--view_schedule") == 0) args.view_schedule_path = require_value(i, "--view_schedule");
-        else if (strcmp(argv[i], "--output") == 0)    args.output_path = require_value(i, "--output");
-        else if (strcmp(argv[i], "--iterations") == 0) { if (!parse_int(i, "--iterations", args.iterations)) break; }
-        else if (strcmp(argv[i], "--width") == 0) { if (!parse_int(i, "--width", args.width)) break; }
-        else if (strcmp(argv[i], "--height") == 0) { if (!parse_int(i, "--height", args.height)) break; }
-        else if (strcmp(argv[i], "--cam_x") == 0) { if (!parse_float(i, "--cam_x", args.cam_x)) break; }
-        else if (strcmp(argv[i], "--cam_y") == 0) { if (!parse_float(i, "--cam_y", args.cam_y)) break; }
-        else if (strcmp(argv[i], "--cam_z") == 0) { if (!parse_float(i, "--cam_z", args.cam_z)) break; }
-        else if (strcmp(argv[i], "--look_x") == 0) { if (!parse_float(i, "--look_x", args.look_x)) break; }
-        else if (strcmp(argv[i], "--look_y") == 0) { if (!parse_float(i, "--look_y", args.look_y)) break; }
-        else if (strcmp(argv[i], "--look_z") == 0) { if (!parse_float(i, "--look_z", args.look_z)) break; }
-        else if (strcmp(argv[i], "--fov") == 0) { if (!parse_float(i, "--fov", args.fov)) break; }
-        else if (strcmp(argv[i], "--sh_degree") == 0) { if (!parse_int(i, "--sh_degree", args.sh_degree)) break; }
-        else if (strcmp(argv[i], "--save_every") == 0) { if (!parse_int(i, "--save_every", args.save_every)) break; }
-        else if (strcmp(argv[i], "--log_every") == 0) { if (!parse_int(i, "--log_every", args.log_every)) break; }
-        else if (strcmp(argv[i], "--densify") == 0) { if (!parse_bool(i, "--densify", args.densify)) break; }
-        else if (strcmp(argv[i], "--densify_from_step") == 0) { if (!parse_int(i, "--densify_from_step", args.densify_from_step)) break; }
-        else if (strcmp(argv[i], "--densify_until_step") == 0) { if (!parse_int(i, "--densify_until_step", args.densify_until_step)) break; }
-        else if (strcmp(argv[i], "--densify_interval") == 0) { if (!parse_int(i, "--densify_interval", args.densify_interval)) break; }
-        else if (strcmp(argv[i], "--cap_max") == 0) {
-            if (!parse_int(i, "--cap_max", args.cap_max)) break;
-            args.cap_max_provided = true;
-        }
-        else if (strcmp(argv[i], "--opacity_reset_interval") == 0) { if (!parse_int(i, "--opacity_reset_interval", args.opacity_reset_interval)) break; }
-        else if (strcmp(argv[i], "--eval_3d") == 0) { if (!parse_bool(i, "--eval_3d", args.eval_3D)) break; }
-        else if (strcmp(argv[i], "--parity_mode") == 0) {
-            if (!parse_bool(i, "--parity_mode", args.parity_mode)) break;
-            args.parity_mode_provided = true;
-        }
-        else if (strcmp(argv[i], "--proper_ewa") == 0) { if (!parse_bool(i, "--proper_ewa", args.proper_ewa)) break; }
-        else if (strcmp(argv[i], "--require_all_gt") == 0) { if (!parse_bool(i, "--require_all_gt", args.require_all_gt)) break; }
-        else if (strcmp(argv[i], "--lambda_dssim") == 0) { if (!parse_float(i, "--lambda_dssim", args.lambda_dssim)) break; }
-        else if (strcmp(argv[i], "--opacity_reg") == 0) { if (!parse_float(i, "--opacity_reg", args.opacity_reg)) break; }
-        else if (strcmp(argv[i], "--scale_reg") == 0) { if (!parse_float(i, "--scale_reg", args.scale_reg)) break; }
-        else if (strcmp(argv[i], "--noise_lr") == 0) { if (!parse_float(i, "--noise_lr", args.noise_lr)) break; }
-        else if (strcmp(argv[i], "--pos_lr_init") == 0) { if (!parse_float(i, "--pos_lr_init", args.pos_lr_init)) break; }
-        else if (strcmp(argv[i], "--pos_lr_final") == 0) { if (!parse_float(i, "--pos_lr_final", args.pos_lr_final)) break; }
-        else if (strcmp(argv[i], "--spatial_lr_scale") == 0) { if (!parse_float(i, "--spatial_lr_scale", args.spatial_lr_scale)) break; }
-        else if (strcmp(argv[i], "--sh_degree_warmup") == 0) { if (!parse_int(i, "--sh_degree_warmup", args.sh_degree_warmup)) break; }
-        else args.parse_error = std::string("unknown option: ") + argv[i];
-    }
-    return args;
-}
-
 static void printUsage(const char* prog) {
     printf("Usage: %s --ply <input.ply> [options]\n\n", prog);
     printf("Single-camera training:\n");
@@ -570,14 +434,16 @@ static void printUsage(const char* prog) {
     printf("  --eval_3d <0|1>       Use eval_3D rasterization during training (default: 0)\n");
     printf("  --parity_mode <0|1>   Use eval_3D parity replay mode; defaults to --eval_3d\n");
     printf("  --proper_ewa <0|1>    Use AAA proper EWA preprocessing during training (default: 0)\n");
-    printf("  --lambda_dssim <v>    DSSIM weight in combined loss, [0,1] (default: 0)\n");
-    printf("  --opacity_reg <v>     Opacity regularization weight (default: 0)\n");
-    printf("  --scale_reg <v>       Scale regularization weight (default: 0)\n");
-    printf("  --noise_lr <v>        Position noise LR (default: 0)\n");
+    printf("  --training_preset <aaa|fast>  Hyperparameter defaults: aaa reference or old fast/L1 baseline (default: aaa)\n");
+    printf("  --lambda_dssim <v>    DSSIM weight in combined loss, [0,1] (aaa default: 0.2; fast: 0)\n");
+    printf("                         GPU DSSIM still requires GS3D_TRAIN_GPU_DSSIM_LOSS=1\n");
+    printf("  --opacity_reg <v>     Opacity regularization weight (aaa default: 0.01; fast: 0)\n");
+    printf("  --scale_reg <v>       Scale regularization weight (aaa default: 0.01; fast: 0)\n");
+    printf("  --noise_lr <v>        Position noise LR (aaa default: 5e5; fast: 0)\n");
     printf("  --pos_lr_init <v>     Position LR init (default: 1.6e-4)\n");
-    printf("  --pos_lr_final <v>    Position LR final; same as init disables decay (default: 1.6e-4)\n");
+    printf("  --pos_lr_final <v>    Position LR final (aaa default: 1.6e-6; fast: same as init)\n");
     printf("  --spatial_lr_scale <v>  Position LR spatial scale (default: 1)\n");
-    printf("  --sh_degree_warmup <N>  Steps between SH degree increments; 0 uses full degree from start\n");
+    printf("  --sh_degree_warmup <N>  Steps between SH degree increments (aaa default: 1000; fast: 0)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +463,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    TrainArgs args = parseArgs(argc, argv);
+    TrainArgs args = parseVkTrainArgs(argc, argv);
     if (!args.parse_error.empty()) {
         printf("Error: %s\n", args.parse_error.c_str());
         printUsage(argv[0]);

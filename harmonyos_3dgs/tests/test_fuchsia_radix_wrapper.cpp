@@ -23,6 +23,7 @@
 
 #include "vulkan/vk_context.h"
 #include "vulkan/radix_sort_fuchsia.h"
+#include "types.h"
 
 #include <gtest/gtest.h>
 
@@ -111,6 +112,99 @@ bool make_raw_buffer(VulkanContext& ctx, VkDeviceSize size,
 // True iff x is a power of two (and nonzero).
 bool is_pow2(VkDeviceSize x) { return x != 0 && (x & (x - 1)) == 0; }
 
+void run_fuchsia_sort_keyvals(VulkanContext& ctx,
+                              const std::vector<uint64_t>& input,
+                              uint32_t key_bits,
+                              std::vector<uint64_t>& got) {
+    ASSERT_FALSE(input.empty());
+    const uint32_t key_count = static_cast<uint32_t>(input.size());
+    RadixSortFuchsia rs(ctx, key_count);
+    auto mr = rs.memory_requirements(key_count);
+
+    const VkBufferUsageFlags kv_usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkBufferUsageFlags int_usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    RawBuf kv_in, kv_scratch, internal;
+    ASSERT_TRUE(make_raw_buffer(ctx, mr.keyvals_size, kv_usage,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, kv_in));
+    ASSERT_TRUE(make_raw_buffer(ctx, mr.keyvals_size, kv_usage,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, kv_scratch));
+    ASSERT_TRUE(make_raw_buffer(ctx, mr.internal_size, int_usage,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, internal));
+
+    const VkDeviceSize host_bytes = static_cast<VkDeviceSize>(key_count) * sizeof(uint64_t);
+    RawBuf staging_up, staging_dn;
+    ASSERT_TRUE(make_raw_buffer(ctx, host_bytes,
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                staging_up));
+    ASSERT_TRUE(make_raw_buffer(ctx, host_bytes,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                staging_dn));
+
+    std::memcpy(staging_up.mapped, input.data(), static_cast<size_t>(host_bytes));
+
+    VkCommandBuffer cmd = ctx.allocatePrimary();
+    ASSERT_NE(cmd, VK_NULL_HANDLE);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    ASSERT_EQ(vkBeginCommandBuffer(cmd, &bi), VK_SUCCESS);
+
+    VkBufferCopy copy_up{0, 0, host_bytes};
+    vkCmdCopyBuffer(cmd, staging_up.buf, kv_in.buf, 1, &copy_up);
+
+    VkBufferMemoryBarrier mb_pre{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    mb_pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb_pre.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb_pre.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb_pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb_pre.buffer = kv_in.buf;
+    mb_pre.offset = 0;
+    mb_pre.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 1, &mb_pre, 0, nullptr);
+
+    rs.record(cmd, kv_in.buf, kv_scratch.buf, internal.buf, key_count, key_bits);
+    VkBuffer sorted_buf = rs.sorted_buffer_after_sort(kv_in.buf, kv_scratch.buf,
+                                                      key_count, key_bits);
+    ASSERT_TRUE(sorted_buf == kv_in.buf || sorted_buf == kv_scratch.buf);
+
+    VkBufferMemoryBarrier mb_post{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    mb_post.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb_post.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    mb_post.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb_post.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb_post.buffer = sorted_buf;
+    mb_post.offset = 0;
+    mb_post.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 1, &mb_post, 0, nullptr);
+
+    VkBufferCopy copy_dn{0, 0, host_bytes};
+    vkCmdCopyBuffer(cmd, sorted_buf, staging_dn.buf, 1, &copy_dn);
+
+    ASSERT_EQ(vkEndCommandBuffer(cmd), VK_SUCCESS);
+    ctx.submitAndWait(cmd);
+    ctx.freePrimary(cmd);
+
+    got.resize(input.size());
+    std::memcpy(got.data(), staging_dn.mapped, static_cast<size_t>(host_bytes));
+}
+
 }  // namespace
 
 // =============================================================================
@@ -166,6 +260,35 @@ TEST(FuchsiaRadixWrapper, ConstructorRejectsInvalidMaxKeyvals) {
     VulkanContext ctx;
     EXPECT_THROW(RadixSortFuchsia(ctx, 0u), std::runtime_error);
     EXPECT_THROW(RadixSortFuchsia(ctx, 1u << 30), std::runtime_error);
+}
+
+TEST(FuchsiaRadixWrapper, SortPackedKeyvalsByTileDepthPrefix) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "skip: no Vulkan 1.2 device with Fuchsia features";
+    }
+
+    constexpr uint32_t KEY_BITS = keyval_pack::TILE_BITS + keyval_pack::DEPTH_BITS;
+    const std::vector<uint64_t> input = {
+        keyval_pack::pack(2u, 30u, 7u),
+        keyval_pack::pack(1u, 50u, 9u),
+        keyval_pack::pack(1u, 10u, 3u),
+        keyval_pack::pack(1u, 50u, 1u),
+        keyval_pack::pack(0u, 99u, 4u),
+        keyval_pack::pack(2u, 10u, 2u),
+    };
+    const std::vector<uint64_t> expected = {
+        keyval_pack::pack(0u, 99u, 4u),
+        keyval_pack::pack(1u, 10u, 3u),
+        keyval_pack::pack(1u, 50u, 9u),
+        keyval_pack::pack(1u, 50u, 1u),
+        keyval_pack::pack(2u, 10u, 2u),
+        keyval_pack::pack(2u, 30u, 7u),
+    };
+
+    std::vector<uint64_t> got;
+    run_fuchsia_sort_keyvals(ctx, input, KEY_BITS, got);
+    EXPECT_EQ(got, expected);
 }
 
 TEST(FuchsiaRadixWrapper, RejectsCountsAboveConstructorMax) {

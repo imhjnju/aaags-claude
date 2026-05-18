@@ -41,7 +41,8 @@ public:
     /// largest sort count you expect; sorting fewer elements is fine.
     /// Throws std::runtime_error if no Fuchsia target matches the device, or
     /// if `radix_sort_vk_create` returns NULL.
-    RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals);
+    RadixSortFuchsia(VulkanContext& ctx, uint32_t max_keyvals,
+                     uint32_t keyval_dwords = 2);
     ~RadixSortFuchsia();
 
     RadixSortFuchsia(const RadixSortFuchsia&)            = delete;
@@ -75,7 +76,7 @@ public:
     /// staging upload) and after the sort before any subsequent read.
     ///
     /// `count` must be <= max_keyvals from the constructor and < 2^30.
-    /// `key_bits` is the number of low bits to sort on (1..64 for u64).
+    /// `key_bits` is the number of most-significant bits to sort on (1..64 for u64).
     /// `keyvals_in` and `keyvals_scratch` must be sized at
     /// `memory_requirements(count).keyvals_size` and aligned to
     /// `keyvals_alignment`. `internal_scratch` likewise for `internal_*`.
@@ -117,6 +118,7 @@ private:
     radix_sort_vk*                      rs_           = nullptr;
     const radix_sort_vk_target*         target_       = nullptr;
     uint32_t                            max_keyvals_  = 0;
+    uint32_t                            keyval_dwords_ = 2;
     // The result-buffer parity is stable for a given (count, key_bits) pair
     // because Fuchsia's pass count is a deterministic function of key_bits and
     // the keyval radix. We capture it on the most recent `record()` call.

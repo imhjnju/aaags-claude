@@ -124,10 +124,6 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         return out;
     }
 
-    if (static_cast<uint32_t>(N) > keyval_pack::MAX_GAUSS) {
-        throw std::runtime_error("TileBinnerVulkan: packed keyval gaussian id exceeds 20-bit range");
-    }
-
     // -------------------------------------------------------------------
     // 1. Ensure persistent SSBOs are large enough, then upload inputs.
     // -------------------------------------------------------------------
@@ -357,8 +353,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     out.values_unsorted = alloc.allocate_array<uint32_t>(R);
     out.keys_sorted     = nullptr;   // SorterVulkan (T14)
     out.values_sorted   = nullptr;
+    out.max_value_exclusive = static_cast<uint32_t>(N);
     out.tile_ranges     = nullptr;
-    out.keyvals_unsorted_gpu = bin_keyvals_buf_->handle();
+    out.keys_unsorted_gpu = reinterpret_cast<void*>(bin_keys_buf_->handle());
+    out.values_unsorted_gpu = reinterpret_cast<void*>(bin_vals_buf_->handle());
+    out.keyvals_unsorted_gpu = reinterpret_cast<void*>(bin_keyvals_buf_->handle());
 
     bin_keys_buf_->download(out.keys_unsorted,
                             static_cast<std::size_t>(R) * sizeof(uint64_t));

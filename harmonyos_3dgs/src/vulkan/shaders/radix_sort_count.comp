@@ -15,9 +15,10 @@
 // to Phase 2 and will require a wg-local stable scatter + global offsets.
 //
 // Output layout (matches prefix_sum.comp input contract):
-//   histograms[wg_id * 16 + bucket] = count of keys in this WG that have
-//                                     ((key >> current_bit) & 0xF) == bucket.
-// For single-WG (wg_id=0 always), this degenerates to histograms[bucket].
+//   histograms[bucket * num_workgroups + wg_id] = count of keys in this WG that
+//                                                 have ((key >> current_bit) & 0xF) == bucket.
+// Bucket-major layout makes one global exclusive scan produce bucket bases plus
+// per-bucket prefixes over earlier workgroups.
 //
 // Bindings — must match radix_count_bind:: in
 // include/vulkan/preprocess_bindings.h (KEYS_IN=0, HISTOGRAMS=1).
@@ -31,7 +32,7 @@ layout(std430, set = 0, binding = 1)          buffer Histograms { uint     histo
 layout(push_constant) uniform PC {
     uint num_elements;
     uint current_bit;   // 0, 4, 8, ..., 60
-    uint _pad0;
+    uint num_workgroups;
     uint _pad1;
 } pc;
 
@@ -64,6 +65,6 @@ void main() {
     // Publish the 16 per-WG counts to global memory. The scan pass reads
     // histograms[0 .. num_wgs*16) as its input array.
     if (lid < 16u) {
-        histograms[wg_id * 16u + lid] = s_hist[lid];
+        histograms[lid * pc.num_workgroups + wg_id] = s_hist[lid];
     }
 }

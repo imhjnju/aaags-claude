@@ -230,6 +230,7 @@ def run_vk(outdir, steps, vk_from_step, densify_until_step, densify_interval, ca
         "--output", str(vk_ply),
         "--iterations", str(steps),
         "--log_every", "250",
+        "--training_preset", "fast",
         "--eval_3d", "1",
         "--proper_ewa", "1" if proper_ewa else "0",
         "--densify", "1",

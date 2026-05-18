@@ -25,7 +25,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -34,6 +36,27 @@ namespace {
 
 std::string tiny_cam0_dir() {
     return std::string(TEST_DATA_DIR) + "/golden/tiny/step000001/cam0000";
+}
+
+struct EnvVarGuard {
+    explicit EnvVarGuard(const char* name) : name(name) {
+        const char* current = std::getenv(name);
+        if (current != nullptr) {
+            was_set = true;
+            saved = current;
+        }
+    }
+    ~EnvVarGuard() {
+        if (was_set) ::setenv(name, saved.c_str(), 1);
+        else ::unsetenv(name);
+    }
+    const char* name;
+    bool was_set = false;
+    std::string saved;
+};
+
+uint64_t make_sort_key(uint32_t tile, uint32_t depth) {
+    return (static_cast<uint64_t>(tile) << 32u) | depth;
 }
 
 }  // namespace
@@ -193,4 +216,123 @@ TEST(SorterVulkan, BinAndSort_TinyFixture) {
                 << " but is in tile " << t << "'s range [" << start << ", " << end << ")";
         }
     }
+}
+
+TEST(SorterVulkan, FuchsiaEnvPreservesCudaKeyValueContract) {
+    VulkanContext ctx;
+    ASSERT_TRUE(ctx.init()) << "Vulkan init failed — no compute-capable device?";
+
+    EnvVarGuard fuchsia_guard("GS3D_USE_FUCHSIA_SORT");
+    EnvVarGuard experimental_guard("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    EnvVarGuard zero_copy_guard("GS3D_FUCHSIA_SORT_ZERO_COPY");
+    ::setenv("GS3D_USE_FUCHSIA_SORT", "1", 1);
+    ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    ::unsetenv("GS3D_FUCHSIA_SORT_ZERO_COPY");
+
+    std::vector<uint64_t> keys = {
+        make_sort_key(1u, 0x00000020u),
+        make_sort_key(0u, 0x00000011u),
+        make_sort_key(0u, 0x00000010u),
+        make_sort_key(1u, 0x00000020u),
+        make_sort_key(2u, 0x00000001u),
+        make_sort_key(1u, 0x0000002Fu),
+    };
+    std::vector<uint32_t> values = {
+        (1u << 20) + 17u,
+        42u,
+        (1u << 20) + 1u,
+        (1u << 20) + 99u,
+        7u,
+        (1u << 20) + 123u,
+    };
+
+    BinningOutput bin{};
+    bin.total_pairs = static_cast<int>(keys.size());
+    bin.keys_unsorted = keys.data();
+    bin.values_unsorted = values.data();
+    bin.num_tiles = 3;
+
+    FrameAllocator alloc(1024u * 1024u);
+    SorterVulkan sorter(ctx);
+    sorter.sort(bin, alloc);
+
+    ASSERT_NE(bin.keys_sorted, nullptr);
+    ASSERT_NE(bin.values_sorted, nullptr);
+    ASSERT_NE(bin.tile_ranges, nullptr);
+
+    std::vector<uint32_t> order(keys.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return keys[a] < keys[b];
+    });
+
+    for (size_t i = 0; i < order.size(); ++i) {
+        EXPECT_EQ(bin.keys_sorted[i], keys[order[i]]) << "key mismatch at i=" << i;
+        EXPECT_EQ(bin.values_sorted[i], values[order[i]]) << "value mismatch at i=" << i;
+    }
+    EXPECT_EQ(bin.tile_ranges[0], 0u);
+    EXPECT_EQ(bin.tile_ranges[1], 2u);
+    EXPECT_EQ(bin.tile_ranges[2], 2u);
+    EXPECT_EQ(bin.tile_ranges[3], 5u);
+    EXPECT_EQ(bin.tile_ranges[4], 5u);
+    EXPECT_EQ(bin.tile_ranges[5], 6u);
+}
+
+TEST(SorterVulkan, MultiWorkgroupPreservesCudaKeyValueContract) {
+    VulkanContext ctx;
+    ASSERT_TRUE(ctx.init()) << "Vulkan init failed — no compute-capable device?";
+
+    EnvVarGuard fuchsia_guard("GS3D_USE_FUCHSIA_SORT");
+    EnvVarGuard experimental_guard("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+    ::setenv("GS3D_USE_FUCHSIA_SORT", "1", 1);
+    ::unsetenv("GS3D_EXPERIMENTAL_FUCHSIA_PACKED_SORT");
+
+    constexpr uint32_t R = 1025;
+    constexpr int kNumTiles = 19;
+    std::vector<uint64_t> keys(R);
+    std::vector<uint32_t> values(R);
+    for (uint32_t i = 0; i < R; ++i) {
+        const uint32_t tile = (R - 1u - i) % static_cast<uint32_t>(kNumTiles);
+        const uint32_t depth = ((i * 53u) & 0xFFFFFFF0u) | (15u - (i & 0xFu));
+        keys[i] = make_sort_key(tile, depth);
+        values[i] = (1u << 20) + i;
+    }
+
+    BinningOutput bin{};
+    bin.total_pairs = static_cast<int>(R);
+    bin.keys_unsorted = keys.data();
+    bin.values_unsorted = values.data();
+    bin.num_tiles = kNumTiles;
+
+    FrameAllocator alloc(16u * 1024u * 1024u);
+    SorterVulkan sorter(ctx);
+    sorter.sort(bin, alloc);
+
+    ASSERT_NE(bin.keys_sorted, nullptr);
+    ASSERT_NE(bin.values_sorted, nullptr);
+    ASSERT_NE(bin.tile_ranges, nullptr);
+
+    std::vector<uint32_t> order(R);
+    for (uint32_t i = 0; i < R; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return keys[a] < keys[b];
+    });
+
+    for (uint32_t i = 0; i < R; ++i) {
+        EXPECT_EQ(bin.keys_sorted[i], keys[order[i]]) << "key mismatch at i=" << i;
+        EXPECT_EQ(bin.values_sorted[i], values[order[i]]) << "value mismatch at i=" << i;
+    }
+
+    uint32_t covered = 0;
+    for (int t = 0; t < kNumTiles; ++t) {
+        const uint32_t start = bin.tile_ranges[t * 2 + 0];
+        const uint32_t end = bin.tile_ranges[t * 2 + 1];
+        ASSERT_LE(start, end) << "tile " << t;
+        ASSERT_LE(end, R) << "tile " << t;
+        covered += end - start;
+        for (uint32_t i = start; i < end; ++i) {
+            EXPECT_EQ(static_cast<uint32_t>(bin.keys_sorted[i] >> 32), static_cast<uint32_t>(t));
+        }
+    }
+    EXPECT_EQ(covered, R);
 }

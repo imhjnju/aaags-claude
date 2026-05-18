@@ -66,16 +66,15 @@ public:
     /// On exit: the sorted data lives in `keys_in_buf` / `values_in_buf`
     /// (16 passes = even number of swaps).
     ///
-    /// `hist_count_buf` : uint[16] scratch (count-shader output)
-    /// `hist_scan_buf`  : uint[16] scratch (scan-shader output, used as
+    /// `hist_count_buf` : uint[ceil(R/256)*16] scratch (bucket-major count output)
+    /// `hist_scan_buf`  : uint[ceil(R/256)*16] scratch (scan output, used as
     ///                    bucket_offsets by the scatter shader)
-    /// `wg_sums_buf`    : uint[>=1] scratch for the inner prefix scan
-    ///
-    /// Constraints: 0 < R <= 256 (single-workgroup radix).
+    /// `wg_sums_buf`    : uint[ceil(hist_entries/256)] scratch for the prefix scan
+    /// `wg_sums2_buf`   : uint[ceil(ceil(hist_entries/256)/256)] scratch for large scans
     void sort_sync(VkBuffer keys_in_buf, VkBuffer values_in_buf,
                    VkBuffer keys_out_buf, VkBuffer values_out_buf,
                    VkBuffer hist_count_buf, VkBuffer hist_scan_buf,
-                   VkBuffer wg_sums_buf,
+                   VkBuffer wg_sums_buf, VkBuffer wg_sums2_buf,
                    uint32_t num_elements);
 
     /// Layer 2: record the 16-pass LSD radix sort into an external command
@@ -89,7 +88,7 @@ public:
                      VkBuffer keys_in_buf, VkBuffer values_in_buf,
                      VkBuffer keys_out_buf, VkBuffer values_out_buf,
                      VkBuffer hist_count_buf, VkBuffer hist_scan_buf,
-                     VkBuffer wg_sums_buf,
+                     VkBuffer wg_sums_buf, VkBuffer wg_sums2_buf,
                      uint32_t num_elements);
 
 private:
@@ -161,6 +160,50 @@ public:
     void dispatch_record(VkCommandBuffer cmd,
                          uint32_t num_elements,
                          uint32_t num_tiles);
+
+private:
+    VulkanContext& ctx_;
+    std::unique_ptr<VulkanShader>          shader_;
+    std::unique_ptr<VulkanComputePipeline> pipeline_;
+    VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
+};
+
+class CanonicalSortPairPackPass {
+public:
+    explicit CanonicalSortPairPackPass(VulkanContext& ctx);
+    ~CanonicalSortPairPackPass() = default;
+
+    CanonicalSortPairPackPass(const CanonicalSortPairPackPass&)            = delete;
+    CanonicalSortPairPackPass& operator=(const CanonicalSortPairPackPass&) = delete;
+
+    void bind_buffers(VkBuffer keys_in,
+                      VkBuffer values_in,
+                      VkBuffer records_out);
+    void dispatch_record(VkCommandBuffer cmd, uint32_t num_elements, bool compact_key48);
+
+private:
+    VulkanContext& ctx_;
+    std::unique_ptr<VulkanShader>          shader_;
+    std::unique_ptr<VulkanComputePipeline> pipeline_;
+    VkDescriptorSet                        descriptor_set_ = VK_NULL_HANDLE;
+};
+
+class CanonicalSortPairExtractPass {
+public:
+    explicit CanonicalSortPairExtractPass(VulkanContext& ctx);
+    ~CanonicalSortPairExtractPass() = default;
+
+    CanonicalSortPairExtractPass(const CanonicalSortPairExtractPass&)            = delete;
+    CanonicalSortPairExtractPass& operator=(const CanonicalSortPairExtractPass&) = delete;
+
+    void bind_buffers(VkBuffer records_sorted,
+                      VkBuffer keys_sorted,
+                      VkBuffer values_sorted,
+                      VkBuffer tile_ranges);
+    void dispatch_record(VkCommandBuffer cmd,
+                         uint32_t num_elements,
+                         uint32_t num_tiles,
+                         bool compact_key48);
 
 private:
     VulkanContext& ctx_;

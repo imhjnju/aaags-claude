@@ -22,7 +22,8 @@
 class VulkanBuffer;
 class VulkanAlignedBuffer;
 class RadixSortFuchsia;
-class PackedKeyvalExtractPass;
+class CanonicalSortPairPackPass;
+class CanonicalSortPairExtractPass;
 
 class SorterVulkan : public Sorter {
 public:
@@ -36,6 +37,8 @@ public:
     /// binning.keys_sorted / values_sorted, then populate binning.tile_ranges
     /// from the sorted keys. All output arrays are allocated from `allocator`.
     void sort(BinningOutput& binning, FrameAllocator& allocator) override;
+
+    void set_host_mirror_enabled(bool enabled) { host_mirror_enabled_ = enabled; }
 
     // -- Layer-2 record-mode API -------------------------------------------
     //
@@ -71,22 +74,25 @@ private:
     VulkanContext& ctx_;
     std::unique_ptr<RadixSortPass> sort_pass_;
     std::unique_ptr<TileRangePass> range_pass_;
+    std::unique_ptr<RadixSortFuchsia> fuchsia_pairs_;
+    std::unique_ptr<CanonicalSortPairPackPass> pair_pack_pass_;
+    std::unique_ptr<CanonicalSortPairExtractPass> pair_extract_pass_;
 
-    std::unique_ptr<RadixSortFuchsia>      fuchsia_;
-    uint32_t                                f_keyvals_count_capacity_ = 0;
-    std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_even_;
-    std::unique_ptr<VulkanAlignedBuffer>    f_keyvals_scratch_;
-    std::unique_ptr<VulkanAlignedBuffer>    f_internal_scratch_;
-    std::unique_ptr<VulkanBuffer>           f_values_sorted_;
-    std::unique_ptr<VulkanBuffer>           f_tile_ranges_;
-    std::unique_ptr<PackedKeyvalExtractPass> f_extract_pass_;
-    VkDeviceSize                            f_keyvals_byte_capacity_ = 0;
-    VkDeviceSize                            f_internal_byte_capacity_ = 0;
-    uint32_t                                f_values_sorted_capacity_ = 0;
-    uint32_t                                f_tile_ranges_capacity_ = 0;
-    VkBuffer                                f_last_sorted_ = VK_NULL_HANDLE;
+    // Layer-1 optimized canonical SortPairs buffers.
+    std::unique_ptr<VulkanAlignedBuffer> f_records_even_;
+    std::unique_ptr<VulkanAlignedBuffer> f_records_odd_;
+    std::unique_ptr<VulkanAlignedBuffer> f_internal_scratch_;
+    std::unique_ptr<VulkanBuffer> f_keys_sorted_;
+    std::unique_ptr<VulkanBuffer> f_values_sorted_;
+    std::unique_ptr<VulkanBuffer> f_ranges_;
+    uint32_t f_record_capacity_ = 0;
+    uint32_t f_output_capacity_ = 0;
+    uint32_t f_range_capacity_ = 0;
+    VkDeviceSize f_record_bytes_capacity_ = 0;
+    VkDeviceSize f_internal_bytes_capacity_ = 0;
+    bool host_mirror_enabled_ = true;
 
-    bool sort_via_fuchsia_gpu(BinningOutput& binning, FrameAllocator& allocator);
+    bool sort_via_fuchsia_sortpairs(BinningOutput& binning, FrameAllocator& allocator);
 
     // Layer-2 persistent buffers. "A" handles are external (not owned);
     // "B" + histograms + tile_ranges are owned by this adapter.
@@ -97,5 +103,6 @@ private:
     std::unique_ptr<VulkanBuffer> r_hist_cnt_;
     std::unique_ptr<VulkanBuffer> r_hist_scn_;
     std::unique_ptr<VulkanBuffer> r_wg_sums_;
+    std::unique_ptr<VulkanBuffer> r_wg_sums2_;
     std::unique_ptr<VulkanBuffer> r_ranges_;
 };

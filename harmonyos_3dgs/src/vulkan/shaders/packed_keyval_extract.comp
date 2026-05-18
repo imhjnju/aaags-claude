@@ -23,12 +23,27 @@ layout(push_constant) uniform Push {
     uint _pad1;
 } pc;
 
-const uint IDX_MASK = 0xFFFFFu;
-const uint TILE_SHIFT = 48u;
-const uint TILE_MASK = 0xFFFFu;
+uint ceil_log2_u32(uint x) {
+    uint bits = 0u;
+    uint v = x - 1u;
+    while (v > 0u) {
+        bits += 1u;
+        v >>= 1u;
+    }
+    return max(bits, 1u);
+}
+
+uint low_mask(uint bits) {
+    return bits >= 32u ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+}
+
+uint idx_bits_for_num_tiles() {
+    return 64u - 32u - ceil_log2_u32(pc.num_tiles);
+}
 
 uint tile_of(uint64_t kv) {
-    return uint((kv >> TILE_SHIFT) & uint64_t(TILE_MASK));
+    uint idx_bits = idx_bits_for_num_tiles();
+    return uint(kv >> (32u + idx_bits));
 }
 
 void main() {
@@ -37,7 +52,7 @@ void main() {
 
     const uint64_t kv = keyvals_sorted[i];
     const uint tile = tile_of(kv);
-    values_sorted[i] = uint(kv) & IDX_MASK;
+    values_sorted[i] = uint(kv) & low_mask(idx_bits_for_num_tiles());
 
     if (tile >= pc.num_tiles) return;
 

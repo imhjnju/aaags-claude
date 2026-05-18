@@ -18,8 +18,8 @@
 //                     low-32-bit depth (we build the test inputs so that
 //                     stability is observable, see TestCase_TileCollisions).
 //
-// SP-2 Phase 1 radix_sort_count / radix_sort_scatter are SINGLE-WORKGROUP
-// (num_elements <= 256), so all test shapes are bounded by 256.
+// The Vulkan pass supports multi-workgroup SortPairs so large R stays on the
+// CUDA-style key/value path instead of falling back to packed keyvals.
 
 #include "vulkan/sort_passes.h"
 #include "vulkan/vk_context.h"
@@ -48,13 +48,21 @@ SortedResult run_sort(VulkanContext& ctx,
     const uint32_t R = static_cast<uint32_t>(keys.size());
     EXPECT_EQ(values.size(), static_cast<size_t>(R));
 
+    constexpr uint32_t kLocalSize = 256u;
+    constexpr uint32_t kBuckets = 16u;
+    const uint32_t sort_wgs = (R + kLocalSize - 1u) / kLocalSize;
+    const uint32_t hist_entries = sort_wgs * kBuckets;
+    const uint32_t scan_wgs = (hist_entries + kLocalSize - 1u) / kLocalSize;
+    const uint32_t scan_wgs2 = (scan_wgs + kLocalSize - 1u) / kLocalSize;
+
     VulkanBuffer keys_a(ctx, R * sizeof(uint64_t));
     VulkanBuffer vals_a(ctx, R * sizeof(uint32_t));
     VulkanBuffer keys_b(ctx, R * sizeof(uint64_t));
     VulkanBuffer vals_b(ctx, R * sizeof(uint32_t));
-    VulkanBuffer hist_count(ctx, 16 * sizeof(uint32_t));
-    VulkanBuffer hist_scan (ctx, 16 * sizeof(uint32_t));
-    VulkanBuffer wg_sums   (ctx, 16 * sizeof(uint32_t));
+    VulkanBuffer hist_count(ctx, hist_entries * sizeof(uint32_t));
+    VulkanBuffer hist_scan (ctx, hist_entries * sizeof(uint32_t));
+    VulkanBuffer wg_sums   (ctx, std::max(scan_wgs, 1u) * sizeof(uint32_t));
+    VulkanBuffer wg_sums2  (ctx, std::max(scan_wgs2, 1u) * sizeof(uint32_t));
 
     keys_a.upload(keys.data(),   R * sizeof(uint64_t));
     vals_a.upload(values.data(), R * sizeof(uint32_t));
@@ -63,7 +71,7 @@ SortedResult run_sort(VulkanContext& ctx,
     sort.sort_sync(keys_a.handle(),  vals_a.handle(),
                    keys_b.handle(),  vals_b.handle(),
                    hist_count.handle(), hist_scan.handle(),
-                   wg_sums.handle(),
+                   wg_sums.handle(), wg_sums2.handle(),
                    R);
 
     SortedResult got;
@@ -249,4 +257,36 @@ TEST(RadixSortPassVk, MaxCapacity256) {
     expect_monotonic(got.keys);
     expect_permutation(keys, got.keys);
     expect_value_mapping(keys, got);
+}
+
+TEST(RadixSortPassVk, MultiWorkgroup1025PreservesFullValuesAndLowDepthBits) {
+    VulkanContext ctx;
+    ASSERT_TRUE(ctx.init()) << "Vulkan init failed — no compute device?";
+
+    auto make_key = [](uint32_t tile, uint32_t depth) -> uint64_t {
+        return (static_cast<uint64_t>(tile) << 32u) | depth;
+    };
+
+    constexpr uint32_t R = 1025;
+    std::vector<uint64_t> keys(R);
+    std::vector<uint32_t> values(R);
+    for (uint32_t i = 0; i < R; ++i) {
+        const uint32_t tile = (R - 1u - i) % 17u;
+        const uint32_t depth = ((i * 37u) & 0xFFFFFFF0u) | (i & 0xFu);
+        keys[i] = make_key(tile, depth);
+        values[i] = (1u << 20) + i;
+    }
+
+    auto got = run_sort(ctx, keys, values);
+    std::vector<uint32_t> order(R);
+    for (uint32_t i = 0; i < R; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return keys[a] < keys[b];
+    });
+
+    for (uint32_t i = 0; i < R; ++i) {
+        EXPECT_EQ(got.keys[i], keys[order[i]]) << "key mismatch at i=" << i;
+        EXPECT_EQ(got.values[i], values[order[i]]) << "value mismatch at i=" << i;
+    }
+    expect_monotonic(got.keys);
 }

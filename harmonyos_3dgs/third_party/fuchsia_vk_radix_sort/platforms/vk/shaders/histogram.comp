@@ -95,8 +95,24 @@ layout(push_constant) uniform block_push
 #define RS_KEYVAL_TYPE uint32_t
 #elif (RS_KEYVAL_DWORDS == 2)
 #define RS_KEYVAL_TYPE u32vec2
+#elif (RS_KEYVAL_DWORDS == 3)
+struct rs_keyval_u96
+{
+  uint32_t dword[3];
+};
+#define RS_KEYVAL_TYPE rs_keyval_u96
+#elif (RS_KEYVAL_DWORDS == 4)
+#define RS_KEYVAL_TYPE u32vec4
 #else
 #error "Unsupported RS_KEYVAL_DWORDS"
+#endif
+
+#if (RS_KEYVAL_DWORDS == 1)
+#define RS_KV_DWORD(kv_, dword_) (kv_)
+#elif (RS_KEYVAL_DWORDS == 3)
+#define RS_KV_DWORD(kv_, dword_) (kv_).dword[dword_]
+#else
+#define RS_KV_DWORD(kv_, dword_) (kv_)[dword_]
 #endif
 
 //
@@ -132,7 +148,7 @@ layout(push_constant) uniform block_push
 #define RS_KV_EXTRACT_DIGIT(kv_, pass_) bitfieldExtract(kv_, pass_ * RS_RADIX_LOG2, RS_RADIX_LOG2)
 #else
 #define RS_KV_EXTRACT_DIGIT(kv_, pass_)                                                            \
-  bitfieldExtract(kv_[pass_ / 4], (pass_ & 3) * RS_RADIX_LOG2, RS_RADIX_LOG2)
+  bitfieldExtract(RS_KV_DWORD(kv_, pass_ / 4), (pass_ & 3) * RS_RADIX_LOG2, RS_RADIX_LOG2)
 #endif
 //----------------------------------------------------------------------
 #else
@@ -145,7 +161,7 @@ layout(push_constant) uniform block_push
 #define RS_KV_EXTRACT_DIGIT(kv_, pass_) ((kv_ >> (pass_ * RS_RADIX_LOG2)) & RS_RADIX_MASK)
 #else
 #define RS_KV_EXTRACT_DIGIT(kv_, pass_)                                                            \
-  ((kv_[pass_ / 4] >> ((pass_ & 3) * RS_RADIX_LOG2)) & RS_RADIX_MASK)
+  ((RS_KV_DWORD(kv_, pass_ / 4) >> ((pass_ & 3) * RS_RADIX_LOG2)) & RS_RADIX_MASK)
 #endif
 //----------------------------------------------------------------------
 #endif
@@ -174,7 +190,11 @@ layout(local_size_x = RS_WORKGROUP_SIZE) in;
 //
 layout(buffer_reference, std430) buffer buffer_rs_kv
 {
+#if (RS_KEYVAL_DWORDS == 3)
+  uint32_t extent[];
+#else
   RS_KEYVAL_TYPE extent[];
+#endif
 };
 
 layout(buffer_reference, std430) buffer buffer_rs_histograms
@@ -351,7 +371,14 @@ main()
   //
   [[unroll]] for (RS_SUBGROUP_UNIFORM uint32_t ii = 0; ii < RS_HISTOGRAM_BLOCK_ROWS; ii++)
   {
+#if (RS_KEYVAL_DWORDS == 3)
+    const uint32_t base = ii * RS_WORKGROUP_SIZE * RS_KEYVAL_DWORDS;
+    kv[ii].dword[0] = rs_kv_in.extent[base + 0];
+    kv[ii].dword[1] = rs_kv_in.extent[base + 1];
+    kv[ii].dword[2] = rs_kv_in.extent[base + 2];
+#else
     kv[ii] = rs_kv_in.extent[ii * RS_WORKGROUP_SIZE];
+#endif
   }
 
   ////////////////////////////////////////////////////////////////////////////
@@ -439,8 +466,42 @@ main()
   RS_HISTOGRAM_PASS(1)
   RS_HISTOGRAM_PASS(0)
 
+#elif (RS_KEYVAL_DWORDS == 3)
+
+  RS_HISTOGRAM_PASS(11)
+  RS_HISTOGRAM_PASS(10)
+  RS_HISTOGRAM_PASS(9)
+  RS_HISTOGRAM_PASS(8)
+  RS_HISTOGRAM_PASS(7)
+  RS_HISTOGRAM_PASS(6)
+  RS_HISTOGRAM_PASS(5)
+  RS_HISTOGRAM_PASS(4)
+  RS_HISTOGRAM_PASS(3)
+  RS_HISTOGRAM_PASS(2)
+  RS_HISTOGRAM_PASS(1)
+  RS_HISTOGRAM_PASS(0)
+
+#elif (RS_KEYVAL_DWORDS == 4)
+
+  RS_HISTOGRAM_PASS(15)
+  RS_HISTOGRAM_PASS(14)
+  RS_HISTOGRAM_PASS(13)
+  RS_HISTOGRAM_PASS(12)
+  RS_HISTOGRAM_PASS(11)
+  RS_HISTOGRAM_PASS(10)
+  RS_HISTOGRAM_PASS(9)
+  RS_HISTOGRAM_PASS(8)
+  RS_HISTOGRAM_PASS(7)
+  RS_HISTOGRAM_PASS(6)
+  RS_HISTOGRAM_PASS(5)
+  RS_HISTOGRAM_PASS(4)
+  RS_HISTOGRAM_PASS(3)
+  RS_HISTOGRAM_PASS(2)
+  RS_HISTOGRAM_PASS(1)
+  RS_HISTOGRAM_PASS(0)
+
 #else
-#error "Error: (RS_KEYVAL_DWORDS >= 3) not implemented."
+#error "Error: Unsupported RS_KEYVAL_DWORDS"
 #endif
 }
 

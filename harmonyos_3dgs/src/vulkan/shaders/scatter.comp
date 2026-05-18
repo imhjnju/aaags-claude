@@ -108,15 +108,28 @@ ivec2 rectMax(vec2 p, float extent_x, float extent_y, int grid_x, int grid_y, in
 // per-tile sort keys that find the closest approach depth of each Gaussian
 // within a tile's pixel frustum.
 
-const uint IDX_MASK = 0xFFFFFu;
-const uint DEPTH_MASK = 0x0FFFFFFFu;
-const uint DEPTH_SHIFT = 20u;
-const uint TILE_SHIFT = 48u;
+uint ceil_log2_u32(uint x) {
+    uint bits = 0u;
+    uint v = x - 1u;
+    while (v > 0u) {
+        bits += 1u;
+        v >>= 1u;
+    }
+    return max(bits, 1u);
+}
+
+uint low_mask(uint bits) {
+    return bits >= 32u ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+}
 
 uint64_t pack_keyval(uint tile_id, uint depth_bits, uint gauss_idx) {
-    return (uint64_t(tile_id & 0xFFFFu) << TILE_SHIFT) |
-           (uint64_t((depth_bits >> 4u) & DEPTH_MASK) << DEPTH_SHIFT) |
-           uint64_t(gauss_idx & IDX_MASK);
+    uint num_tiles = pc.num_tiles_x * pc.num_tiles_y;
+    uint tile_bits = ceil_log2_u32(num_tiles);
+    uint idx_bits = 64u - 32u - tile_bits;
+    uint tile_shift = 32u + idx_bits;
+    return (uint64_t(tile_id) << tile_shift) |
+           (uint64_t(depth_bits) << idx_bits) |
+           uint64_t(gauss_idx & low_mask(idx_bits));
 }
 
 // Port of math_utils.cpp:186-207.

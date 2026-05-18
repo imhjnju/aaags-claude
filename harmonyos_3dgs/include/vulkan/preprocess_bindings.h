@@ -116,7 +116,7 @@ constexpr uint32_t VALUES_OUT     = 4;
 struct RadixSortPushConstants {
     uint32_t num_elements;
     uint32_t current_bit;   // 0, 4, 8, ..., 60
-    uint32_t _pad0;
+    uint32_t num_workgroups;
     uint32_t _pad1;
 };
 static_assert(sizeof(RadixSortPushConstants) == 16, "RadixSortPushConstants must be 16 bytes per spec §4.8.4/5");
@@ -147,6 +147,35 @@ struct PackedKeyvalExtractPushConstants {
 };
 static_assert(sizeof(PackedKeyvalExtractPushConstants) == 16,
               "PackedKeyvalExtractPushConstants must be 16 bytes");
+
+namespace canonical_sortpair_pack_bind {
+constexpr uint32_t KEYS_IN    = 0;
+constexpr uint32_t VALUES_IN  = 1;
+constexpr uint32_t RECORDS_OUT = 2;
+}
+struct CanonicalSortPairPackPushConstants {
+    uint32_t num_elements;
+    uint32_t compact_key48;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
+static_assert(sizeof(CanonicalSortPairPackPushConstants) == 16,
+              "CanonicalSortPairPackPushConstants must be 16 bytes");
+
+namespace canonical_sortpair_extract_bind {
+constexpr uint32_t RECORDS_SORTED = 0;
+constexpr uint32_t KEYS_SORTED    = 1;
+constexpr uint32_t VALUES_SORTED  = 2;
+constexpr uint32_t TILE_RANGES    = 3;
+}
+struct CanonicalSortPairExtractPushConstants {
+    uint32_t num_elements;
+    uint32_t num_tiles;
+    uint32_t compact_key48;
+    uint32_t _pad1;
+};
+static_assert(sizeof(CanonicalSortPairExtractPushConstants) == 16,
+              "CanonicalSortPairExtractPushConstants must be 16 bytes");
 
 // --- rasterize.comp bindings (spec §4.8.7) ---
 namespace rasterize_bind {

@@ -2,9 +2,9 @@
 
 Run: `ctest --test-dir harmonyos_3dgs/build`
 Build: `cd harmonyos_3dgs && cmake -B build -DBUILD_TESTS=ON && cmake --build build`
-Current CTest total: **351 tests** (2026-05-15 Vulkan DSSIM loss pass and trainer GPU DSSIM fast-path coverage, 75 .cpp test files)
+Current CTest total: **366 tests** (2026-05-18 canonical Vulkan SortPairs multi-workgroup coverage, Fuchsia env no-op canonical routing plus GPU tile-range coverage, Vulkan DSSIM loss pass, trainer GPU DSSIM/regularization/noise fast-path coverage, and gs3d_vk_train preset parser coverage, 76 .cpp test files)
 
-## Test Inventory (75 files)
+## Test Inventory (76 files)
 
 ### CPU / Unit Tests
 | File | Subsystem | What It Tests |
@@ -55,13 +55,13 @@ Current CTest total: **351 tests** (2026-05-15 Vulkan DSSIM loss pass and traine
 | `test_vk_pipeline_dispatch.cpp` | Vulkan | Pipeline dispatch plumbing |
 | `test_prefix_scan_pass_vk.cpp` | Vulkan Pass | Prefix scan pass |
 | `test_scatter_pass_vk.cpp` | Vulkan Pass | Scatter pass |
-| `test_radix_sort_pass_vk.cpp` | Vulkan Pass | Radix sort pass |
+| `test_radix_sort_pass_vk.cpp` | Vulkan Pass | CUDA-style key/value radix SortPairs, including multi-workgroup full-value/depth coverage |
 | `test_tile_range_pass_vk.cpp` | Vulkan Pass | Tile range construction |
 | `test_l1_loss_pass_vk.cpp` | Vulkan Pass | GPU L1 loss and dL/dpixel parity for lambda_dssim=0 |
 | `test_dssim_loss_pass_vk.cpp` | Vulkan Pass | GPU DSSIM loss and dL/dpixel parity for lambda_dssim>0 |
 | `test_fuchsia_link.cpp` | Vulkan Pass | Fuchsia radix sort vendored link gate |
-| `test_fuchsia_radix_wrapper.cpp` | Vulkan Pass | Fuchsia radix sort wrapper target/memory/record smoke |
-| `test_fuchsia_radix_e2e_vk.cpp` | Vulkan Pass | Fuchsia sort env routing and GPU carrier/rasterizer contract |
+| `test_fuchsia_radix_wrapper.cpp` | Vulkan Pass | Fuchsia radix sort wrapper target/memory/record smoke and packed-key tile/depth partial-bit sorting |
+| `test_fuchsia_radix_e2e_vk.cpp` | Vulkan Pass | Fuchsia sort env compatibility as canonical SortPairs no-op routing with canonical GPU tile-range publication |
 | `test_preprocess_pass_vk.cpp` | Vulkan Pass | Forward preprocess pass, including eval_3D smoke |
 | `test_rasterize_pass_vk.cpp` | Vulkan Pass | Forward rasterize pass |
 | `test_preprocess_backward_pass_vk.cpp` | Vulkan Pass | Backward preprocess pass |
@@ -77,9 +77,10 @@ Current CTest total: **351 tests** (2026-05-15 Vulkan DSSIM loss pass and traine
 | `test_preprocessor_backward_vulkan.cpp` | Vulkan Backward | Preprocessor backward parity |
 | `test_rasterizer_backward_vulkan.cpp` | Vulkan Backward | Rasterizer backward parity |
 | `test_tile_binner_vulkan.cpp` | Vulkan Tile Binner | Tile binning and eval_3D parity-mode keying |
-| `test_sorter_vulkan.cpp` | Vulkan Sorter | Vulkan sorting |
+| `test_sorter_vulkan.cpp` | Vulkan Sorter | CUDA-style Vulkan sorting and packed-Fuchsia routing guard |
 | `test_vulkan_adam.cpp` | Vulkan Optimizer | GPU Adam update, moment resize, selective zeroing |
-| `test_training_step_vk.cpp` | Vulkan Trainer | VulkanTrainer step, parity, eval_3D replay-order support/gradient parity |
+| `test_vk_train_args.cpp` | Vulkan CLI | gs3d_vk_train training preset parsing and override semantics |
+| `test_training_step_vk.cpp` | Vulkan Trainer | VulkanTrainer step, parity, eval_3D replay-order support/gradient parity, GPU DSSIM coverage, and GPU regularization/noise raw-activation fast-path coverage |
 | `test_mcmc_trainer_integration.cpp` | Vulkan Trainer | MCMC densification integration, Adam preservation, opacity reset |
 | `test_vk_vs_cpu_render.cpp` | Vulkan Parity | CPU↔VK render parity |
 | `test_vk_vs_py_reference.cpp` | Vulkan Parity | VK↔Python reference training parity |

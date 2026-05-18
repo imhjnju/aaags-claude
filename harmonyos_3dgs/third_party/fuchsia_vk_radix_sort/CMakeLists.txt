@@ -9,12 +9,23 @@ find_package(Vulkan REQUIRED)
 function(shader header source source_list include_path)
     get_filename_component(shader_bin_name ${source} NAME)
     string(REPLACE "\." "_" shader_bin_name ${shader_bin_name})
+    set(shader_deps
+        ${source}
+        ${include_path}/config.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/shaders/bufref.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/shaders/prefix.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/shaders/prefix_limits.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/shaders/push.h
+    )
+    if(source MATCHES "platforms/vk/shaders/scatter_.*\\.comp")
+        list(APPEND shader_deps ${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/shaders/scatter.glsl)
+    endif()
     # AAAGS LOCAL PATCH: removed -Os, our glslangValidator lacks SPIRV-Tools optimizer (see SPIKE_REPORT §2)
     add_custom_command(
         OUTPUT ${header}
         COMMAND glslangValidator --target-env vulkan1.2 --vn ${shader_bin_name}_shader_binary ${CMAKE_CURRENT_SOURCE_DIR}/${source} -o ${CMAKE_CURRENT_BINARY_DIR}/${header} -I${include_path}
         MAIN_DEPENDENCY ${source}
-        DEPENDS ${source}
+        DEPENDS ${shader_deps}
         IMPLICIT_DEPENDS C ${source}
         VERBATIM
     )
@@ -31,7 +42,7 @@ set(targets
 )
 
 foreach(target ${targets})
-    foreach(keyval IN ITEMS u32 u64)
+    foreach(keyval IN ITEMS u32 u64 u96 u128)
         get_filename_component(arch ${target} NAME)
         set(a ${arch}_${keyval}_)
         set(i "${CMAKE_CURRENT_SOURCE_DIR}/platforms/vk/targets/vendors/${target}/${keyval}")
@@ -41,8 +52,18 @@ foreach(target ${targets})
         shader(${a}prefix.comp.h platforms/vk/shaders/prefix.comp shader_binary ${i})
         shader(${a}scatter_0_even.comp.h platforms/vk/shaders/scatter_0_even.comp shader_binary ${i})
         shader(${a}scatter_0_odd.comp.h platforms/vk/shaders/scatter_0_odd.comp shader_binary ${i})
-        shader(${a}scatter_1_even.comp.h platforms/vk/shaders/scatter_1_even.comp shader_binary ${i})
-        shader(${a}scatter_1_odd.comp.h platforms/vk/shaders/scatter_1_odd.comp shader_binary ${i})
+        if(NOT keyval STREQUAL "u32")
+            shader(${a}scatter_1_even.comp.h platforms/vk/shaders/scatter_1_even.comp shader_binary ${i})
+            shader(${a}scatter_1_odd.comp.h platforms/vk/shaders/scatter_1_odd.comp shader_binary ${i})
+        endif()
+        if(keyval STREQUAL "u96" OR keyval STREQUAL "u128")
+            shader(${a}scatter_2_even.comp.h platforms/vk/shaders/scatter_2_even.comp shader_binary ${i})
+            shader(${a}scatter_2_odd.comp.h platforms/vk/shaders/scatter_2_odd.comp shader_binary ${i})
+        endif()
+        if(keyval STREQUAL "u128")
+            shader(${a}scatter_3_even.comp.h platforms/vk/shaders/scatter_3_even.comp shader_binary ${i})
+            shader(${a}scatter_3_odd.comp.h platforms/vk/shaders/scatter_3_odd.comp shader_binary ${i})
+        endif()
         set(target_sources ${target_sources} ${i}/header.c)
     endforeach()
 endforeach()

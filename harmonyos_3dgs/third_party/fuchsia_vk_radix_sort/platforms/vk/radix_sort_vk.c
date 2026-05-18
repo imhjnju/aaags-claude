@@ -33,10 +33,10 @@
 #endif
 
 //
-// NOTE: The library currently supports uint32_t and uint64_t keyvals.
+// NOTE: The library currently supports uint32_t, uint64_t, and AAAGS u128 records.
 //
 
-#define RS_KV_DWORDS_MAX 2
+#define RS_KV_DWORDS_MAX 4
 
 //
 //
@@ -363,6 +363,22 @@ radix_sort_vk_create(VkDevice                       device,
     { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,  //
       .offset     = 0,
       .size       = sizeof(struct rs_push_scatter) },  // scatter_1_odd
+
+    { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,  //
+      .offset     = 0,
+      .size       = sizeof(struct rs_push_scatter) },  // scatter_2_even
+
+    { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,  //
+      .offset     = 0,
+      .size       = sizeof(struct rs_push_scatter) },  // scatter_2_odd
+
+    { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,  //
+      .offset     = 0,
+      .size       = sizeof(struct rs_push_scatter) },  // scatter_3_even
+
+    { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,  //
+      .offset     = 0,
+      .size       = sizeof(struct rs_push_scatter) },  // scatter_3_odd
   };
 
   VkPipelineLayoutCreateInfo plci = {
@@ -429,6 +445,10 @@ radix_sort_vk_create(VkDevice                       device,
     RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[0].odd
     RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[1].even
     RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[1].odd
+    RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[2].even
+    RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[2].odd
+    RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[3].even
+    RS_SUBGROUP_SIZE_CREATE_INFO_NAME(scatter),    // scatter[3].odd
   };
 
   //
@@ -457,8 +477,12 @@ radix_sort_vk_create(VkDevice                       device,
     RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(3),  // prefix
     RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(4),  // scatter[0].even
     RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(5),  // scatter[0].odd
-    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(6),  // scatter[1].even
-    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(7),  // scatter[1].odd
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(6),   // scatter[1].even
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(7),   // scatter[1].odd
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(8),   // scatter[2].even
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(9),   // scatter[2].odd
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(10),  // scatter[3].even
+    RS_COMPUTE_PIPELINE_CREATE_INFO_DECL(11),  // scatter[3].odd
   };
 
   //
