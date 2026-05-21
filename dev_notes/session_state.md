@@ -1,5 +1,24 @@
 # Session State
 
+## Test Counts
+- 2026-05-21: Release CTest inventory is **134 CTest entries / 372 GoogleTest cases** after the backward sync, grouped CPU/Vulkan gate registration, and CLI preset/position-noise/DSSIM coverage; latest full Release CTest **134/134 PASS** in **67.72s** with 5 expected skips.
+- 2026-05-20: Grouped Debug CTest inventory is **133 CTest entries / 371 GoogleTest cases** after syncing CPU/Vulkan gate grouping; latest full grouped Debug CTest **133/133 PASS** in **49.41s** with 5 expected skips.
+- 2026-05-20: Native build CTest inventory was **370 tests** after adding `PositionNoisePassVulkan.RecordBeforeBindBuffersThrows`; final full CTest **370/370 PASS** in **117.74s**.
+
+## Completed Phase (latest backward sync + geometry-only fused replay clear — 2026-05-21)
+Synced the remaining actionable delta from `backward` HEAD `734c056d feat(vk-train): fuse eval3D replay backward` without wholesale overwriting the current worktree. The major fused eval_3D replay/tangent/subgroup shader and binding plumbing was already present; the new code delta is `PreprocessorBackwardVulkan::clear_geometry_grad_buffers()`, used by the fused eval_3D replay backward path so it clears only raw position/scale/rotation gradient buffers before raster backward writes them, instead of also clearing SH and opacity buffers that the fused path does not populate.
+
+Preserved current correctness/performance fixes while syncing: `VK_BUFFER_USAGE_TRANSFER_DST_BIT` remains on preprocessor gradient outputs used by `vkCmdFillBuffer`, `cache.dL_dpixels_gpu` remains authoritative over CPU `dL_dpixels`, the CPU loss-gradient null guard remains intact, CTest grouping remains intact, and current DSSIM/noise/raw-activation/position-noise/cache-skip paths were not overwritten. The backward worktree's subgroup default change was intentionally not adopted; subgroup tangent replay remains explicit via `GS3D_EVAL3D_TANGENT_SUBGROUP_BWD=1` until a dedicated correctness/perf gate chooses otherwise.
+
+Validation is green: Release build of `gs3d_vk_train` and `gs3d_vk_tests` PASS; targeted backward/training/CUDA-first-loss CTest **47/47 PASS**; explicit `GS3D_EVAL3D_FUSED_REPLAY_BWD=1` fused replay tests **3/3 PASS**; fused split-backward timing test **1/1 PASS**; full Release CTest **134/134 PASS** in **67.72s** with 5 expected skips. Imported the backward performance evidence document at `investigations/backward_eval3d_replay_perf.md`.
+
+## Completed Phase (gate grouping + eval_3D backward perf sync — 2026-05-20)
+Synced the `remove_test` gate optimization and grouped CPU/Vulkan CTest registration without dropping GoogleTest coverage: CPU tests now run through one `gs3d_tests` CTest entry and selected no-skip Vulkan infra/sort/config suites run through four grouped entries. Debug and Release inventories report **133 CTest entries / 371 GoogleTest cases**.
+
+Synced the performance-oriented `backward` worktree eval_3D backward additions while preserving current correctness fixes. Imported fused replay tangent, subgroup, and currently-disabled hot-GID shader paths, their binding/UBO contracts, CMake shader generation, and Vulkan subgroup BASIC/BALLOT/SHUFFLE capability checks. Preserved the existing `cache.dL_dpixels_gpu` precedence contract, the CPU-gradient null guard, `PreprocessorBackwardVulkan` transfer-dst gradient buffer usage, current DSSIM/noise/raw-activation trainer paths, and the grouped CTest registration.
+
+Validation is green after review fixes: Debug `gs3d_vk_tests` build PASS; Release `gs3d_vk_tests` build PASS; focused Debug backward/parity tests **20/20 PASS**; explicit fused+tangent+subgroup Debug env tests **4/4 PASS**; focused Release backward tests **9/9 PASS**; full grouped Debug CTest **133/133 PASS** in **49.41s**. Independent subagent review initially found a fused-record `dL_dpixels` null-guard regression and a disabled hot shader active-lane hazard; both were fixed and re-review found no remaining blockers.
+
 ## Current Phase (AAA defaults performance optimization — 2026-05-15)
 After the AAA-default 5000/10000 benchmarks, the first two host-bound performance regressions are optimized. `RegularizationPass` keeps nonzero `opacity_reg`/`scale_reg` on the GPU before VulkanAdam, so regularization no longer forces gradient download/upload when `GS3D_TRAIN_GPU_GRAD_ADAM=1`. The noise path now also allows `GS3D_TRAIN_GPU_RAW_ACTIVATE=1` with nonzero `noise_lr`: GPU activation remains authoritative for forward/backward, pre-Adam active scale/rotation/opacity values are downloaded narrowly for CPU noise semantics, and post-Adam CPU sync downloads only raw positions unless densification or opacity reset requires full raw materialization.
 

@@ -44,6 +44,11 @@ public:
     PreprocessOutput process(const GaussianData& g, const Camera& cam,
                              const RenderConfig& cfg, FrameAllocator& alloc,
                              ForwardCache* cache = nullptr) override;
+    PreprocessOutput process_without_cpu_cache_download(const GaussianData& g,
+                                                        const Camera& cam,
+                                                        const RenderConfig& cfg,
+                                                        FrameAllocator& alloc,
+                                                        ForwardCache* cache);
 
     PreprocessOutput process_gpu_inputs(int N,
                                         int max_coeffs,
@@ -56,7 +61,8 @@ public:
                                         const Camera& cam,
                                         const RenderConfig& cfg,
                                         FrameAllocator& alloc,
-                                        ForwardCache* cache = nullptr);
+                                        ForwardCache* cache = nullptr,
+                                        bool download_cpu_cache = true);
 
     // Layer 2: allocate persistent GPU buffers, upload inputs, and bind to
     // the PreprocessPass. Must be called before record(). Buffers live until
@@ -95,11 +101,25 @@ public:
     // cache fields cov3D, p_view, p_hom_w, cov2D, cov2D_det are allocated from alloc and filled.
     void download_cache(int num_gaussians, ForwardCache& cache, FrameAllocator& alloc);
 
+#ifdef GS3D_TESTING
+    bool last_cpu_cache_downloaded_for_test() const { return last_cpu_cache_downloaded_; }
+#endif
+
 private:
+    PreprocessOutput process_impl(const GaussianData& g,
+                                  const Camera& cam,
+                                  const RenderConfig& cfg,
+                                  FrameAllocator& alloc,
+                                  ForwardCache* cache,
+                                  bool download_cpu_cache);
+
     VulkanContext& ctx_;
     bool eval_3D_ = false;
     bool proper_ewa_ = false;
     std::unique_ptr<PreprocessPass> pass_;
+#ifdef GS3D_TESTING
+    bool last_cpu_cache_downloaded_ = false;
+#endif
 
     // Layer-1 per-call ForwardCache output buffers.
     // Allocated in process() when the feature is used; reset each call.

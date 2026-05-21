@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer HotGids { uint hot_gids[]; };
+layout(std430, set = 0, binding = 1) readonly buffer HotGeomScratch { float hot_geom_scratch[]; };
+layout(std430, set = 0, binding = 2) buffer DMeans3D { float d_means3D[]; };
+layout(std430, set = 0, binding = 3) buffer DScales { float d_scales[]; };
+layout(std430, set = 0, binding = 4) buffer DRotTangent { float d_rot_tangent[]; };
+layout(std140, set = 0, binding = 5) uniform HotUBO {
+    uint hot_count;
+    uint num_shards;
+    uint stride;
+    uint _pad;
+} hot_ubo;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = hot_ubo.hot_count * hot_ubo.stride;
+    if (idx >= total) return;
+
+    uint hot_slot = idx / hot_ubo.stride;
+    uint component = idx - hot_slot * hot_ubo.stride;
+    float sum = 0.0;
+    uint base = hot_slot * hot_ubo.num_shards * hot_ubo.stride + component;
+    for (uint shard = 0u; shard < hot_ubo.num_shards; ++shard) {
+        sum += hot_geom_scratch[base + shard * hot_ubo.stride];
+    }
+
+    uint gid = hot_gids[hot_slot];
+    uint base3 = gid * 3u;
+    if (component < 3u) {
+        atomicAdd(d_means3D[base3 + component], sum);
+    } else if (component < 6u) {
+        atomicAdd(d_scales[base3 + component - 3u], sum);
+    } else {
+        atomicAdd(d_rot_tangent[base3 + component - 6u], sum);
+    }
+}

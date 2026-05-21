@@ -60,6 +60,130 @@ constexpr uint32_t REPLAY_ORDER_GIDS    = 14;  // RO uint[sum(n_contrib)]
 constexpr uint32_t BINDING_COUNT        = 15;
 }  // namespace rasterize_backward_eval3d_bind
 
+namespace rasterize_backward_eval3d_fused_bind {
+constexpr uint32_t GAUSS2SCREEN     = 0;
+constexpr uint32_t CONIC_OPACITY    = 1;
+constexpr uint32_t COLORS           = 2;
+constexpr uint32_t T_FINAL          = 3;
+constexpr uint32_t N_CONTRIB        = 4;
+constexpr uint32_t DL_DPIXELS       = 5;
+constexpr uint32_t DL_DOPACITY      = 6;
+constexpr uint32_t DL_DCOLORS       = 7;
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 8;
+constexpr uint32_t REPLAY_ORDER_GIDS    = 9;
+constexpr uint32_t POSITIONS        = 10;
+constexpr uint32_t SCALES           = 11;
+constexpr uint32_t ROTATIONS        = 12;
+constexpr uint32_t RAW_ROTATIONS    = 13;
+constexpr uint32_t FILTER_3D        = 14;
+constexpr uint32_t D_MEANS3D        = 15;
+constexpr uint32_t D_SCALES         = 16;
+constexpr uint32_t D_ROTATIONS      = 17;
+constexpr uint32_t FUSED_UBO        = 18;
+constexpr uint32_t BINDING_COUNT    = 19;
+}  // namespace rasterize_backward_eval3d_fused_bind
+
+namespace rasterize_backward_eval3d_fused_tangent_bind {
+constexpr uint32_t GAUSS2SCREEN     = 0;
+constexpr uint32_t CONIC_OPACITY    = 1;
+constexpr uint32_t COLORS           = 2;
+constexpr uint32_t T_FINAL          = 3;
+constexpr uint32_t N_CONTRIB        = 4;
+constexpr uint32_t DL_DPIXELS       = 5;
+constexpr uint32_t DL_DOPACITY      = 6;
+constexpr uint32_t DL_DCOLORS       = 7;
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 8;
+constexpr uint32_t REPLAY_ORDER_GIDS    = 9;
+constexpr uint32_t POSITIONS        = 10;
+constexpr uint32_t SCALES           = 11;
+constexpr uint32_t ROTATIONS        = 12;
+constexpr uint32_t RAW_ROTATIONS    = 13;
+constexpr uint32_t FILTER_3D        = 14;
+constexpr uint32_t D_MEANS3D        = 15;
+constexpr uint32_t D_SCALES         = 16;
+constexpr uint32_t D_ROT_TANGENT    = 17;
+constexpr uint32_t FUSED_UBO        = 18;
+constexpr uint32_t BINDING_COUNT    = 19;
+}  // namespace rasterize_backward_eval3d_fused_tangent_bind
+
+namespace rasterize_backward_eval3d_fused_tangent_hot_bind {
+constexpr uint32_t GAUSS2SCREEN     = 0;
+constexpr uint32_t CONIC_OPACITY    = 1;
+constexpr uint32_t COLORS           = 2;
+constexpr uint32_t T_FINAL          = 3;
+constexpr uint32_t N_CONTRIB        = 4;
+constexpr uint32_t DL_DPIXELS       = 5;
+constexpr uint32_t DL_DOPACITY      = 6;
+constexpr uint32_t DL_DCOLORS       = 7;
+constexpr uint32_t REPLAY_ORDER_OFFSETS = 8;
+constexpr uint32_t REPLAY_ORDER_GIDS    = 9;
+constexpr uint32_t POSITIONS        = 10;
+constexpr uint32_t SCALES           = 11;
+constexpr uint32_t ROTATIONS        = 12;
+constexpr uint32_t RAW_ROTATIONS    = 13;
+constexpr uint32_t FILTER_3D        = 14;
+constexpr uint32_t D_MEANS3D        = 15;
+constexpr uint32_t D_SCALES         = 16;
+constexpr uint32_t D_ROT_TANGENT    = 17;
+constexpr uint32_t FUSED_UBO        = 18;
+constexpr uint32_t HOT_LOOKUP       = 19;
+constexpr uint32_t HOT_GEOM_SCRATCH = 20;
+constexpr uint32_t HOT_UBO          = 21;
+constexpr uint32_t BINDING_COUNT    = 22;
+}  // namespace rasterize_backward_eval3d_fused_tangent_hot_bind
+
+namespace rasterize_backward_eval3d_hot_geom_reduce_bind {
+constexpr uint32_t HOT_GIDS         = 0;
+constexpr uint32_t HOT_GEOM_SCRATCH = 1;
+constexpr uint32_t D_MEANS3D        = 2;
+constexpr uint32_t D_SCALES         = 3;
+constexpr uint32_t D_ROT_TANGENT    = 4;
+constexpr uint32_t HOT_UBO          = 5;
+constexpr uint32_t BINDING_COUNT    = 6;
+}  // namespace rasterize_backward_eval3d_hot_geom_reduce_bind
+
+namespace rasterize_backward_eval3d_tangent_reduce_bind {
+constexpr uint32_t ROTATIONS      = 0;
+constexpr uint32_t D_ROT_TANGENT  = 1;
+constexpr uint32_t D_ROTATIONS    = 2;
+constexpr uint32_t BINDING_COUNT  = 3;
+}  // namespace rasterize_backward_eval3d_tangent_reduce_bind
+
+struct alignas(16) RasterizeBackwardEval3DHotUBO {
+    uint32_t hot_count  = 0;
+    uint32_t num_shards = 0;
+    uint32_t stride     = 9;
+    uint32_t _pad       = 0;
+};
+static_assert(sizeof(RasterizeBackwardEval3DHotUBO) == 16,
+              "RasterizeBackwardEval3DHotUBO must be 16 bytes (std140)");
+
+struct alignas(16) RasterizeBackwardEval3DFusedUBO {
+    float    view_matrix[16]     = {};
+    float    viewproj_matrix[16] = {};
+    uint32_t W                   = 0;
+    uint32_t H                   = 0;
+    uint32_t num_tiles_x         = 0;
+    uint32_t _pad                = 0;
+    float    bg_color[3]         = {};
+    float    scale_modifier      = 1.f;
+    float    h_x                 = 0.f;
+    float    h_y                 = 0.f;
+    float    _pad2[2]            = {};
+    float    world2screen_matrix[16] = {};
+};
+static_assert(sizeof(RasterizeBackwardEval3DFusedUBO) == 240,
+              "RasterizeBackwardEval3DFusedUBO must be 240 bytes (std140)");
+
+struct alignas(16) RasterizeBackwardEval3DTangentReducePC {
+    uint32_t N     = 0;
+    uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
+    uint32_t _pad2 = 0;
+};
+static_assert(sizeof(RasterizeBackwardEval3DTangentReducePC) == 16,
+              "RasterizeBackwardEval3DTangentReducePC must be 16 bytes");
+
 namespace preprocess_backward_eval3d_bind {
 constexpr uint32_t POSITIONS        = 0;
 constexpr uint32_t RADII            = 1;

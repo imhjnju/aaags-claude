@@ -268,6 +268,7 @@ TEST(Densification, VulkanTrainerSurvivesDensificationStep) {
     tcfg.densify_percent_dense = 0.01f;
     tcfg.pos_lr_init           = 1.6e-4f;
     tcfg.pos_lr_final          = 1.6e-6f;
+    tcfg.noise_lr              = 0.0f;
     tcfg.max_steps             = 30000;
     tcfg.sh_degree_max         = scene.sh_degree;
     tcfg.sh_degree_warmup      = 10000;  // keep SH at 0 during test

@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Rotations { float rotations[]; };
+layout(std430, set = 0, binding = 1) readonly buffer DRotTangent { float d_rot_tangent[]; };
+layout(std430, set = 0, binding = 2) buffer DRotations { float d_rotations[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+void tangentBasis(vec4 q, out vec4 b0, out vec4 b1, out vec4 b2) {
+    b0 = vec4(-q.y,  q.x,  q.w, -q.z);
+    b1 = vec4(-q.z, -q.w,  q.x,  q.y);
+    b2 = vec4(-q.w,  q.z, -q.y,  q.x);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.N) return;
+
+    uint base3 = gid * 3u;
+    vec3 t = vec3(d_rot_tangent[base3 + 0u],
+                  d_rot_tangent[base3 + 1u],
+                  d_rot_tangent[base3 + 2u]);
+
+    uint base4 = gid * 4u;
+    vec4 q = vec4(rotations[base4 + 0u], rotations[base4 + 1u], rotations[base4 + 2u], rotations[base4 + 3u]);
+    vec4 b0;
+    vec4 b1;
+    vec4 b2;
+    tangentBasis(q, b0, b1, b2);
+    vec4 d_raw = b0 * t.x + b1 * t.y + b2 * t.z;
+
+    d_rotations[base4 + 0u] = d_raw.x;
+    d_rotations[base4 + 1u] = d_raw.y;
+    d_rotations[base4 + 2u] = d_raw.z;
+    d_rotations[base4 + 3u] = d_raw.w;
+}

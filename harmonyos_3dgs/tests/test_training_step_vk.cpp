@@ -548,6 +548,114 @@ TEST(VulkanTrainer, GpuDssimFastPathMatchesCpuStepNoUpdate) {
     expect_close(gpu_trainer.captured_grad_opacities(), cpu_trainer.captured_grad_opacities(), "opacities");
 }
 
+TEST(VulkanTrainer, GpuDssimFastPathRefreshesMutatedTargetStorage) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    VkTrainingConfig tcfg;
+    tcfg.lambda_dssim = 0.2f;
+    tcfg.noise_lr = 0.0f;
+    tcfg.sh_degree_max = scene.sh_degree;
+    tcfg.sh_degree_warmup = 0;
+    tcfg.densify_from_step = 0;
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    for (size_t i = 0; i < target.size(); ++i) {
+        target[i] = 0.1f + static_cast<float>((i * 17u) % 41u) / 83.0f;
+    }
+
+    EnvVarGuard gpu_l1_env("GS3D_TRAIN_GPU_L1_LOSS");
+    EnvVarGuard gpu_dssim_env("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    EnvVarGuard reuse_env("GS3D_REUSE_FORWARD_OUTPUTS");
+    EnvVarGuard validate_target_env("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE");
+    unsetenv("GS3D_TRAIN_GPU_L1_LOSS");
+    unsetenv("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    unsetenv("GS3D_REUSE_FORWARD_OUTPUTS");
+    unsetenv("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE");
+    VulkanTrainer cpu_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+
+    setenv("GS3D_TRAIN_GPU_DSSIM_LOSS", "1", 1);
+    setenv("GS3D_REUSE_FORWARD_OUTPUTS", "1", 1);
+    setenv("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE", "1", 1);
+    VulkanTrainer gpu_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    (void)gpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+
+    for (size_t i = 0; i < target.size(); ++i) {
+        target[i] = 0.2f + static_cast<float>((i * 19u) % 37u) / 89.0f;
+    }
+
+    const float cpu_loss = cpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+    const float gpu_loss = gpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+    EXPECT_TRUE(gpu_trainer.last_gpu_dssim_used_for_test());
+    EXPECT_NEAR(gpu_loss, cpu_loss, 5e-4f);
+}
+
+TEST(VulkanTrainer, GpuDssimFastPathRefreshesUnsampledMutatedTargetStorage) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+
+    VkTrainingConfig tcfg;
+    tcfg.lambda_dssim = 0.2f;
+    tcfg.noise_lr = 0.0f;
+    tcfg.sh_degree_max = scene.sh_degree;
+    tcfg.sh_degree_warmup = 0;
+    tcfg.densify_from_step = 0;
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    for (size_t i = 0; i < target.size(); ++i) {
+        target[i] = 0.1f + static_cast<float>((i * 17u) % 41u) / 83.0f;
+    }
+
+    EnvVarGuard gpu_l1_env("GS3D_TRAIN_GPU_L1_LOSS");
+    EnvVarGuard gpu_dssim_env("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    EnvVarGuard reuse_env("GS3D_REUSE_FORWARD_OUTPUTS");
+    EnvVarGuard validate_target_env("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE");
+    unsetenv("GS3D_TRAIN_GPU_L1_LOSS");
+    unsetenv("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    unsetenv("GS3D_REUSE_FORWARD_OUTPUTS");
+    unsetenv("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE");
+    VulkanTrainer cpu_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+
+    setenv("GS3D_TRAIN_GPU_DSSIM_LOSS", "1", 1);
+    setenv("GS3D_REUSE_FORWARD_OUTPUTS", "1", 1);
+    setenv("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE", "1", 1);
+    VulkanTrainer gpu_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    (void)gpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+
+    // Regression guard for the previous sampled hash: mutate only elements that the
+    // old 16-sample-plus-last hash would not inspect, while preserving pointer,
+    // dimensions, and those sampled values.
+    std::vector<char> preserve(target.size(), 0);
+    const size_t samples = std::min<size_t>(target.size(), 16u);
+    const size_t stride = std::max<size_t>(1u, target.size() / samples);
+    for (size_t sample = 0, idx = 0; sample < samples; ++sample, idx = std::min(idx + stride, target.size() - 1u)) {
+        preserve[idx] = 1;
+    }
+    preserve[target.size() - 1u] = 1;
+    size_t mutated = 0;
+    for (size_t i = 0; i < target.size(); ++i) {
+        if (preserve[i]) continue;
+        target[i] = 0.85f - static_cast<float>((i * 23u) % 29u) / 173.0f;
+        ++mutated;
+    }
+    ASSERT_GT(mutated, 0u);
+
+    const float cpu_loss = cpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+    const float gpu_loss = gpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
+    EXPECT_TRUE(gpu_trainer.last_gpu_dssim_used_for_test());
+    EXPECT_NEAR(gpu_loss, cpu_loss, 5e-4f);
+}
+
 TEST(VulkanTrainer, GpuDssimFastPathMatchesCpuStepApplyUpdate) {
     VulkanContext ctx;
     if (!ctx.init()) {
@@ -754,6 +862,7 @@ TEST(VulkanTrainer, GpuL1AndForwardCacheUseGpuResidentOutputs) {
     EXPECT_FALSE(cpu_trainer.last_forward_gpu_resident_outputs_for_test());
     EXPECT_TRUE(cpu_trainer.last_forward_cpu_image_downloaded_for_test());
     EXPECT_TRUE(cpu_trainer.last_forward_cpu_cache_downloaded_for_test());
+    EXPECT_TRUE(cpu_trainer.last_preprocess_cpu_cache_downloaded_for_test());
 
     setenv("GS3D_TRAIN_GPU_L1_LOSS", "1", 1);
     setenv("GS3D_REUSE_FORWARD_OUTPUTS", "1", 1);
@@ -766,6 +875,7 @@ TEST(VulkanTrainer, GpuL1AndForwardCacheUseGpuResidentOutputs) {
     EXPECT_TRUE(gpu_trainer.last_forward_gpu_resident_outputs_for_test());
     EXPECT_FALSE(gpu_trainer.last_forward_cpu_image_downloaded_for_test());
     EXPECT_FALSE(gpu_trainer.last_forward_cpu_cache_downloaded_for_test());
+    EXPECT_TRUE(gpu_trainer.last_preprocess_cpu_cache_downloaded_for_test());
     EXPECT_NEAR(gpu_loss, cpu_loss, 1e-5f);
     ASSERT_EQ(gpu_trainer.rendered_image_size(), cpu_trainer.rendered_image_size());
     for (int i = 0; i < gpu_trainer.rendered_image_size(); ++i) {
@@ -968,7 +1078,7 @@ TEST(VulkanTrainer, GpuRawActivationMatchesCpuActivationAfterTwoSteps) {
     expect_close(a.raw_rotations, b.raw_rotations, N * 4u, "raw_rotations");
 }
 
-TEST(VulkanTrainer, GpuRawActivationSupportsPositionNoise) {
+TEST(VulkanTrainer, GpuRawActivationRemainsEnabledWithPositionNoise) {
     VulkanContext ctx;
     if (!ctx.init()) {
         GTEST_SKIP() << "No Vulkan compute device — skipping.";
@@ -978,10 +1088,12 @@ TEST(VulkanTrainer, GpuRawActivationSupportsPositionNoise) {
     ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
     std::fill(scene.raw_opacities.begin(), scene.raw_opacities.end(), logit(0.001f));
     std::fill(scene.opacities.begin(), scene.opacities.end(), 0.001f);
+    scene.raw.raw_opacities = scene.raw_opacities.data();
+    scene.g.opacities = scene.opacities.data();
 
     VkTrainingConfig tcfg;
     tcfg.lambda_dssim = 0.0f;
-    tcfg.noise_lr = 1.0f;
+    tcfg.noise_lr = 0.0f;
     tcfg.sh_degree_max = scene.sh_degree;
     tcfg.sh_degree_warmup = 0;
     tcfg.densify_from_step = 0;
@@ -991,51 +1103,75 @@ TEST(VulkanTrainer, GpuRawActivationSupportsPositionNoise) {
 
     std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
     for (size_t i = 0; i < target.size(); ++i) {
-        target[i] = static_cast<float>((i * 17u) % 47u) / 149.0f;
+        target[i] = static_cast<float>((i * 31u) % 59u) / 181.0f;
     }
 
     EnvVarGuard grad_env("GS3D_TRAIN_GPU_GRAD_ADAM");
     EnvVarGuard raw_env("GS3D_TRAIN_GPU_RAW_ACTIVATE");
-
     setenv("GS3D_TRAIN_GPU_GRAD_ADAM", "1", 1);
-    unsetenv("GS3D_TRAIN_GPU_RAW_ACTIVATE");
-    VulkanTrainer cpu_activation_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
-    cpu_activation_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
-    const float cpu_loss_2 = cpu_activation_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
-    EXPECT_FALSE(cpu_activation_trainer.last_gpu_raw_activation_used_for_test());
-    EXPECT_TRUE(cpu_activation_trainer.last_gpu_grad_adam_used_for_test());
-    EXPECT_EQ(cpu_activation_trainer.last_raw_materialization_kind_for_test(), VulkanTrainer::RawMaterializationKind::Full);
-
     setenv("GS3D_TRAIN_GPU_RAW_ACTIVATE", "1", 1);
-    VulkanTrainer gpu_activation_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
-    gpu_activation_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
-    const float gpu_loss_2 = gpu_activation_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
-    EXPECT_TRUE(gpu_activation_trainer.last_gpu_raw_activation_used_for_test());
-    EXPECT_TRUE(gpu_activation_trainer.last_gpu_grad_adam_used_for_test());
-    EXPECT_EQ(gpu_activation_trainer.last_raw_materialization_kind_for_test(), VulkanTrainer::RawMaterializationKind::PositionsOnly);
-    EXPECT_NEAR(gpu_loss_2, cpu_loss_2, 1e-6f);
 
-    auto expect_close = [](const float* a, const float* b, size_t n, const char* name) {
-        for (size_t i = 0; i < n; ++i) {
-            EXPECT_NEAR(a[i], b[i], 2e-5f) << name << "[" << i << "]";
-        }
-    };
-    const RawGaussianParams& a = gpu_activation_trainer.raw_params();
-    const RawGaussianParams& b = cpu_activation_trainer.raw_params();
-    const size_t N = static_cast<size_t>(scene.N);
-    const size_t K = static_cast<size_t>(scene.max_coeffs);
-    expect_close(a.raw_positions, b.raw_positions, N * 3u, "raw_positions");
-    expect_close(a.raw_sh_coeffs, b.raw_sh_coeffs, N * K * 3u, "raw_sh");
-    expect_close(a.raw_opacities, b.raw_opacities, N, "raw_opacities");
-    expect_close(a.raw_scales, b.raw_scales, N * 3u, "raw_scales");
-    expect_close(a.raw_rotations, b.raw_rotations, N * 4u, "raw_rotations");
+    VulkanTrainer no_noise_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    const float no_noise_loss = no_noise_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
+    ASSERT_TRUE(std::isfinite(no_noise_loss));
+    EXPECT_TRUE(no_noise_trainer.last_gpu_raw_activation_used_for_test());
 
-    double max_position_delta = 0.0;
-    for (size_t i = 0; i < N * 3u; ++i) {
-        max_position_delta = std::max(max_position_delta,
-                                      static_cast<double>(std::fabs(b.raw_positions[i] - scene.raw_positions[i])));
+    tcfg.noise_lr = 5e5f;
+    VulkanTrainer noise_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    const float noise_loss = noise_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
+    ASSERT_TRUE(std::isfinite(noise_loss));
+    EXPECT_TRUE(noise_trainer.last_gpu_raw_activation_used_for_test());
+    EXPECT_EQ(noise_trainer.last_raw_materialization_kind_for_test(),
+              VulkanTrainer::RawMaterializationKind::None);
+
+    const RawGaussianParams& no_noise = no_noise_trainer.raw_params();
+    const RawGaussianParams& with_noise = noise_trainer.raw_params();
+    double abs_diff = 0.0;
+    for (int i = 0; i < scene.N * 3; ++i) {
+        ASSERT_TRUE(std::isfinite(with_noise.raw_positions[i])) << i;
+        abs_diff += std::abs(static_cast<double>(with_noise.raw_positions[i]) -
+                             static_cast<double>(no_noise.raw_positions[i]));
     }
-    EXPECT_GT(max_position_delta, 1e-8);
+    EXPECT_GT(abs_diff, 1e-7);
+
+    VulkanTrainer repeat_noise_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    const float repeat_noise_loss = repeat_noise_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
+    ASSERT_TRUE(std::isfinite(repeat_noise_loss));
+    EXPECT_TRUE(repeat_noise_trainer.last_gpu_raw_activation_used_for_test());
+    EXPECT_EQ(repeat_noise_trainer.last_raw_materialization_kind_for_test(),
+              VulkanTrainer::RawMaterializationKind::None);
+    const RawGaussianParams& repeat_noise = repeat_noise_trainer.raw_params();
+    for (int i = 0; i < scene.N * 3; ++i) {
+        EXPECT_FLOAT_EQ(with_noise.raw_positions[i], repeat_noise.raw_positions[i]) << i;
+    }
+
+    SceneFixture active_scene;
+    ASSERT_TRUE(active_scene.load()) << "Could not load tiny golden fixture.";
+    std::fill(active_scene.raw_opacities.begin(), active_scene.raw_opacities.end(), logit(0.999f));
+    std::fill(active_scene.opacities.begin(), active_scene.opacities.end(), 0.999f);
+    active_scene.raw.raw_opacities = active_scene.raw_opacities.data();
+    active_scene.g.opacities = active_scene.opacities.data();
+
+    VkTrainingConfig active_tcfg = tcfg;
+    active_tcfg.noise_lr = 0.0f;
+    VulkanTrainer active_no_noise_trainer(ctx, active_scene.g, active_scene.raw, active_scene.sh_degree, active_scene.W, active_scene.H, active_tcfg);
+    const float active_no_noise_loss = active_no_noise_trainer.step(active_scene.cam, active_scene.cfg, target.data(), active_scene.W, active_scene.H, true);
+    ASSERT_TRUE(std::isfinite(active_no_noise_loss));
+    EXPECT_TRUE(active_no_noise_trainer.last_gpu_raw_activation_used_for_test());
+
+    active_tcfg.noise_lr = 5e5f;
+    VulkanTrainer active_noise_trainer(ctx, active_scene.g, active_scene.raw, active_scene.sh_degree, active_scene.W, active_scene.H, active_tcfg);
+    const float active_noise_loss = active_noise_trainer.step(active_scene.cam, active_scene.cfg, target.data(), active_scene.W, active_scene.H, true);
+    ASSERT_TRUE(std::isfinite(active_noise_loss));
+    EXPECT_TRUE(active_noise_trainer.last_gpu_raw_activation_used_for_test());
+    EXPECT_EQ(active_noise_trainer.last_raw_materialization_kind_for_test(),
+              VulkanTrainer::RawMaterializationKind::None);
+
+    const RawGaussianParams& active_no_noise = active_no_noise_trainer.raw_params();
+    const RawGaussianParams& active_noise = active_noise_trainer.raw_params();
+    for (int i = 0; i < active_scene.N * 3; ++i) {
+        EXPECT_FLOAT_EQ(active_no_noise.raw_positions[i], active_noise.raw_positions[i]) << i;
+    }
 }
 
 TEST(VulkanTrainer, ForwardGpuCacheReuseIgnoredByForwardOnly) {
@@ -1169,6 +1305,76 @@ TEST(VulkanTrainer, Eval3DOneStepSmoke) {
     EXPECT_GT(max_delta, 0.0f) << "eval_3D step produced no raw parameter update.";
 }
 
+TEST(VulkanTrainer, Eval3DParityProperEwaGpuResidentSkipsPreprocessCpuCache) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    SceneFixture scene;
+    ASSERT_TRUE(scene.load()) << "Could not load tiny golden fixture.";
+    scene.cfg.eval_3D = true;
+
+    VkTrainingConfig tcfg;
+    tcfg.eval_3D = true;
+    tcfg.parity_mode = true;
+    tcfg.proper_ewa = true;
+    tcfg.lambda_dssim = 0.2f;
+    tcfg.noise_lr = 0.0f;
+    tcfg.sh_degree_max = scene.sh_degree;
+    tcfg.sh_degree_warmup = 0;
+    tcfg.densify_from_step = 0;
+    tcfg.cap_max = 1000;
+
+    std::vector<float> target(static_cast<size_t>(scene.W) * scene.H * 3, 0.0f);
+    for (size_t i = 0; i < target.size(); ++i) {
+        target[i] = 0.07f + static_cast<float>((i * 13u) % 31u) / 101.0f;
+    }
+
+    EnvVarGuard gpu_dssim_env("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    EnvVarGuard reuse_env("GS3D_REUSE_FORWARD_OUTPUTS");
+    EnvVarGuard grad_env("GS3D_TRAIN_GPU_GRAD_ADAM");
+    EnvVarGuard raw_env("GS3D_TRAIN_GPU_RAW_ACTIVATE");
+    unsetenv("GS3D_TRAIN_GPU_DSSIM_LOSS");
+    unsetenv("GS3D_REUSE_FORWARD_OUTPUTS");
+    unsetenv("GS3D_TRAIN_GPU_GRAD_ADAM");
+    unsetenv("GS3D_TRAIN_GPU_RAW_ACTIVATE");
+
+    setenv("GS3D_TRAIN_GPU_DSSIM_LOSS", "1", 1);
+    setenv("GS3D_TRAIN_GPU_GRAD_ADAM", "1", 1);
+    setenv("GS3D_TRAIN_GPU_RAW_ACTIVATE", "1", 1);
+    VulkanTrainer cache_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    const float cache_loss = cache_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
+    EXPECT_TRUE(cache_trainer.last_gpu_dssim_used_for_test());
+    EXPECT_TRUE(cache_trainer.last_gpu_grad_adam_used_for_test());
+    EXPECT_FALSE(cache_trainer.last_forward_gpu_resident_outputs_for_test());
+    EXPECT_TRUE(cache_trainer.last_preprocess_cpu_cache_downloaded_for_test());
+
+    setenv("GS3D_REUSE_FORWARD_OUTPUTS", "1", 1);
+    VulkanTrainer gpu_resident_trainer(ctx, scene.g, scene.raw, scene.sh_degree, scene.W, scene.H, tcfg);
+    const float gpu_resident_loss = gpu_resident_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, true);
+    EXPECT_TRUE(gpu_resident_trainer.last_gpu_dssim_used_for_test());
+    EXPECT_TRUE(gpu_resident_trainer.last_gpu_grad_adam_used_for_test());
+    EXPECT_TRUE(gpu_resident_trainer.last_forward_gpu_resident_outputs_for_test());
+    EXPECT_FALSE(gpu_resident_trainer.last_preprocess_cpu_cache_downloaded_for_test());
+    EXPECT_NEAR(gpu_resident_loss, cache_loss, 5e-4f);
+
+    auto expect_close = [](const float* a, const float* b, size_t n, const char* name) {
+        for (size_t i = 0; i < n; ++i) {
+            EXPECT_NEAR(a[i], b[i], 2e-4f) << name << "[" << i << "]";
+        }
+    };
+    const RawGaussianParams& a = gpu_resident_trainer.raw_params();
+    const RawGaussianParams& b = cache_trainer.raw_params();
+    const size_t N = static_cast<size_t>(scene.N);
+    const size_t K = static_cast<size_t>(scene.max_coeffs);
+    expect_close(a.raw_positions, b.raw_positions, N * 3u, "raw_positions");
+    expect_close(a.raw_sh_coeffs, b.raw_sh_coeffs, N * K * 3u, "raw_sh");
+    expect_close(a.raw_opacities, b.raw_opacities, N, "raw_opacities");
+    expect_close(a.raw_scales, b.raw_scales, N * 3u, "raw_scales");
+    expect_close(a.raw_rotations, b.raw_rotations, N * 4u, "raw_rotations");
+}
+
 // ---------------------------------------------------------------------------
 // T-eval3d-replay : non-parity eval_3D training records exact replay order
 // ---------------------------------------------------------------------------
@@ -1249,6 +1455,7 @@ TEST(VulkanTrainer, Eval3DNonParityGpuReplayOffsetsMatchCpuReplayCount) {
     const float cpu_loss = cpu_trainer.step(scene.cam, scene.cfg, target.data(), scene.W, scene.H, false);
     ASSERT_TRUE(std::isfinite(cpu_loss));
     ASSERT_GT(cpu_trainer.last_replay_order_count_for_test(), 0u);
+    EXPECT_TRUE(cpu_trainer.last_preprocess_cpu_cache_downloaded_for_test());
 
     setenv("GS3D_TRAIN_GPU_L1_LOSS", "1", 1);
     setenv("GS3D_REUSE_FORWARD_OUTPUTS", "1", 1);
@@ -1261,6 +1468,7 @@ TEST(VulkanTrainer, Eval3DNonParityGpuReplayOffsetsMatchCpuReplayCount) {
     EXPECT_TRUE(gpu_trainer.last_gpu_l1_used_for_test());
     EXPECT_TRUE(gpu_trainer.last_forward_gpu_resident_outputs_for_test());
     EXPECT_FALSE(gpu_trainer.last_forward_cpu_cache_downloaded_for_test());
+    EXPECT_FALSE(gpu_trainer.last_preprocess_cpu_cache_downloaded_for_test());
     EXPECT_NEAR(gpu_loss, cpu_loss, 1e-5f);
     EXPECT_GT(gpu_trainer.last_replay_order_count_for_test(), 0u);
     EXPECT_EQ(gpu_trainer.last_replay_order_count_for_test(),

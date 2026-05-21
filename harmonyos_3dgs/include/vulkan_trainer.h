@@ -17,6 +17,7 @@
 #include "vulkan/dssim_loss_pass.h"
 #include "vulkan/sh_grad_split_pass.h"
 #include "vulkan/raw_activation_pass.h"
+#include "vulkan/position_noise_pass.h"
 #include "vulkan/regularization_pass.h"
 
 #include <vector>
@@ -92,6 +93,7 @@ public:
     bool last_forward_gpu_resident_outputs_for_test() const { return last_forward_gpu_resident_outputs_; }
     bool last_forward_cpu_image_downloaded_for_test() const { return last_forward_cpu_image_downloaded_; }
     bool last_forward_cpu_cache_downloaded_for_test() const { return last_forward_cpu_cache_downloaded_; }
+    bool last_preprocess_cpu_cache_downloaded_for_test() const { return last_preprocess_cpu_cache_downloaded_; }
     bool last_gpu_grad_adam_used_for_test() const { return last_gpu_grad_adam_used_; }
     bool last_gpu_raw_activation_used_for_test() const { return last_gpu_raw_activation_used_; }
     RawMaterializationKind last_raw_materialization_kind_for_test() const { return last_raw_materialization_kind_; }
@@ -192,6 +194,7 @@ private:
                                ForwardCache& out_cache);
     float run_gpu_l1_loss(const float* target, int W, int H, ForwardCache& out_cache);
     float run_gpu_dssim_loss(const float* target, int W, int H, ForwardCache& out_cache);
+    void ensure_gpu_dssim_loss_resources(size_t num_elements, size_t partial_count);
     void ensure_rendered_image_downloaded() const;
     // Inject covariance-scaled Gaussian noise into positions of near-dead Gaussians.
     // Called after GPU Adam download. Matches train.py:141-148.
@@ -241,7 +244,20 @@ private:
     std::unique_ptr<VulkanBuffer> gpu_dssim_alpha_buf_;
     std::unique_ptr<VulkanBuffer> gpu_dssim_beta_buf_;
     std::unique_ptr<VulkanBuffer> gpu_dssim_gamma_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_x2_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_y2_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_xy_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_scratch_buf_;
+    std::unique_ptr<VulkanBuffer> gpu_dssim_mu1_buf_;
     std::vector<float> gpu_dssim_partials_;
+    const float* gpu_dssim_cached_target_ = nullptr;
+    size_t gpu_dssim_cached_target_elements_ = 0;
+    int gpu_dssim_cached_target_W_ = 0;
+    int gpu_dssim_cached_target_H_ = 0;
+    uint64_t gpu_dssim_cached_target_hash_ = 0;
+    bool gpu_dssim_cached_target_hash_valid_ = false;
+    bool gpu_dssim_pass_bound_ = false;
+    VkBuffer gpu_dssim_bound_rendered_ = VK_NULL_HANDLE;
     size_t gpu_dssim_elements_capacity_ = 0;
     size_t gpu_dssim_partials_capacity_ = 0;
     bool gpu_l1_fast_path_allowed_ = false;
@@ -252,6 +268,7 @@ private:
     bool last_forward_gpu_resident_outputs_ = false;
     bool last_forward_cpu_image_downloaded_ = false;
     bool last_forward_cpu_cache_downloaded_ = false;
+    bool last_preprocess_cpu_cache_downloaded_ = false;
     bool last_gpu_grad_adam_used_ = false;
     bool last_gpu_raw_activation_used_ = false;
     mutable RawMaterializationKind last_raw_materialization_kind_ = RawMaterializationKind::None;
@@ -374,5 +391,6 @@ private:
     std::unique_ptr<DssimLossPass> dssim_loss_pass_;
     ShGradSplitPass           sh_grad_split_pass_;
     RawActivationPass         raw_activation_pass_;
+    PositionNoisePass         position_noise_pass_;
     RegularizationPass        regularization_pass_;
 };

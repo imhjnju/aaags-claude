@@ -229,7 +229,7 @@ ForwardResult run_forward_with_env(const char* env_value,
 }  // namespace
 
 // ============================================================================
-// 1. env-on forward path produces same image as env-off forward path.
+// 1. env-on Fuchsia path produces same image as env-off fallback path.
 // ============================================================================
 TEST(FuchsiaRadixE2E, EnvOnEnvOffSameImage) {
     auto off = run_forward_with_env("0");
@@ -243,9 +243,9 @@ TEST(FuchsiaRadixE2E, EnvOnEnvOffSameImage) {
         << "device feature, but env-off succeeded so device is OK).";
 
     ASSERT_FALSE(off.used_keyvals_gpu);
+    ASSERT_FALSE(off.used_tile_ranges_gpu);
     ASSERT_TRUE(on.used_unsorted_keyvals_gpu);
     ASSERT_FALSE(on.used_keyvals_gpu);
-    ASSERT_EQ(off.used_tile_ranges_gpu, on.used_tile_ranges_gpu);
     if (on.fuchsia_features_available) {
         ASSERT_TRUE(on.used_tile_ranges_gpu);
     }

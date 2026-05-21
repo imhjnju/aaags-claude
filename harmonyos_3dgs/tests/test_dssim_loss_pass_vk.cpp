@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -40,6 +41,11 @@ void run_dssim_case(int W, int H, float lambda_dssim) {
     VulkanBuffer alpha_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     VulkanBuffer beta_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     VulkanBuffer gamma_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer x2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer y2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer xy_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer scratch_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer mu1_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     const uint32_t partial_count = (N + 255u) / 256u;
     VulkanBuffer partials_buf(ctx, static_cast<VkDeviceSize>(partial_count) * sizeof(float));
     rendered_buf.upload(rendered.data(), rendered.size() * sizeof(float));
@@ -47,7 +53,10 @@ void run_dssim_case(int W, int H, float lambda_dssim) {
 
     DssimLossPass pass(ctx);
     pass.bind_buffers(rendered_buf.handle(), target_buf.handle(), grad_buf.handle(),
-                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle());
+                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle(),
+                      x2_buf.handle(), y2_buf.handle(), xy_buf.handle(), scratch_buf.handle(),
+                      mu1_buf.handle());
+    pass.precompute_target_terms(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
     pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
 
     std::vector<float> gpu_grad(N, 0.0f);
@@ -84,6 +93,11 @@ TEST(DssimLossPassVulkan, ConstantImageHasZeroLossAndGradient) {
     VulkanBuffer alpha_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     VulkanBuffer beta_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     VulkanBuffer gamma_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer x2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer y2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer xy_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer scratch_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer mu1_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
     const uint32_t partial_count = (N + 255u) / 256u;
     VulkanBuffer partials_buf(ctx, static_cast<VkDeviceSize>(partial_count) * sizeof(float));
     rendered_buf.upload(rendered.data(), rendered.size() * sizeof(float));
@@ -91,7 +105,10 @@ TEST(DssimLossPassVulkan, ConstantImageHasZeroLossAndGradient) {
 
     DssimLossPass pass(ctx);
     pass.bind_buffers(rendered_buf.handle(), target_buf.handle(), grad_buf.handle(),
-                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle());
+                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle(),
+                      x2_buf.handle(), y2_buf.handle(), xy_buf.handle(), scratch_buf.handle(),
+                      mu1_buf.handle());
+    pass.precompute_target_terms(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
     pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
 
     std::vector<float> gpu_grad(N, 1.0f);
@@ -105,6 +122,64 @@ TEST(DssimLossPassVulkan, ConstantImageHasZeroLossAndGradient) {
     for (uint32_t i = 0; i < N; ++i) {
         EXPECT_NEAR(gpu_grad[i], 0.0f, 1e-5f) << "i=" << i;
     }
+}
+
+TEST(DssimLossPassVulkan, RequiresCurrentTargetPrecompute) {
+    VulkanContext ctx;
+    if (!ctx.init()) {
+        GTEST_SKIP() << "No Vulkan compute device — skipping.";
+    }
+
+    const int W = 8;
+    const int H = 8;
+    const float lambda_dssim = 0.2f;
+    const uint32_t N = static_cast<uint32_t>(W * H * 3);
+    std::vector<float> rendered(N, 0.5f);
+    std::vector<float> target_a(N, 0.5f);
+    std::vector<float> target_b(N, 0.5f);
+
+    VulkanBuffer rendered_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer target_a_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer target_b_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer grad_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer alpha_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer beta_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer gamma_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer x2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer y2_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer xy_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer scratch_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    VulkanBuffer mu1_buf(ctx, static_cast<VkDeviceSize>(N) * sizeof(float));
+    const uint32_t partial_count = (N + 255u) / 256u;
+    VulkanBuffer partials_buf(ctx, static_cast<VkDeviceSize>(partial_count) * sizeof(float));
+    rendered_buf.upload(rendered.data(), rendered.size() * sizeof(float));
+    target_a_buf.upload(target_a.data(), target_a.size() * sizeof(float));
+    target_b_buf.upload(target_b.data(), target_b.size() * sizeof(float));
+
+    DssimLossPass pass(ctx);
+    pass.bind_buffers(rendered_buf.handle(), target_a_buf.handle(), grad_buf.handle(),
+                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle(),
+                      x2_buf.handle(), y2_buf.handle(), xy_buf.handle(), scratch_buf.handle(),
+                      mu1_buf.handle());
+    EXPECT_THROW(pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim),
+                 std::runtime_error);
+
+    pass.precompute_target_terms(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
+    pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim);
+
+    pass.bind_buffers(rendered_buf.handle(), target_a_buf.handle(), grad_buf.handle(),
+                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle(),
+                      x2_buf.handle(), y2_buf.handle(), xy_buf.handle(), scratch_buf.handle(),
+                      mu1_buf.handle());
+    EXPECT_THROW(pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim),
+                 std::runtime_error);
+
+    pass.bind_buffers(rendered_buf.handle(), target_b_buf.handle(), grad_buf.handle(),
+                      partials_buf.handle(), alpha_buf.handle(), beta_buf.handle(), gamma_buf.handle(),
+                      x2_buf.handle(), y2_buf.handle(), xy_buf.handle(), scratch_buf.handle(),
+                      mu1_buf.handle());
+    EXPECT_THROW(pass.dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), lambda_dssim),
+                 std::runtime_error);
 }
 
 TEST(DssimLossPassVulkan, MatchesCpuDssimNonMultipleSize) {

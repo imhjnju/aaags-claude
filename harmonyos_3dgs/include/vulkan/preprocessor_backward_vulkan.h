@@ -93,7 +93,10 @@ public:
                               VkBuffer d_means2D_gpu,  // from rasterize_bwd dL_dmeans2D_buf()
                               const RawGaussianParams& raw,
                               VkBuffer d_gauss2screen_gpu = VK_NULL_HANDLE,
-                              const PreprocessBackwardGpuInputs* gpu_inputs = nullptr);
+                              const PreprocessBackwardGpuInputs* gpu_inputs = nullptr,
+                              bool skip_eval3d_geometry = false);
+
+    void prepare_record_buffers(int num_gaussians, int max_coeffs);
 
     /// Download gradient outputs to CPU after backward_record_into() + submit.
     /// grads is allocated from alloc and filled from persistent GPU output buffers.
@@ -110,6 +113,7 @@ public:
     /// Critical for correctness: backward shaders only write to active Gaussians,
     /// so stale data from previous steps would accumulate without clearing.
     void clear_grad_buffers(VkCommandBuffer cmd);
+    void clear_geometry_grad_buffers(VkCommandBuffer cmd);
 
     void enable_debug_capture(bool enable) { debug_capture_enabled_ = enable; }
     void download_debug_buffers(int num_gaussians,

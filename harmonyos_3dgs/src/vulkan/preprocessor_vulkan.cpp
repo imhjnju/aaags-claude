@@ -48,6 +48,26 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
                                              const RenderConfig& cfg,
                                              FrameAllocator& alloc,
                                              ForwardCache* cache) {
+    return process_impl(g, cam, cfg, alloc, cache, true);
+}
+
+PreprocessOutput PreprocessorVulkan::process_without_cpu_cache_download(const GaussianData& g,
+                                                                       const Camera& cam,
+                                                                       const RenderConfig& cfg,
+                                                                       FrameAllocator& alloc,
+                                                                       ForwardCache* cache) {
+    return process_impl(g, cam, cfg, alloc, cache, false);
+}
+
+PreprocessOutput PreprocessorVulkan::process_impl(const GaussianData& g,
+                                                  const Camera& cam,
+                                                  const RenderConfig& cfg,
+                                                  FrameAllocator& alloc,
+                                                  ForwardCache* cache,
+                                                  bool download_cpu_cache) {
+#ifdef GS3D_TESTING
+    last_cpu_cache_downloaded_ = false;
+#endif
     // --- SP-2 hard errors (spec §4.4) ----------------------------------------
     if (cfg.tile_w != 16 || cfg.tile_h != 16)
         throw std::runtime_error(
@@ -287,9 +307,11 @@ PreprocessOutput PreprocessorVulkan::process(const GaussianData& g,
         out.opacities_2d[i]   = packed[i * 4 + 3];
     }
 
-    // Populate ForwardCache if requested.
     if (cache) {
-        download_cache(N, *cache, alloc);
+        cache->gauss2screen_gpu = out.gauss2screen_gpu;
+        if (download_cpu_cache) {
+            download_cache(N, *cache, alloc);
+        }
     }
 
     return out;
@@ -306,7 +328,11 @@ PreprocessOutput PreprocessorVulkan::process_gpu_inputs(int N,
                                                         const Camera& cam,
                                                         const RenderConfig& cfg,
                                                         FrameAllocator& alloc,
-                                                        ForwardCache* cache) {
+                                                        ForwardCache* cache,
+                                                        bool download_cpu_cache) {
+#ifdef GS3D_TESTING
+    last_cpu_cache_downloaded_ = false;
+#endif
     if (cfg.tile_w != 16 || cfg.tile_h != 16)
         throw std::runtime_error(
             "PreprocessorVulkan: only 16x16 tiles supported");
@@ -457,7 +483,10 @@ PreprocessOutput PreprocessorVulkan::process_gpu_inputs(int N,
     }
 
     if (cache) {
-        download_cache(N, *cache, alloc);
+        cache->gauss2screen_gpu = out.gauss2screen_gpu;
+        if (download_cpu_cache) {
+            download_cache(N, *cache, alloc);
+        }
     }
 
     return out;
@@ -469,6 +498,9 @@ PreprocessOutput PreprocessorVulkan::process_gpu_inputs(int N,
 // ---------------------------------------------------------------------------
 void PreprocessorVulkan::download_cache(int N, ForwardCache& cache,
                                         FrameAllocator& alloc) {
+#ifdef GS3D_TESTING
+    last_cpu_cache_downloaded_ = true;
+#endif
     if (!cov3d_buf_ || !p_view_buf_ || !p_hom_w_buf_ || !cov2d_buf_ || !cov2d_det_buf_)
         throw std::runtime_error(
             "PreprocessorVulkan::download_cache: process() not yet called");

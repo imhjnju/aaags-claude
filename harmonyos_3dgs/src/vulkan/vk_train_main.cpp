@@ -914,6 +914,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("Done.\n");
-
-    return 0;
+    std::fflush(nullptr);
+    std::_Exit(0);
 }

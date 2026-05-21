@@ -1,0 +1,85 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer TmpAlpha { float tmp_alpha[]; };
+layout(std430, set = 0, binding = 1) readonly buffer TmpBeta { float tmp_beta[]; };
+layout(std430, set = 0, binding = 2) readonly buffer TmpGamma { float tmp_gamma[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Rendered { float rendered[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Target { float target[]; };
+layout(std430, set = 0, binding = 5) buffer DLDpixels { float dL_dpixels[]; };
+
+layout(push_constant) uniform PC {
+    uint W;
+    uint H;
+    uint num_elements;
+    float lambda_dssim;
+} pc;
+
+const float K[11] = float[11](
+    0.0010283801,
+    0.0075987581,
+    0.0360007721,
+    0.1093606895,
+    0.2130055377,
+    0.2660117249,
+    0.2130055377,
+    0.1093606895,
+    0.0360007721,
+    0.0075987581,
+    0.0010283801);
+
+void add_sample(uint idx, float w, inout float sa, inout float sb, inout float sg) {
+    sa += w * tmp_alpha[idx];
+    sb += w * tmp_beta[idx];
+    sg += w * tmp_gamma[idx];
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.num_elements || pc.lambda_dssim == 0.0) return;
+
+    uint HW = pc.W * pc.H;
+    uint ch = gid / HW;
+    uint p = gid - ch * HW;
+    uint x = p % pc.W;
+    uint y = p / pc.W;
+    uint base = ch * HW + y * pc.W;
+    uint hi = pc.W - 1u;
+
+    float sa = 0.0;
+    float sb = 0.0;
+    float sg = 0.0;
+    if (x >= 5u && x + 5u < pc.W) {
+        for (int d = -5; d <= 5; ++d) {
+            add_sample(base + x + 5u - uint(d + 5), K[d + 5], sa, sb, sg);
+        }
+    } else {
+        for (int d = -5; d <= 5; ++d) {
+            int cx = int(x) - d;
+            if (cx >= 0 && cx < int(pc.W)) {
+                add_sample(base + uint(cx), K[d + 5], sa, sb, sg);
+            }
+        }
+    }
+    // Adjoint of clamp blur: interior symmetric taps plus boundary clamp spill.
+    if (x == 0u) {
+        uint cmax = min(hi, 4u);
+        for (uint cx = 0u; cx <= cmax; ++cx) {
+            for (int d = -5; d <= -int(cx) - 1; ++d) {
+                add_sample(base + cx, K[d + 5], sa, sb, sg);
+            }
+        }
+    }
+    if (x == hi) {
+        uint cmin = hi > 4u ? hi - 4u : 0u;
+        for (uint cx = cmin; cx <= hi; ++cx) {
+            for (int d = int(pc.W) - int(cx); d <= 5; ++d) {
+                add_sample(base + cx, K[d + 5], sa, sb, sg);
+            }
+        }
+    }
+
+    float d_ssim_dx = sa + target[gid] * sb + rendered[gid] * sg;
+    dL_dpixels[gid] += -pc.lambda_dssim * (1.0 / float(pc.num_elements)) * d_ssim_dx;
+}

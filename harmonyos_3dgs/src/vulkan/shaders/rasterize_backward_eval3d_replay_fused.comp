@@ -1,0 +1,353 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Gauss2Screen { float gauss2screen[]; };
+layout(std430, set = 0, binding = 1) readonly buffer ConicOpacity { float conic_opacity[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Colors { float colors[]; };
+layout(std430, set = 0, binding = 3) readonly buffer TFinal { float T_final[]; };
+layout(std430, set = 0, binding = 4) readonly buffer NContrib { uint n_contrib[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DLDpixels { float dL_dpixels[]; };
+layout(std430, set = 0, binding = 6) buffer DLDOpacity { float dL_dopacity[]; };
+layout(std430, set = 0, binding = 7) buffer DLDColors { float dL_dcolors[]; };
+layout(std430, set = 0, binding = 8) readonly buffer ReplayOrderOffsets { uint replay_order_offsets[]; };
+layout(std430, set = 0, binding = 9) readonly buffer ReplayOrderGids { uint replay_order_gids[]; };
+layout(std430, set = 0, binding = 10) readonly buffer Positions { float positions[]; };
+layout(std430, set = 0, binding = 11) readonly buffer Scales { float scales[]; };
+layout(std430, set = 0, binding = 12) readonly buffer Rotations { float rotations[]; };
+layout(std430, set = 0, binding = 13) readonly buffer RawRotations { float raw_rotations[]; };
+layout(std430, set = 0, binding = 14) readonly buffer Filter3D { float filter_3D[]; };
+layout(std430, set = 0, binding = 15) buffer DMeans3D { float d_means3D[]; };
+layout(std430, set = 0, binding = 16) buffer DScales { float d_scales[]; };
+layout(std430, set = 0, binding = 17) buffer DRotations { float d_rotations[]; };
+
+layout(std140, set = 0, binding = 18) uniform FusedReplayUBO {
+    mat4 view_matrix;
+    mat4 viewproj_matrix;
+    uint W;
+    uint H;
+    uint num_tiles_x;
+    uint _pad;
+    vec3 bg_color;
+    float scale_modifier;
+    float h_x;
+    float h_y;
+    vec2 _pad2;
+} ubo;
+
+float maxContribRayPixel(vec4 plane_a,
+                          vec4 plane_b,
+                          out vec3 m,
+                          out vec3 d,
+                          out float d_2,
+                          out float m_2,
+                          out float inv_d2) {
+    vec3 n_x = plane_a.xyz;
+    vec3 n_y = plane_b.xyz;
+    d = cross(n_x, n_y);
+    m = plane_a.w * n_y - plane_b.w * n_x;
+    d_2 = dot(d, d);
+    m_2 = dot(m, m);
+    if (d_2 < 1e-8) {
+        inv_d2 = 0.0;
+        return 0.0;
+    }
+    inv_d2 = 1.0 / d_2;
+    return m_2 * inv_d2;
+}
+
+vec4 g2s_row(uint gid, uint row) {
+    uint base = gid * 16u + row * 4u;
+    return vec4(gauss2screen[base + 0u],
+                gauss2screen[base + 1u],
+                gauss2screen[base + 2u],
+                gauss2screen[base + 3u]);
+}
+
+void quat2R(vec4 q, out float R[9]) {
+    float r = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    R[0] = 1.0 - 2.0 * (y * y + z * z);
+    R[1] = 2.0 * (x * y + r * z);
+    R[2] = 2.0 * (x * z - r * y);
+    R[3] = 2.0 * (x * y - r * z);
+    R[4] = 1.0 - 2.0 * (x * x + z * z);
+    R[5] = 2.0 * (y * z + r * x);
+    R[6] = 2.0 * (x * z + r * y);
+    R[7] = 2.0 * (y * z - r * x);
+    R[8] = 1.0 - 2.0 * (x * x + y * y);
+}
+
+void mat4Mul16(float A[16], float B[16], out float result[16]) {
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                sum += A[k * 4 + row] * B[col * 4 + k];
+            }
+            result[col * 4 + row] = sum;
+        }
+    }
+}
+
+void buildWorld2Screen(out float w2s[16]) {
+    float W = float(ubo.W);
+    float H = float(ubo.H);
+    float vp[16] = float[16](
+        W * 0.5, 0.0, 0.0, 0.0,
+        0.0, H * 0.5, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        W * 0.5 - 0.5, H * 0.5 - 0.5, 0.0, 1.0
+    );
+    float viewproj[16];
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            viewproj[col * 4 + row] = ubo.viewproj_matrix[col][row];
+        }
+    }
+    mat4Mul16(vp, viewproj, w2s);
+}
+
+void quatGradFromDR(float d_R[9], vec4 q, out vec4 d_qn) {
+    float qr = q.x;
+    float qx = q.y;
+    float qy = q.z;
+    float qz = q.w;
+    float d_qn_r = 0.0;
+    float d_qn_x = 0.0;
+    float d_qn_y = 0.0;
+    float d_qn_z = 0.0;
+
+    d_qn_y += d_R[0] * (-4.0 * qy);
+    d_qn_z += d_R[0] * (-4.0 * qz);
+    d_qn_r += d_R[1] * 2.0 * qz;
+    d_qn_x += d_R[1] * 2.0 * qy;
+    d_qn_y += d_R[1] * 2.0 * qx;
+    d_qn_z += d_R[1] * 2.0 * qr;
+    d_qn_r += d_R[2] * (-2.0 * qy);
+    d_qn_x += d_R[2] * 2.0 * qz;
+    d_qn_y += d_R[2] * (-2.0 * qr);
+    d_qn_z += d_R[2] * 2.0 * qx;
+    d_qn_r += d_R[3] * (-2.0 * qz);
+    d_qn_x += d_R[3] * 2.0 * qy;
+    d_qn_y += d_R[3] * 2.0 * qx;
+    d_qn_z += d_R[3] * (-2.0 * qr);
+    d_qn_x += d_R[4] * (-4.0 * qx);
+    d_qn_z += d_R[4] * (-4.0 * qz);
+    d_qn_r += d_R[5] * 2.0 * qx;
+    d_qn_x += d_R[5] * 2.0 * qr;
+    d_qn_y += d_R[5] * 2.0 * qz;
+    d_qn_z += d_R[5] * 2.0 * qy;
+    d_qn_r += d_R[6] * 2.0 * qy;
+    d_qn_x += d_R[6] * 2.0 * qz;
+    d_qn_y += d_R[6] * 2.0 * qr;
+    d_qn_z += d_R[6] * 2.0 * qx;
+    d_qn_r += d_R[7] * (-2.0 * qx);
+    d_qn_x += d_R[7] * (-2.0 * qr);
+    d_qn_y += d_R[7] * 2.0 * qz;
+    d_qn_z += d_R[7] * 2.0 * qy;
+    d_qn_x += d_R[8] * (-4.0 * qx);
+    d_qn_y += d_R[8] * (-4.0 * qy);
+
+    d_qn = vec4(d_qn_r, d_qn_x, d_qn_y, d_qn_z);
+}
+
+void atomicAddGeometry(uint gid, float d_g2s[16], float w2s[16]) {
+    uint base3 = gid * 3u;
+    uint base4 = gid * 4u;
+
+    float d_g2w[16];
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                sum += w2s[row * 4 + k] * d_g2s[col * 4 + k];
+            }
+            d_g2w[col * 4 + row] = sum;
+        }
+    }
+
+    vec3 pos = vec3(positions[base3 + 0u], positions[base3 + 1u], positions[base3 + 2u]);
+    vec3 scale = vec3(scales[base3 + 0u], scales[base3 + 1u], scales[base3 + 2u]);
+    vec4 rot = vec4(rotations[base4 + 0u], rotations[base4 + 1u], rotations[base4 + 2u], rotations[base4 + 3u]);
+    float R[9];
+    quat2R(rot, R);
+
+    float focal = max(ubo.h_x, ubo.h_y);
+    float mean_view_z = ubo.view_matrix[0][2] * pos.x + ubo.view_matrix[1][2] * pos.y + ubo.view_matrix[2][2] * pos.z + ubo.view_matrix[3][2];
+    float mip_from_view = (mean_view_z / focal) * (mean_view_z / focal) * 0.3;
+    float f3 = filter_3D[gid];
+    float variance = max(f3 * f3, mip_from_view);
+    float scale_dilated[3] = float[3](
+        sqrt(scale.x * scale.x + variance),
+        sqrt(scale.y * scale.y + variance),
+        sqrt(scale.z * scale.z + variance)
+    );
+    float sqrt_mod = sqrt(ubo.scale_modifier);
+    float sd[3] = float[3](scale_dilated[0] * sqrt_mod,
+                            scale_dilated[1] * sqrt_mod,
+                            scale_dilated[2] * sqrt_mod);
+
+    vec3 d_pos = vec3(d_g2w[12], d_g2w[13], d_g2w[14]);
+    float d_sd[3] = float[3](0.0, 0.0, 0.0);
+    float d_R[9];
+    for (int k = 0; k < 9; ++k) d_R[k] = 0.0;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int row = 0; row < 3; ++row) {
+            float grad = d_g2w[axis * 4 + row];
+            d_sd[axis] += grad * R[axis * 3 + row];
+            d_R[axis * 3 + row] += grad * sd[axis];
+        }
+    }
+
+    float d_scale_geom[3] = float[3](0.0, 0.0, 0.0);
+    for (int axis = 0; axis < 3; ++axis) {
+        d_scale_geom[axis] += d_sd[axis] * sqrt_mod * scale[axis] / max(scale_dilated[axis], 1e-12);
+    }
+
+    vec4 d_qn;
+    quatGradFromDR(d_R, rot, d_qn);
+    vec4 raw_q = vec4(raw_rotations[base4 + 0u], raw_rotations[base4 + 1u], raw_rotations[base4 + 2u], raw_rotations[base4 + 3u]);
+    float raw_len = max(length(raw_q), 1e-12);
+    float dot_dq_q = dot(d_qn, rot);
+    vec4 d_raw_q = (d_qn - rot * dot_dq_q) / raw_len;
+
+    atomicAdd(d_means3D[base3 + 0u], d_pos.x);
+    atomicAdd(d_means3D[base3 + 1u], d_pos.y);
+    atomicAdd(d_means3D[base3 + 2u], d_pos.z);
+    atomicAdd(d_scales[base3 + 0u], d_scale_geom[0] * scale.x);
+    atomicAdd(d_scales[base3 + 1u], d_scale_geom[1] * scale.y);
+    atomicAdd(d_scales[base3 + 2u], d_scale_geom[2] * scale.z);
+    atomicAdd(d_rotations[base4 + 0u], d_raw_q.x);
+    atomicAdd(d_rotations[base4 + 1u], d_raw_q.y);
+    atomicAdd(d_rotations[base4 + 2u], d_raw_q.z);
+    atomicAdd(d_rotations[base4 + 3u], d_raw_q.w);
+}
+
+void main() {
+    uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    if (pixel_x >= ubo.W || pixel_y >= ubo.H) return;
+
+    uint px = pixel_y * ubo.W + pixel_x;
+    uint HW = ubo.W * ubo.H;
+
+    uint last_contributor = n_contrib[px];
+    if (last_contributor == 0u) return;
+    uint replay_start = replay_order_offsets[px];
+    uint contributor = last_contributor;
+
+    float T = T_final[px];
+    float final_T = T;
+    vec3 dL_dpixel = vec3(dL_dpixels[0u * HW + px],
+                          dL_dpixels[1u * HW + px],
+                          dL_dpixels[2u * HW + px]);
+    vec3 accum_rec = vec3(0.0);
+    vec3 last_color = vec3(0.0);
+    float last_alpha = 0.0;
+    bool has_bg = ubo.bg_color.x != 0.0 || ubo.bg_color.y != 0.0 || ubo.bg_color.z != 0.0;
+    float bg_dot_dpixel = has_bg ? dot(ubo.bg_color, dL_dpixel) : 0.0;
+    vec2 pixf = vec2(float(pixel_x), float(pixel_y));
+    float w2s[16];
+    buildWorld2Screen(w2s);
+
+    for (uint offset = 0u; offset < last_contributor; ++offset) {
+        contributor -= 1u;
+        uint gid = replay_order_gids[replay_start + contributor];
+        vec4 row0 = g2s_row(gid, 0u);
+        vec4 row1 = g2s_row(gid, 1u);
+        vec4 row3 = g2s_row(gid, 3u);
+
+        vec4 plane_x = row0 - row3 * pixf.x;
+        vec4 plane_y = row1 - row3 * pixf.y;
+        vec3 m;
+        vec3 d;
+        float d_2;
+        float m_2;
+        float inv_d2;
+        float distance = maxContribRayPixel(plane_x, plane_y, m, d, d_2, m_2, inv_d2);
+        float power = -0.5 * distance;
+        float G = exp(power);
+        float opacity = conic_opacity[gid * 4u + 3u];
+        float alpha = min(0.99, opacity * G);
+
+        T = T / (1.0 - alpha);
+        float dchannel_dcolor = alpha * T;
+        vec3 color = vec3(colors[gid * 3u + 0u],
+                          colors[gid * 3u + 1u],
+                          colors[gid * 3u + 2u]);
+
+        accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec;
+        float dL_dalpha = dot(color - accum_rec, dL_dpixel);
+        last_color = color;
+
+        atomicAdd(dL_dcolors[gid * 3u + 0u], dchannel_dcolor * dL_dpixel.x);
+        atomicAdd(dL_dcolors[gid * 3u + 1u], dchannel_dcolor * dL_dpixel.y);
+        atomicAdd(dL_dcolors[gid * 3u + 2u], dchannel_dcolor * dL_dpixel.z);
+
+        dL_dalpha *= T;
+        last_alpha = alpha;
+        if (has_bg) {
+            dL_dalpha += (-final_T / (1.0 - alpha)) * bg_dot_dpixel;
+        }
+
+        float dL_dG = opacity * dL_dalpha;
+        vec3 n_x = plane_x.xyz;
+        vec3 n_y = plane_y.xyz;
+        float d_x = plane_x.w;
+        float d_y = plane_y.w;
+        if (d_2 >= 1e-8) {
+            float n_x_2 = dot(n_x, n_x);
+            float n_y_2 = dot(n_y, n_y);
+            float n_xy = dot(n_x, n_y);
+            float n_y_m = dot(n_y, m);
+            float n_x_m = dot(n_x, m);
+
+            vec3 dd_dT0 = n_y_2 * n_x - n_xy * n_y;
+            vec3 dd_dT1 = n_x_2 * n_y - n_xy * n_x;
+            vec3 dd_dT3 = n_xy * (pixf.y * n_x + pixf.x * n_y)
+                         - pixf.x * n_y_2 * n_x
+                         - pixf.y * n_x_2 * n_y;
+            vec4 dd_dT_u = vec4(dd_dT0.x, dd_dT1.x, 0.0, dd_dT3.x);
+            vec4 dd_dT_v = vec4(dd_dT0.y, dd_dT1.y, 0.0, dd_dT3.y);
+            vec4 dd_dT_w = vec4(dd_dT0.z, dd_dT1.z, 0.0, dd_dT3.z);
+
+            vec3 dm_dT0 = -d_y * m;
+            vec3 dm_dT1 = d_x * m;
+            vec3 dm_dT3 = (d_y * pixf.x - d_x * pixf.y) * m;
+            vec4 dm_dT_u = vec4(dm_dT0.x, dm_dT1.x, 0.0, dm_dT3.x);
+            vec4 dm_dT_v = vec4(dm_dT0.y, dm_dT1.y, 0.0, dm_dT3.y);
+            vec4 dm_dT_w = vec4(dm_dT0.z, dm_dT1.z, 0.0, dm_dT3.z);
+            vec4 dm_dT_mu = vec4(n_y_m, -n_x_m, 0.0,
+                                  pixf.y * n_x_m - pixf.x * n_y_m);
+
+            float grad_scale = dL_dG * G;
+            vec4 dG_dT_u = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_u - dm_dT_u * inv_d2);
+            vec4 dG_dT_v = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_v - dm_dT_v * inv_d2);
+            vec4 dG_dT_w = grad_scale * (m_2 * inv_d2 * inv_d2 * dd_dT_w - dm_dT_w * inv_d2);
+            vec4 dG_dT_mu = grad_scale * (-dm_dT_mu * inv_d2);
+
+            float d_g2s[16];
+            for (int k = 0; k < 16; ++k) d_g2s[k] = 0.0;
+            d_g2s[0] = dG_dT_u.x;
+            d_g2s[1] = dG_dT_u.y;
+            d_g2s[3] = dG_dT_u.w;
+            d_g2s[4] = dG_dT_v.x;
+            d_g2s[5] = dG_dT_v.y;
+            d_g2s[7] = dG_dT_v.w;
+            d_g2s[8] = dG_dT_w.x;
+            d_g2s[9] = dG_dT_w.y;
+            d_g2s[11] = dG_dT_w.w;
+            d_g2s[12] = dG_dT_mu.x;
+            d_g2s[13] = dG_dT_mu.y;
+            d_g2s[15] = dG_dT_mu.w;
+            atomicAddGeometry(gid, d_g2s, w2s);
+        }
+
+        atomicAdd(dL_dopacity[gid], G * dL_dalpha);
+    }
+}

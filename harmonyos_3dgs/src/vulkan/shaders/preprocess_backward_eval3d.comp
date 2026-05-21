@@ -3,6 +3,7 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint spec_proper_ewa = 0u;
+layout(constant_id = 1) const uint spec_skip_geometry = 0u;
 
 layout(std430, set = 0, binding = 0) readonly buffer Positions { float positions[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Radii { int radii[]; };
@@ -176,7 +177,14 @@ void main() {
     uint sh_base = i * ubo.sh_coeffs_per_g * 3u;
 
     if (radii[i] <= 0) {
-        write_zero(i, base3, base4, sh_base);
+        if (spec_skip_geometry == 0u) {
+            write_zero(i, base3, base4, sh_base);
+        } else {
+            d_raw_opacities[i] = 0.0;
+            for (uint k = 0u; k < ubo.sh_coeffs_per_g * 3u; ++k) {
+                d_sh[sh_base + k] = 0.0;
+            }
+        }
         return;
     }
 
@@ -186,117 +194,120 @@ void main() {
     float R[9];
     quat2R(rot, R);
 
-    float w2s[16];
-    buildWorld2Screen(w2s);
-
-    float d_g2w[16];
-    for (int col = 0; col < 4; ++col) {
-        for (int row = 0; row < 4; ++row) {
-            float sum = 0.0;
-            for (int k = 0; k < 4; ++k) {
-                sum += w2s[row * 4 + k] * d_gauss2screen[i * 16u + uint(col * 4 + k)];
-            }
-            d_g2w[col * 4 + row] = sum;
-        }
-    }
-
-    float focal = max(ubo.h_x, ubo.h_y);
-    float mean_view_z = ubo.view_matrix[0][2] * pos.x + ubo.view_matrix[1][2] * pos.y + ubo.view_matrix[2][2] * pos.z + ubo.view_matrix[3][2];
-    float mip_from_view = (mean_view_z / focal) * (mean_view_z / focal) * 0.3;
-    float f3 = filter_3D[i];
-    float variance = max(f3 * f3, mip_from_view);
-    float scale_dilated[3] = float[3](
-        sqrt(scale.x * scale.x + variance),
-        sqrt(scale.y * scale.y + variance),
-        sqrt(scale.z * scale.z + variance)
-    );
-    float sqrt_mod = sqrt(ubo.scale_modifier);
-    float sd[3] = float[3](scale_dilated[0] * sqrt_mod,
-                            scale_dilated[1] * sqrt_mod,
-                            scale_dilated[2] * sqrt_mod);
-
-    vec3 d_pos = vec3(d_g2w[12], d_g2w[13], d_g2w[14]);
-    float d_sd[3] = float[3](0.0, 0.0, 0.0);
-    float d_R[9];
-    for (int k = 0; k < 9; ++k) d_R[k] = 0.0;
-
-    for (int axis = 0; axis < 3; ++axis) {
-        for (int row = 0; row < 3; ++row) {
-            float grad = d_g2w[axis * 4 + row];
-            d_sd[axis] += grad * R[axis * 3 + row];
-            d_R[axis * 3 + row] += grad * sd[axis];
-        }
-    }
-
     float conv = 1.0;
-    float d_scale_geom[3] = float[3](0.0, 0.0, 0.0);
-    for (int axis = 0; axis < 3; ++axis) {
-        d_scale_geom[axis] += d_sd[axis] * sqrt_mod * scale[axis] / max(scale_dilated[axis], 1e-12);
-    }
+    vec3 d_pos = vec3(0.0);
+    if (spec_skip_geometry == 0u) {
+        float w2s[16];
+        buildWorld2Screen(w2s);
 
-    if (spec_proper_ewa != 0u) {
-        vec3 ray = pos - ubo.cam_pos;
-        float ray_len = max(length(ray), 1e-12);
-        vec3 viewray = ray / ray_len;
-        vec3 rd = vec3(
-            R[0] * viewray.x + R[1] * viewray.y + R[2] * viewray.z,
-            R[3] * viewray.x + R[4] * viewray.y + R[5] * viewray.z,
-            R[6] * viewray.x + R[7] * viewray.y + R[8] * viewray.z
-        );
-
-        vec3 s2 = scale * scale;
-        vec3 sdil = vec3(scale_dilated[0], scale_dilated[1], scale_dilated[2]);
-        vec3 sdil2 = sdil * sdil;
-        vec3 rd2 = rd * rd;
-        float A = rd2.x * s2.y * s2.z + rd2.y * s2.z * s2.x + rd2.z * s2.x * s2.y;
-        float B = rd2.x * sdil2.y * sdil2.z + rd2.y * sdil2.z * sdil2.x + rd2.z * sdil2.x * sdil2.y;
-        if (A > 1e-20 && B > 1e-20) {
-            conv = sqrt(A / B);
-            float d_conv = d_opacity[i] * opacities[i];
-            float dA = d_conv * 0.5 * conv / A;
-            float dB = -d_conv * 0.5 * conv / B;
-
-            d_scale_geom[0] += dA * 2.0 * scale.x * (rd2.y * s2.z + rd2.z * s2.y);
-            d_scale_geom[1] += dA * 2.0 * scale.y * (rd2.x * s2.z + rd2.z * s2.x);
-            d_scale_geom[2] += dA * 2.0 * scale.z * (rd2.x * s2.y + rd2.y * s2.x);
-
-            d_scale_geom[0] += dB * 2.0 * sdil.x * (rd2.y * sdil2.z + rd2.z * sdil2.y) * scale.x / max(sdil.x, 1e-12);
-            d_scale_geom[1] += dB * 2.0 * sdil.y * (rd2.x * sdil2.z + rd2.z * sdil2.x) * scale.y / max(sdil.y, 1e-12);
-            d_scale_geom[2] += dB * 2.0 * sdil.z * (rd2.x * sdil2.y + rd2.y * sdil2.x) * scale.z / max(sdil.z, 1e-12);
-
-            vec3 d_rd = vec3(
-                dA * 2.0 * rd.x * s2.y * s2.z + dB * 2.0 * rd.x * sdil2.y * sdil2.z,
-                dA * 2.0 * rd.y * s2.z * s2.x + dB * 2.0 * rd.y * sdil2.z * sdil2.x,
-                dA * 2.0 * rd.z * s2.x * s2.y + dB * 2.0 * rd.z * sdil2.x * sdil2.y
-            );
-            for (int row = 0; row < 3; ++row) {
-                d_R[row * 3 + 0] += d_rd[row] * viewray.x;
-                d_R[row * 3 + 1] += d_rd[row] * viewray.y;
-                d_R[row * 3 + 2] += d_rd[row] * viewray.z;
+        float d_g2w[16];
+        for (int col = 0; col < 4; ++col) {
+            for (int row = 0; row < 4; ++row) {
+                float sum = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    sum += w2s[row * 4 + k] * d_gauss2screen[i * 16u + uint(col * 4 + k)];
+                }
+                d_g2w[col * 4 + row] = sum;
             }
-            vec3 d_viewray = vec3(
-                R[0] * d_rd.x + R[3] * d_rd.y + R[6] * d_rd.z,
-                R[1] * d_rd.x + R[4] * d_rd.y + R[7] * d_rd.z,
-                R[2] * d_rd.x + R[5] * d_rd.y + R[8] * d_rd.z
-            );
-            d_pos += (d_viewray - viewray * dot(viewray, d_viewray)) / ray_len;
         }
+
+        float focal = max(ubo.h_x, ubo.h_y);
+        float mean_view_z = ubo.view_matrix[0][2] * pos.x + ubo.view_matrix[1][2] * pos.y + ubo.view_matrix[2][2] * pos.z + ubo.view_matrix[3][2];
+        float mip_from_view = (mean_view_z / focal) * (mean_view_z / focal) * 0.3;
+        float f3 = filter_3D[i];
+        float variance = max(f3 * f3, mip_from_view);
+        float scale_dilated[3] = float[3](
+            sqrt(scale.x * scale.x + variance),
+            sqrt(scale.y * scale.y + variance),
+            sqrt(scale.z * scale.z + variance)
+        );
+        float sqrt_mod = sqrt(ubo.scale_modifier);
+        float sd[3] = float[3](scale_dilated[0] * sqrt_mod,
+                                scale_dilated[1] * sqrt_mod,
+                                scale_dilated[2] * sqrt_mod);
+
+        d_pos = vec3(d_g2w[12], d_g2w[13], d_g2w[14]);
+        float d_sd[3] = float[3](0.0, 0.0, 0.0);
+        float d_R[9];
+        for (int k = 0; k < 9; ++k) d_R[k] = 0.0;
+
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int row = 0; row < 3; ++row) {
+                float grad = d_g2w[axis * 4 + row];
+                d_sd[axis] += grad * R[axis * 3 + row];
+                d_R[axis * 3 + row] += grad * sd[axis];
+            }
+        }
+
+        float d_scale_geom[3] = float[3](0.0, 0.0, 0.0);
+        for (int axis = 0; axis < 3; ++axis) {
+            d_scale_geom[axis] += d_sd[axis] * sqrt_mod * scale[axis] / max(scale_dilated[axis], 1e-12);
+        }
+
+        if (spec_proper_ewa != 0u) {
+            vec3 ray = pos - ubo.cam_pos;
+            float ray_len = max(length(ray), 1e-12);
+            vec3 viewray = ray / ray_len;
+            vec3 rd = vec3(
+                R[0] * viewray.x + R[1] * viewray.y + R[2] * viewray.z,
+                R[3] * viewray.x + R[4] * viewray.y + R[5] * viewray.z,
+                R[6] * viewray.x + R[7] * viewray.y + R[8] * viewray.z
+            );
+
+            vec3 s2 = scale * scale;
+            vec3 sdil = vec3(scale_dilated[0], scale_dilated[1], scale_dilated[2]);
+            vec3 sdil2 = sdil * sdil;
+            vec3 rd2 = rd * rd;
+            float A = rd2.x * s2.y * s2.z + rd2.y * s2.z * s2.x + rd2.z * s2.x * s2.y;
+            float B = rd2.x * sdil2.y * sdil2.z + rd2.y * sdil2.z * sdil2.x + rd2.z * sdil2.x * sdil2.y;
+            if (A > 1e-20 && B > 1e-20) {
+                conv = sqrt(A / B);
+                float d_conv = d_opacity[i] * opacities[i];
+                float dA = d_conv * 0.5 * conv / A;
+                float dB = -d_conv * 0.5 * conv / B;
+
+                d_scale_geom[0] += dA * 2.0 * scale.x * (rd2.y * s2.z + rd2.z * s2.y);
+                d_scale_geom[1] += dA * 2.0 * scale.y * (rd2.x * s2.z + rd2.z * s2.x);
+                d_scale_geom[2] += dA * 2.0 * scale.z * (rd2.x * s2.y + rd2.y * s2.x);
+
+                d_scale_geom[0] += dB * 2.0 * sdil.x * (rd2.y * sdil2.z + rd2.z * sdil2.y) * scale.x / max(sdil.x, 1e-12);
+                d_scale_geom[1] += dB * 2.0 * sdil.y * (rd2.x * sdil2.z + rd2.z * sdil2.x) * scale.y / max(sdil.y, 1e-12);
+                d_scale_geom[2] += dB * 2.0 * sdil.z * (rd2.x * sdil2.y + rd2.y * sdil2.x) * scale.z / max(sdil.z, 1e-12);
+
+                vec3 d_rd = vec3(
+                    dA * 2.0 * rd.x * s2.y * s2.z + dB * 2.0 * rd.x * sdil2.y * sdil2.z,
+                    dA * 2.0 * rd.y * s2.z * s2.x + dB * 2.0 * rd.y * sdil2.z * sdil2.x,
+                    dA * 2.0 * rd.z * s2.x * s2.y + dB * 2.0 * rd.z * sdil2.x * sdil2.y
+                );
+                for (int row = 0; row < 3; ++row) {
+                    d_R[row * 3 + 0] += d_rd[row] * viewray.x;
+                    d_R[row * 3 + 1] += d_rd[row] * viewray.y;
+                    d_R[row * 3 + 2] += d_rd[row] * viewray.z;
+                }
+                vec3 d_viewray = vec3(
+                    R[0] * d_rd.x + R[3] * d_rd.y + R[6] * d_rd.z,
+                    R[1] * d_rd.x + R[4] * d_rd.y + R[7] * d_rd.z,
+                    R[2] * d_rd.x + R[5] * d_rd.y + R[8] * d_rd.z
+                );
+                d_pos += (d_viewray - viewray * dot(viewray, d_viewray)) / ray_len;
+            }
+        }
+
+        d_scales[base3 + 0u] = d_scale_geom[0] * scale.x;
+        d_scales[base3 + 1u] = d_scale_geom[1] * scale.y;
+        d_scales[base3 + 2u] = d_scale_geom[2] * scale.z;
+
+        vec4 d_qn;
+        quatGradFromDR(d_R, rot, d_qn);
+        vec4 raw_q = vec4(raw_rotations[base4 + 0u], raw_rotations[base4 + 1u], raw_rotations[base4 + 2u], raw_rotations[base4 + 3u]);
+        float raw_len = max(length(raw_q), 1e-12);
+        float dot_dq_q = dot(d_qn, rot);
+        vec4 d_raw_q = (d_qn - rot * dot_dq_q) / raw_len;
+        d_rotations[base4 + 0u] = d_raw_q.x;
+        d_rotations[base4 + 1u] = d_raw_q.y;
+        d_rotations[base4 + 2u] = d_raw_q.z;
+        d_rotations[base4 + 3u] = d_raw_q.w;
     }
-
-    d_scales[base3 + 0u] = d_scale_geom[0] * scale.x;
-    d_scales[base3 + 1u] = d_scale_geom[1] * scale.y;
-    d_scales[base3 + 2u] = d_scale_geom[2] * scale.z;
-
-    vec4 d_qn;
-    quatGradFromDR(d_R, rot, d_qn);
-    vec4 raw_q = vec4(raw_rotations[base4 + 0u], raw_rotations[base4 + 1u], raw_rotations[base4 + 2u], raw_rotations[base4 + 3u]);
-    float raw_len = max(length(raw_q), 1e-12);
-    float dot_dq_q = dot(d_qn, rot);
-    vec4 d_raw_q = (d_qn - rot * dot_dq_q) / raw_len;
-    d_rotations[base4 + 0u] = d_raw_q.x;
-    d_rotations[base4 + 1u] = d_raw_q.y;
-    d_rotations[base4 + 2u] = d_raw_q.z;
-    d_rotations[base4 + 3u] = d_raw_q.w;
 
     vec3 dir = normalize(pos - ubo.cam_pos);
     float dx = dir.x;
@@ -399,9 +410,11 @@ void main() {
         d_sh[off + 2u] = 0.0;
     }
 
-    d_means3D[base3 + 0u] = d_pos.x;
-    d_means3D[base3 + 1u] = d_pos.y;
-    d_means3D[base3 + 2u] = d_pos.z;
+    if (spec_skip_geometry == 0u) {
+        d_means3D[base3 + 0u] = d_pos.x;
+        d_means3D[base3 + 1u] = d_pos.y;
+        d_means3D[base3 + 2u] = d_pos.z;
+    }
 
     float sigma = opacities[i];
     float d_opacity_activated = d_opacity[i] * conv;

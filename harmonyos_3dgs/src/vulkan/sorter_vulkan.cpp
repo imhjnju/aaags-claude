@@ -33,6 +33,12 @@
 #include <stdexcept>
 #include <vector>
 
+static bool env_is_explicit_zero(const char* name)
+{
+    const char* env = std::getenv(name);
+    return env != nullptr && env[0] == '0' && env[1] == '\0';
+}
+
 static uint64_t make_packed_keyval(uint64_t legacy_key, uint32_t gauss_idx)
 {
     const uint32_t tile_id = static_cast<uint32_t>(legacy_key >> 32);
@@ -119,8 +125,12 @@ SorterVulkan::SorterVulkan(VulkanContext& ctx)
 SorterVulkan::~SorterVulkan() = default;
 
 bool SorterVulkan::fuchsia_sort_enabled() {
+#ifdef GS3D_TESTING
     const char* env = std::getenv("GS3D_USE_FUCHSIA_SORT");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
+#else
+    return !env_is_explicit_zero("GS3D_USE_FUCHSIA_SORT");
+#endif
 }
 
 bool SorterVulkan::sort_via_fuchsia_sortpairs(BinningOutput& bin, FrameAllocator& alloc) {
@@ -285,8 +295,10 @@ void SorterVulkan::sort(BinningOutput& bin, FrameAllocator& alloc) {
 
     const uint32_t R_u = static_cast<uint32_t>(R);
 
-    if (sort_via_fuchsia_sortpairs(bin, alloc)) {
-        return;
+    if (fuchsia_sort_enabled()) {
+        if (sort_via_fuchsia_sortpairs(bin, alloc)) {
+            return;
+        }
     }
     if (!has_host_input)
         throw std::runtime_error(
@@ -296,6 +308,10 @@ void SorterVulkan::sort(BinningOutput& bin, FrameAllocator& alloc) {
     // 1. Allocate GPU buffers (host-visible, Phase 1 style).
     // -------------------------------------------------------------------
     constexpr uint32_t kRadixLocalSize = 256u;
+    if (R > static_cast<int>(kRadixLocalSize)) {
+        sort_cpu_fallback(bin, alloc);
+        return;
+    }
     constexpr uint32_t kRadixBuckets = 16u;
     const uint32_t sort_wgs = (R_u + kRadixLocalSize - 1u) / kRadixLocalSize;
     const uint32_t hist_entries = sort_wgs * kRadixBuckets;
@@ -392,6 +408,20 @@ void SorterVulkan::prepare_record(uint32_t R, uint32_t num_tiles,
         throw std::runtime_error(
             "SorterVulkan::prepare_record: keys/values_unsorted is null");
 
+    r_fuchsia_sortpairs_record_ = false;
+    r_f_keys_input_ = VK_NULL_HANDLE;
+    r_f_values_input_ = VK_NULL_HANDLE;
+    if (fuchsia_sort_enabled()) {
+        try {
+            prepare_record_fuchsia_sortpairs(R, num_tiles, keys_unsorted, values_unsorted);
+            return;
+        } catch (const std::exception&) {
+            r_fuchsia_sortpairs_record_ = false;
+            r_f_keys_input_ = VK_NULL_HANDLE;
+            r_f_values_input_ = VK_NULL_HANDLE;
+        }
+    }
+
     // Release old ones.
     r_keys_b_.reset();
     r_vals_b_.reset();
@@ -449,8 +479,85 @@ void SorterVulkan::prepare_record(uint32_t R, uint32_t num_tiles,
     range_pass_->bind_buffers(r_keys_a_, r_ranges_->handle());
 }
 
+void SorterVulkan::prepare_record_fuchsia_sortpairs(uint32_t R, uint32_t num_tiles,
+                                                    VkBuffer keys_unsorted,
+                                                    VkBuffer values_unsorted) {
+    if (R == 0u)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record_fuchsia_sortpairs: R must be > 0");
+    if (num_tiles == 0u)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record_fuchsia_sortpairs: num_tiles must be > 0");
+    if (keys_unsorted == VK_NULL_HANDLE || values_unsorted == VK_NULL_HANDLE)
+        throw std::runtime_error(
+            "SorterVulkan::prepare_record_fuchsia_sortpairs: keys/values_unsorted is null");
+
+    constexpr uint32_t kRecordDwords = 3u;
+    const VkDeviceSize bytes_keys = static_cast<VkDeviceSize>(R) * sizeof(uint64_t);
+    const VkDeviceSize bytes_values = static_cast<VkDeviceSize>(R) * sizeof(uint32_t);
+    const VkDeviceSize bytes_ranges = static_cast<VkDeviceSize>(num_tiles) * 2u * sizeof(uint32_t);
+
+    if (!fuchsia_pairs_ || R > f_record_capacity_) {
+        fuchsia_pairs_ = std::make_unique<RadixSortFuchsia>(ctx_, R, kRecordDwords);
+        f_record_capacity_ = R;
+        f_record_bytes_capacity_ = 0;
+        f_internal_bytes_capacity_ = 0;
+    }
+
+    const auto mr = fuchsia_pairs_->memory_requirements(R);
+    const VkBufferUsageFlags record_usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (!f_records_even_ || mr.keyvals_size > f_record_bytes_capacity_) {
+        f_records_even_ = std::make_unique<VulkanAlignedBuffer>(
+            ctx_, mr.keyvals_size, mr.keyvals_alignment, record_usage);
+        f_records_odd_ = std::make_unique<VulkanAlignedBuffer>(
+            ctx_, mr.keyvals_size, mr.keyvals_alignment, record_usage);
+        f_record_bytes_capacity_ = mr.keyvals_size;
+    }
+    if (!f_internal_scratch_ || mr.internal_size > f_internal_bytes_capacity_) {
+        f_internal_scratch_ = std::make_unique<VulkanAlignedBuffer>(
+            ctx_, mr.internal_size, mr.internal_alignment,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        f_internal_bytes_capacity_ = mr.internal_size;
+    }
+    if (!f_keys_sorted_ || R > f_output_capacity_) {
+        f_keys_sorted_ = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_keys, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        f_values_sorted_ = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_values, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        f_output_capacity_ = R;
+    }
+    if (!f_ranges_ || num_tiles > f_range_capacity_) {
+        f_ranges_ = std::make_unique<VulkanBuffer>(
+            ctx_, bytes_ranges, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        f_range_capacity_ = num_tiles;
+    }
+    f_ranges_->zero_fill(static_cast<std::size_t>(bytes_ranges));
+
+    r_keys_b_.reset();
+    r_vals_b_.reset();
+    r_hist_cnt_.reset();
+    r_hist_scn_.reset();
+    r_wg_sums_.reset();
+    r_wg_sums2_.reset();
+    r_ranges_.reset();
+
+    r_f_keys_input_ = keys_unsorted;
+    r_f_values_input_ = values_unsorted;
+    r_fuchsia_sortpairs_record_ = true;
+    pair_pack_pass_->bind_buffers(r_f_keys_input_, r_f_values_input_, f_records_even_->handle());
+}
+
 void SorterVulkan::record(VkCommandBuffer cmd,
                           uint32_t R, uint32_t num_tiles) {
+    if (r_fuchsia_sortpairs_record_) {
+        record_fuchsia_sortpairs(cmd, R, num_tiles);
+        return;
+    }
     if (!r_keys_b_)
         throw std::runtime_error(
             "SorterVulkan::record called before prepare_record()");
@@ -471,8 +578,48 @@ void SorterVulkan::record(VkCommandBuffer cmd,
     range_pass_->dispatch_record(cmd, R, num_tiles);
 }
 
-VkBuffer SorterVulkan::keys_sorted_buf()   const { return r_keys_a_; }
-VkBuffer SorterVulkan::values_sorted_buf() const { return r_vals_a_; }
-VkBuffer SorterVulkan::tile_ranges_buf()   const {
+void SorterVulkan::record_fuchsia_sortpairs(VkCommandBuffer cmd,
+                                            uint32_t R,
+                                            uint32_t num_tiles) {
+    if (!r_fuchsia_sortpairs_record_ || !f_records_even_ || !f_records_odd_ ||
+        !f_internal_scratch_ || !f_keys_sorted_ || !f_values_sorted_ || !f_ranges_) {
+        throw std::runtime_error(
+            "SorterVulkan::record_fuchsia_sortpairs called before prepare_record_fuchsia_sortpairs()");
+    }
+
+    constexpr bool compact_key48 = false;
+    constexpr uint32_t key_bits = 64u;
+
+    pair_pack_pass_->dispatch_record(cmd, R, compact_key48);
+    insert_compute_barrier(cmd);
+
+    fuchsia_pairs_->record(cmd,
+                           f_records_even_->handle(),
+                           f_records_odd_->handle(),
+                           f_internal_scratch_->handle(),
+                           R,
+                           key_bits);
+    insert_compute_barrier(cmd);
+
+    VkBuffer sorted_records = fuchsia_pairs_->sorted_buffer_after_sort(
+        f_records_even_->handle(), f_records_odd_->handle(), R, key_bits);
+    pair_extract_pass_->bind_buffers(sorted_records,
+                                     f_keys_sorted_->handle(),
+                                     f_values_sorted_->handle(),
+                                     f_ranges_->handle());
+    pair_extract_pass_->dispatch_record(cmd, R, num_tiles, compact_key48);
+}
+
+VkBuffer SorterVulkan::keys_sorted_buf() const {
+    return r_fuchsia_sortpairs_record_ && f_keys_sorted_ ? f_keys_sorted_->handle() : r_keys_a_;
+}
+
+VkBuffer SorterVulkan::values_sorted_buf() const {
+    return r_fuchsia_sortpairs_record_ && f_values_sorted_ ? f_values_sorted_->handle() : r_vals_a_;
+}
+
+VkBuffer SorterVulkan::tile_ranges_buf() const {
+    if (r_fuchsia_sortpairs_record_)
+        return f_ranges_ ? f_ranges_->handle() : VK_NULL_HANDLE;
     return r_ranges_ ? r_ranges_->handle() : VK_NULL_HANDLE;
 }

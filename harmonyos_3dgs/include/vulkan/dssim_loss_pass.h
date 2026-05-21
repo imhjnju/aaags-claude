@@ -9,16 +9,6 @@
 #include <cstdint>
 #include <memory>
 
-namespace dssim_loss_bind {
-constexpr uint32_t RENDERED = 0;
-constexpr uint32_t TARGET   = 1;
-constexpr uint32_t DLDPIX   = 2;
-constexpr uint32_t PARTIALS = 3;
-constexpr uint32_t ALPHA    = 4;
-constexpr uint32_t BETA     = 5;
-constexpr uint32_t GAMMA    = 6;
-}
-
 struct DssimLossPushConstants {
     uint32_t W;
     uint32_t H;
@@ -30,7 +20,7 @@ static_assert(sizeof(DssimLossPushConstants) == 16, "DssimLossPushConstants must
 class DssimLossPass {
 public:
     explicit DssimLossPass(VulkanContext& ctx);
-    ~DssimLossPass() = default;
+    ~DssimLossPass();
 
     DssimLossPass(const DssimLossPass&) = delete;
     DssimLossPass& operator=(const DssimLossPass&) = delete;
@@ -41,15 +31,42 @@ public:
                       VkBuffer partials,
                       VkBuffer alpha,
                       VkBuffer beta,
-                      VkBuffer gamma);
+                      VkBuffer gamma,
+                      VkBuffer x2,
+                      VkBuffer y2,
+                      VkBuffer xy,
+                      VkBuffer scratch,
+                      VkBuffer mu1);
+    void precompute_target_terms(uint32_t W, uint32_t H, float lambda_dssim);
     void dispatch_sync(uint32_t W, uint32_t H, float lambda_dssim);
 
 private:
     VulkanContext& ctx_;
-    std::unique_ptr<VulkanShader> terms_shader_;
-    std::unique_ptr<VulkanShader> grad_shader_;
-    std::unique_ptr<VulkanComputePipeline> terms_pipeline_;
-    std::unique_ptr<VulkanComputePipeline> grad_pipeline_;
-    VkDescriptorSet terms_descriptor_set_ = VK_NULL_HANDLE;
-    VkDescriptorSet grad_descriptor_set_ = VK_NULL_HANDLE;
+    std::unique_ptr<VulkanShader> target_blur5_h_shader_;
+    std::unique_ptr<VulkanShader> target_blur5_v_shader_;
+    std::unique_ptr<VulkanShader> blur5_h_shader_;
+    std::unique_ptr<VulkanShader> blur5_v_terms_shader_;
+    std::unique_ptr<VulkanShader> transpose3_v_shader_;
+    std::unique_ptr<VulkanShader> transpose3_h_grad_shader_;
+    std::unique_ptr<VulkanComputePipeline> target_blur5_h_pipeline_;
+    std::unique_ptr<VulkanComputePipeline> target_blur5_v_pipeline_;
+    std::unique_ptr<VulkanComputePipeline> blur5_h_pipeline_;
+    std::unique_ptr<VulkanComputePipeline> blur5_v_terms_pipeline_;
+    std::unique_ptr<VulkanComputePipeline> transpose3_v_pipeline_;
+    std::unique_ptr<VulkanComputePipeline> transpose3_h_grad_pipeline_;
+    VkDescriptorSet target_blur5_h_descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet target_blur5_v_descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet blur5_h_descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet blur5_v_terms_descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet transpose3_v_descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet transpose3_h_grad_descriptor_set_ = VK_NULL_HANDLE;
+    VkBuffer bound_target_ = VK_NULL_HANDLE;
+    VkBuffer bound_target_x2_ = VK_NULL_HANDLE;
+    VkBuffer bound_target_y2_ = VK_NULL_HANDLE;
+    VkBuffer bound_target_scratch_ = VK_NULL_HANDLE;
+    VkBuffer bound_target_mu1_ = VK_NULL_HANDLE;
+    bool target_terms_valid_ = false;
+    uint32_t target_terms_W_ = 0;
+    uint32_t target_terms_H_ = 0;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
 };

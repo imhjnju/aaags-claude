@@ -1,0 +1,66 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Target { float target[]; };
+layout(std430, set = 0, binding = 1) buffer HTarget { float htarget[]; };
+layout(std430, set = 0, binding = 2) buffer HTarget2 { float htarget2[]; };
+
+layout(push_constant) uniform PC {
+    uint W;
+    uint H;
+    uint num_elements;
+    float lambda_dssim;
+} pc;
+
+const float K[11] = float[11](
+    0.0010283801,
+    0.0075987581,
+    0.0360007721,
+    0.1093606895,
+    0.2130055377,
+    0.2660117249,
+    0.2130055377,
+    0.1093606895,
+    0.0360007721,
+    0.0075987581,
+    0.0010283801);
+
+uint clamp_u(int v, uint hi) {
+    return uint(clamp(v, 0, int(hi)));
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.num_elements) return;
+
+    uint HW = pc.W * pc.H;
+    uint ch = gid / HW;
+    uint p = gid - ch * HW;
+    uint x = p % pc.W;
+    uint y = p / pc.W;
+    uint base = ch * HW + y * pc.W;
+
+    float sy = 0.0;
+    float sy2 = 0.0;
+    if (x >= 5u && x + 5u < pc.W) {
+        for (int dx = -5; dx <= 5; ++dx) {
+            uint idx = base + x + uint(dx + 5) - 5u;
+            float w = K[dx + 5];
+            float yv = target[idx];
+            sy += w * yv;
+            sy2 += w * yv * yv;
+        }
+    } else {
+        for (int dx = -5; dx <= 5; ++dx) {
+            uint xx = clamp_u(int(x) + dx, pc.W - 1u);
+            uint idx = base + xx;
+            float w = K[dx + 5];
+            float yv = target[idx];
+            sy += w * yv;
+            sy2 += w * yv * yv;
+        }
+    }
+    htarget[gid] = sy;
+    htarget2[gid] = sy2;
+}

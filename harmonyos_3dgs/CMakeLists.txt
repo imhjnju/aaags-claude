@@ -136,7 +136,8 @@ if(BUILD_TESTS)
     target_compile_definitions(gs3d_tests PRIVATE
         TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data")
     include(GoogleTest)
-    gtest_discover_tests(gs3d_tests)
+    add_test(NAME gs3d_tests COMMAND gs3d_tests --gtest_also_run_disabled_tests)
+    set_tests_properties(gs3d_tests PROPERTIES TIMEOUT 300)
 endif()
 
 add_executable(gs3d_render src/main.cpp)
@@ -243,18 +244,30 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(canonical_sortpair_extract _hdr_canonical_sortpair_extract)
         gs3d_compile_glsl(l1_loss _spv_l1_loss)
         gs3d_embed_spirv(l1_loss _hdr_l1_loss)
-        gs3d_compile_glsl(dssim_loss_terms _spv_dssim_loss_terms)
-        gs3d_embed_spirv(dssim_loss_terms _hdr_dssim_loss_terms)
-        gs3d_compile_glsl(dssim_loss_grad _spv_dssim_loss_grad)
-        gs3d_embed_spirv(dssim_loss_grad _hdr_dssim_loss_grad)
+        gs3d_compile_glsl(dssim_target_blur5_h _spv_dssim_target_blur5_h)
+        gs3d_embed_spirv(dssim_target_blur5_h _hdr_dssim_target_blur5_h)
+        gs3d_compile_glsl(dssim_target_blur5_v _spv_dssim_target_blur5_v)
+        gs3d_embed_spirv(dssim_target_blur5_v _hdr_dssim_target_blur5_v)
+        gs3d_compile_glsl(dssim_blur5_h _spv_dssim_blur5_h)
+        gs3d_embed_spirv(dssim_blur5_h _hdr_dssim_blur5_h)
+        gs3d_compile_glsl(dssim_blur5_v_terms _spv_dssim_blur5_v_terms)
+        gs3d_embed_spirv(dssim_blur5_v_terms _hdr_dssim_blur5_v_terms)
+        gs3d_compile_glsl(dssim_transpose3_h_grad _spv_dssim_transpose3_h_grad)
+        gs3d_embed_spirv(dssim_transpose3_h_grad _hdr_dssim_transpose3_h_grad)
+        gs3d_compile_glsl(dssim_transpose3_v _spv_dssim_transpose3_v)
+        gs3d_embed_spirv(dssim_transpose3_v _hdr_dssim_transpose3_v)
         gs3d_compile_glsl(sh_grad_split _spv_sh_grad_split)
         gs3d_embed_spirv(sh_grad_split _hdr_sh_grad_split)
         gs3d_compile_glsl(raw_activation _spv_raw_activation)
         gs3d_embed_spirv(raw_activation _hdr_raw_activation)
+        gs3d_compile_glsl(position_noise _spv_position_noise)
+        gs3d_embed_spirv(position_noise _hdr_position_noise)
         gs3d_compile_glsl(regularization _spv_regularization)
         gs3d_embed_spirv(regularization _hdr_regularization)
         gs3d_compile_glsl(rasterize _spv_rasterize)
         gs3d_embed_spirv(rasterize _hdr_rasterize)
+        gs3d_compile_glsl(rasterize_raw_replay _spv_rasterize_raw_replay)
+        gs3d_embed_spirv(rasterize_raw_replay _hdr_rasterize_raw_replay)
         gs3d_compile_glsl(rasterize_hierarchical _spv_rasterize_hierarchical)
         gs3d_embed_spirv(rasterize_hierarchical _hdr_rasterize_hierarchical)
         gs3d_compile_glsl(rasterize_cascade_trace _spv_rasterize_cascade_trace)
@@ -265,6 +278,18 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
         gs3d_embed_spirv(rasterize_backward_eval3d _hdr_rasterize_backward_eval3d)
         gs3d_compile_glsl(rasterize_backward_eval3d_replay _spv_rasterize_backward_eval3d_replay)
         gs3d_embed_spirv(rasterize_backward_eval3d_replay _hdr_rasterize_backward_eval3d_replay)
+        gs3d_compile_glsl(rasterize_backward_eval3d_replay_fused _spv_rasterize_backward_eval3d_replay_fused)
+        gs3d_embed_spirv(rasterize_backward_eval3d_replay_fused _hdr_rasterize_backward_eval3d_replay_fused)
+        gs3d_compile_glsl(rasterize_backward_eval3d_replay_fused_tangent _spv_rasterize_backward_eval3d_replay_fused_tangent)
+        gs3d_embed_spirv(rasterize_backward_eval3d_replay_fused_tangent _hdr_rasterize_backward_eval3d_replay_fused_tangent)
+        gs3d_compile_glsl(rasterize_backward_eval3d_replay_fused_tangent_subgroup _spv_rasterize_backward_eval3d_replay_fused_tangent_subgroup)
+        gs3d_embed_spirv(rasterize_backward_eval3d_replay_fused_tangent_subgroup _hdr_rasterize_backward_eval3d_replay_fused_tangent_subgroup)
+        gs3d_compile_glsl(rasterize_backward_eval3d_replay_fused_hot _spv_rasterize_backward_eval3d_replay_fused_hot)
+        gs3d_embed_spirv(rasterize_backward_eval3d_replay_fused_hot _hdr_rasterize_backward_eval3d_replay_fused_hot)
+        gs3d_compile_glsl(rasterize_backward_eval3d_hot_geom_reduce _spv_rasterize_backward_eval3d_hot_geom_reduce)
+        gs3d_embed_spirv(rasterize_backward_eval3d_hot_geom_reduce _hdr_rasterize_backward_eval3d_hot_geom_reduce)
+        gs3d_compile_glsl(rasterize_backward_eval3d_tangent_rot_reduce _spv_rasterize_backward_eval3d_tangent_rot_reduce)
+        gs3d_embed_spirv(rasterize_backward_eval3d_tangent_rot_reduce _hdr_rasterize_backward_eval3d_tangent_rot_reduce)
         gs3d_compile_glsl(preprocess_backward _spv_preprocess_backward)
         gs3d_embed_spirv(preprocess_backward _hdr_preprocess_backward)
         gs3d_compile_glsl(preprocess_backward_eval3d _spv_preprocess_backward_eval3d)
@@ -284,17 +309,29 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                     ${_spv_canonical_sortpair_pack} ${_hdr_canonical_sortpair_pack}
                     ${_spv_canonical_sortpair_extract} ${_hdr_canonical_sortpair_extract}
                     ${_spv_l1_loss} ${_hdr_l1_loss}
-                    ${_spv_dssim_loss_terms} ${_hdr_dssim_loss_terms}
-                    ${_spv_dssim_loss_grad} ${_hdr_dssim_loss_grad}
+                    ${_spv_dssim_target_blur5_h} ${_hdr_dssim_target_blur5_h}
+                    ${_spv_dssim_target_blur5_v} ${_hdr_dssim_target_blur5_v}
+                    ${_spv_dssim_blur5_h} ${_hdr_dssim_blur5_h}
+                    ${_spv_dssim_blur5_v_terms} ${_hdr_dssim_blur5_v_terms}
+                    ${_spv_dssim_transpose3_h_grad} ${_hdr_dssim_transpose3_h_grad}
+                    ${_spv_dssim_transpose3_v} ${_hdr_dssim_transpose3_v}
                     ${_spv_sh_grad_split} ${_hdr_sh_grad_split}
                     ${_spv_raw_activation} ${_hdr_raw_activation}
+                    ${_spv_position_noise} ${_hdr_position_noise}
                     ${_spv_regularization} ${_hdr_regularization}
                     ${_spv_rasterize} ${_hdr_rasterize}
+                    ${_spv_rasterize_raw_replay} ${_hdr_rasterize_raw_replay}
                     ${_spv_rasterize_hierarchical} ${_hdr_rasterize_hierarchical}
                     ${_spv_rasterize_cascade_trace} ${_hdr_rasterize_cascade_trace}
                     ${_spv_rasterize_backward} ${_hdr_rasterize_backward}
                     ${_spv_rasterize_backward_eval3d} ${_hdr_rasterize_backward_eval3d}
                     ${_spv_rasterize_backward_eval3d_replay} ${_hdr_rasterize_backward_eval3d_replay}
+                    ${_spv_rasterize_backward_eval3d_replay_fused} ${_hdr_rasterize_backward_eval3d_replay_fused}
+                    ${_spv_rasterize_backward_eval3d_replay_fused_tangent} ${_hdr_rasterize_backward_eval3d_replay_fused_tangent}
+                    ${_spv_rasterize_backward_eval3d_replay_fused_tangent_subgroup} ${_hdr_rasterize_backward_eval3d_replay_fused_tangent_subgroup}
+                    ${_spv_rasterize_backward_eval3d_replay_fused_hot} ${_hdr_rasterize_backward_eval3d_replay_fused_hot}
+                    ${_spv_rasterize_backward_eval3d_hot_geom_reduce} ${_hdr_rasterize_backward_eval3d_hot_geom_reduce}
+                    ${_spv_rasterize_backward_eval3d_tangent_rot_reduce} ${_hdr_rasterize_backward_eval3d_tangent_rot_reduce}
                     ${_spv_preprocess_backward} ${_hdr_preprocess_backward}
                     ${_spv_preprocess_backward_eval3d} ${_hdr_preprocess_backward_eval3d}
                     ${_spv_adam_step} ${_hdr_adam_step})
@@ -318,6 +355,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             src/vulkan/dssim_loss_pass.cpp
             src/vulkan/sh_grad_split_pass.cpp
             src/vulkan/raw_activation_pass.cpp
+            src/vulkan/position_noise_pass.cpp
             src/vulkan/regularization_pass.cpp
             src/vulkan/sorter_vulkan.cpp
             src/vulkan/rasterize_pass.cpp
@@ -374,6 +412,7 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
                 tests/test_tile_range_pass_vk.cpp
                 tests/test_l1_loss_pass_vk.cpp
                 tests/test_dssim_loss_pass_vk.cpp
+                tests/test_position_noise_pass_vk.cpp
                 tests/test_sorter_vulkan.cpp
                 tests/test_rasterize_pass_vk.cpp
                 tests/test_forward_pipeline_vk.cpp
@@ -427,7 +466,40 @@ if(ENABLE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
             # a pipeline-recorded dispatch path would reduce this significantly.
             # All gs3d_vk_tests get a generous timeout; the basketball test needs
             # the most headroom.
-            gtest_discover_tests(gs3d_vk_tests PROPERTIES TIMEOUT 7200)
+            function(gs3d_add_vk_group GROUP_NAME GROUP_FILTER)
+                add_test(NAME ${GROUP_NAME}
+                    COMMAND gs3d_vk_tests
+                        --gtest_filter=${GROUP_FILTER}
+                        --gtest_also_run_disabled_tests)
+                set_tests_properties(${GROUP_NAME} PROPERTIES TIMEOUT 7200)
+            endfunction()
+
+            set(_gs3d_vk_grouped_filters
+                "VkCompute.*"
+                "VkPipelineDispatch.*"
+                "VkHello.*"
+                "PrefixScanPassVk.*"
+                "RadixSortPassVk.*"
+                "TileRangePassVk.*"
+                "TileBinner.*"
+                "SorterVulkan.*"
+                "ConfigLoader.AaaJsonMatchesVkHardcoded"
+                "ConfigLoader.Validator*"
+                "VkTrainArgs.*")
+            list(JOIN _gs3d_vk_grouped_filters ":" _gs3d_vk_grouped_filter)
+
+            gs3d_add_vk_group(VkGroup.Infra
+                "VkCompute.*:VkPipelineDispatch.*:VkHello.*")
+            gs3d_add_vk_group(VkGroup.SortScanRange
+                "PrefixScanPassVk.*:RadixSortPassVk.*:TileRangePassVk.*")
+            gs3d_add_vk_group(VkGroup.BinnerSorter
+                "TileBinner.*:SorterVulkan.*")
+            gs3d_add_vk_group(VkGroup.ConfigArgs
+                "ConfigLoader.AaaJsonMatchesVkHardcoded:ConfigLoader.Validator*:VkTrainArgs.*")
+
+            gtest_discover_tests(gs3d_vk_tests
+                TEST_FILTER "-${_gs3d_vk_grouped_filter}"
+                PROPERTIES TIMEOUT 7200)
 
             add_executable(test_sp7_cb_chain tests/test_sp7_cb_chain.cpp)
             target_link_libraries(test_sp7_cb_chain PRIVATE gs3d_core gs3d_vk_core GTest::gtest_main)

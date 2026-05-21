@@ -44,8 +44,11 @@ public:
     ///                      when some Gaussians are culled and absent from the list.
     /// \param cam           Camera (provides W, H)
     /// \param cfg           Render config (provides bg_color, tile_w/h)
-    /// \param cache         Forward pass cache (T_final, n_contrib)
-    /// \param dL_dpixels    Loss gradient w.r.t. output pixels, CHW [3*H*W]
+    /// \param cache         Forward pass cache (T_final, n_contrib); if cache.dL_dpixels_gpu
+    ///                      is present, that GPU loss-gradient buffer is authoritative
+    ///                      and takes precedence over dL_dpixels.
+    /// \param dL_dpixels    CPU loss gradient w.r.t. output pixels, CHW [3*H*W], used
+    ///                      only when cache.dL_dpixels_gpu is absent.
     /// \param rgrad         Output gradients (allocated and zeroed internally)
     /// \param alloc         Frame allocator for rgrad arrays
     ///
@@ -93,6 +96,23 @@ public:
                               const float* dL_dpixels,
                               const float* rendered_image = nullptr);
 
+    void backward_record_fused_eval3d_replay_into(VkCommandBuffer cmd,
+                                                  const PreprocessOutput& pre,
+                                                  const BinningOutput& bin,
+                                                  int num_gaussians,
+                                                  const Camera& cam,
+                                                  const RenderConfig& cfg,
+                                                  const ForwardCache& cache,
+                                                  const float* dL_dpixels,
+                                                  VkBuffer positions,
+                                                  VkBuffer scales,
+                                                  VkBuffer rotations,
+                                                  VkBuffer raw_rotations,
+                                                  VkBuffer filter_3D,
+                                                  VkBuffer d_means3D,
+                                                  VkBuffer d_scales,
+                                                  VkBuffer d_rotations);
+
 private:
     VulkanContext& ctx_;
     std::unique_ptr<RasterizeBackwardPass> pass_;
@@ -105,6 +125,9 @@ private:
     int buf_num_tiles_ = 0;
     int buf_HW_        = 0;
     size_t buf_replay_count_ = 0;
+    size_t hot_lookup_capacity_ = 0;
+    size_t hot_gids_capacity_ = 0;
+    size_t hot_geom_scratch_capacity_ = 0;
 
     std::unique_ptr<VulkanBuffer> tr_buf_;     // tile_ranges   [num_tiles*2] u32
     std::unique_ptr<VulkanBuffer> vs_buf_;     // values_sorted [R] u32
@@ -123,8 +146,14 @@ private:
     std::unique_ptr<VulkanBuffer> dlg2s_buf_;  // dL_dgauss2screen [N*16] f32
     std::unique_ptr<VulkanBuffer> replay_offsets_buf_; // [HW+1] u32 eval_3D exact replay offsets
     std::unique_ptr<VulkanBuffer> replay_gids_buf_;    // [sum(n_contrib)] u32 eval_3D exact replay gids
+    std::unique_ptr<VulkanBuffer> drot_tangent_buf_;    // [N*3] f32 opt-in eval_3D tangent rotation accumulation
+    std::unique_ptr<VulkanBuffer> hot_lookup_buf_;      // [N] u32 hot slot or UINT32_MAX
+    std::unique_ptr<VulkanBuffer> hot_gids_buf_;        // [hot_count] u32 hot slot -> gid
+    std::unique_ptr<VulkanBuffer> hot_geom_scratch_buf_; // [hot_count*num_shards*9] f32
+    std::unique_ptr<VulkanBuffer> hot_ubo_buf_;         // RasterizeBackwardEval3DHotUBO
     std::unique_ptr<VulkanBuffer> dummy4_buf_;          // 4-byte dummy for optional replay bindings
     std::unique_ptr<VulkanBuffer> ubo_buf_;    // RasterizeBackwardUBO (32B)
+    std::unique_ptr<VulkanBuffer> fused_ubo_buf_; // RasterizeBackwardEval3DFusedUBO
     bool last_forward_gpu_cache_used_ = false;
 
     void prepare_for_n(int N, int R, int num_tiles, int HW);

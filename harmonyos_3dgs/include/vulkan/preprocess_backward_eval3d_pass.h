@@ -39,12 +39,14 @@ public:
     PreprocessBackwardEval3DPass& operator=(const PreprocessBackwardEval3DPass&) = delete;
 
     void bind_buffers(const Buffers& b, VkBuffer ubo);
-    void dispatch_sync(uint32_t num_gaussians);
-    void record(VkCommandBuffer cmd, uint32_t num_gaussians);
+    void dispatch_sync(uint32_t num_gaussians, bool skip_geometry = false);
+    void record(VkCommandBuffer cmd, uint32_t num_gaussians, bool skip_geometry = false);
 
 private:
     VulkanContext& ctx_;
     std::unique_ptr<VulkanShader> shader_;
     std::unique_ptr<VulkanComputePipeline> pipeline_;
+    std::unique_ptr<VulkanComputePipeline> skip_geometry_pipeline_;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet skip_geometry_descriptor_set_ = VK_NULL_HANDLE;
 };

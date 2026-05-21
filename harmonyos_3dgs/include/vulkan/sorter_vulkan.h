@@ -54,16 +54,23 @@ public:
                         VkBuffer keys_unsorted,
                         VkBuffer values_unsorted);
 
+    void prepare_record_fuchsia_sortpairs(uint32_t R, uint32_t num_tiles,
+                                          VkBuffer keys_unsorted,
+                                          VkBuffer values_unsorted);
+
     // Record radix sort + tile_range sweep into cmd. prepare_record() must
     // have been called. Inserts a compute barrier between the sort and the
     // tile_range sweep (tile_range.comp reads keys_sorted).
     void record(VkCommandBuffer cmd, uint32_t R, uint32_t num_tiles);
 
+    void record_fuchsia_sortpairs(VkCommandBuffer cmd,
+                                  uint32_t R,
+                                  uint32_t num_tiles);
+
     // Output handles valid after prepare_record(). Caller reads these to
-    // thread into RasterizerVulkan::prepare_record().
-    // keys_sorted / values_sorted are the same handles passed in for
-    // keys_unsorted / values_unsorted (the "A" side is where sorted data
-    // ends up after 16 even ping-pong passes).
+    // thread into RasterizerVulkan::prepare_record(). The project radix path
+    // returns the external A-side handles; the recorded Fuchsia SortPairs path
+    // returns owned canonical output buffers.
     VkBuffer keys_sorted_buf()   const;
     VkBuffer values_sorted_buf() const;
     VkBuffer tile_ranges_buf()   const;
@@ -93,6 +100,10 @@ private:
     bool host_mirror_enabled_ = true;
 
     bool sort_via_fuchsia_sortpairs(BinningOutput& binning, FrameAllocator& allocator);
+
+    bool r_fuchsia_sortpairs_record_ = false;
+    VkBuffer r_f_keys_input_ = VK_NULL_HANDLE;
+    VkBuffer r_f_values_input_ = VK_NULL_HANDLE;
 
     // Layer-2 persistent buffers. "A" handles are external (not owned);
     // "B" + histograms + tile_ranges are owned by this adapter.

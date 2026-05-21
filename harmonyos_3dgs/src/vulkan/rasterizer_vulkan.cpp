@@ -209,6 +209,17 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     const VkDeviceSize bytes_ncontrib =
         static_cast<VkDeviceSize>(HW) * sizeof(uint32_t);
 
+    const bool gpu_resident_outputs = cache && cache->gpu_resident_outputs;
+    const bool retain_gpu_outputs = cache && (cache->gpu_resident_outputs || cache->retain_gpu_outputs);
+    auto reuse_or_alloc = [&](std::unique_ptr<VulkanBuffer>& slot,
+                              VkDeviceSize bytes,
+                              VkBufferUsageFlags usage) {
+        if (retain_gpu_outputs && slot && slot->size() >= bytes) {
+            return std::move(slot);
+        }
+        return std::make_unique<VulkanBuffer>(ctx_, bytes, usage);
+    };
+
     std::unique_ptr<VulkanBuffer> vs_buf;
     std::unique_ptr<VulkanBuffer> tr_buf;
     std::unique_ptr<VulkanBuffer> m2d_buf;
@@ -234,15 +245,11 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         rgb_buf = std::make_unique<VulkanBuffer>(
             ctx_, bytes_rgb, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
-    auto img_buf = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_img,      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto t_buf   = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_tfinal,   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto nc_buf  = std::make_unique<VulkanBuffer>(
-        ctx_, bytes_ncontrib, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto ubo_buf = std::make_unique<VulkanBuffer>(
-        ctx_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    auto img_buf = reuse_or_alloc(r_img_, bytes_img, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto t_buf   = reuse_or_alloc(r_tfinal_, bytes_tfinal, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto nc_buf  = reuse_or_alloc(r_ncontrib_, bytes_ncontrib, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto ubo_buf = reuse_or_alloc(r_ubo_, static_cast<VkDeviceSize>(sizeof(RasterizeUBO)),
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
     // -------------------------------------------------------------------
     // Upload inputs.
@@ -280,8 +287,7 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
     // -------------------------------------------------------------------
     std::unique_ptr<VulkanBuffer> g2s_buf, r_cov3d_buf, r_mo_buf;
     std::unique_ptr<VulkanBuffer> eval3d_ubo_buf;
-    auto dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    auto dummy4_buf = reuse_or_alloc(r_dummy4_, 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     if (eval_3D_) {
         if (!has_gauss2screen_gpu) {
@@ -306,9 +312,10 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
                 static_cast<std::size_t>(N_eff) * 3u * sizeof(float));
         }
     }
-    // Build RasterEval3DUBO.
+    eval3d_ubo_buf = reuse_or_alloc(r_eval3d_ubo_, sizeof(RasterEval3DUBO),
+                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     RasterEval3DUBO eubo{};
-    {
+    if (!eval3d_raw_replay_) {
         float inv_vp[16];
         if (invertMatrix4x4(camera.viewproj_matrix, inv_vp))
             std::memcpy(eubo.inverse_vp, inv_vp, sizeof(inv_vp));
@@ -320,14 +327,16 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         eubo.img_size[1] = static_cast<float>(H);
         eubo.img_size[2] = 0.0f;
         eubo.img_size[3] = 0.0f;
+        eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
     }
-    eval3d_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
-        sizeof(RasterEval3DUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    eval3d_ubo_buf->upload(&eubo, sizeof(eubo));
-    auto replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    auto replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::unique_ptr<VulkanBuffer> replay_offsets_buf;
+    std::unique_ptr<VulkanBuffer> replay_gids_buf;
+    if (!eval3d_raw_replay_) {
+        replay_offsets_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        replay_gids_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
 
     // -------------------------------------------------------------------
     // Bind and dispatch.
@@ -363,8 +372,8 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         ? static_cast<VkBuffer>(preprocess.mean_offset_gpu)
         : (r_mo_buf ? r_mo_buf->handle() : dummy4_buf->handle());
     rb.raster_eval3d_ubo    = eval3d_ubo_buf->handle();
-    rb.replay_order_offsets = replay_offsets_buf->handle();
-    rb.replay_order_gids    = replay_gids_buf->handle();
+    rb.replay_order_offsets = replay_offsets_buf ? replay_offsets_buf->handle() : dummy4_buf->handle();
+    rb.replay_order_gids    = replay_gids_buf ? replay_gids_buf->handle() : dummy4_buf->handle();
     pass_->bind_buffers(rb);
     pass_->dispatch_sync(N_eff,
                          static_cast<uint32_t>(W), static_cast<uint32_t>(H),
@@ -379,8 +388,6 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
 #endif
     r_W_ = static_cast<uint32_t>(W);
     r_H_ = static_cast<uint32_t>(H);
-    const bool gpu_resident_outputs = cache && cache->gpu_resident_outputs;
-    const bool retain_gpu_outputs = cache && (cache->gpu_resident_outputs || cache->retain_gpu_outputs);
     if (!gpu_resident_outputs) {
         img_buf->download(output_image, static_cast<std::size_t>(bytes_img));
 #ifdef GS3D_TESTING
@@ -554,10 +561,16 @@ void RasterizerVulkan::rasterize(const PreprocessOutput& preprocess,
         r_img_ = std::move(img_buf);
         r_tfinal_ = std::move(t_buf);
         r_ncontrib_ = std::move(nc_buf);
+        r_ubo_ = std::move(ubo_buf);
+        r_eval3d_ubo_ = std::move(eval3d_ubo_buf);
+        r_dummy4_ = std::move(dummy4_buf);
     } else {
         r_img_.reset();
         r_tfinal_.reset();
         r_ncontrib_.reset();
+        r_ubo_.reset();
+        r_eval3d_ubo_.reset();
+        r_dummy4_.reset();
     }
 }
 

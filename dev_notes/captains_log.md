@@ -1,5 +1,21 @@
 # Captain's Log
 
+## Session 28 — 2026-05-21 — Latest backward sync and fused replay clear trim
+
+Synced the remaining useful delta from `backward` HEAD `734c056d feat(vk-train): fuse eval3D replay backward` after a read-only diff audit showed the main fused eval_3D replay/tangent/subgroup implementation was already present. The code sync adds `PreprocessorBackwardVulkan::clear_geometry_grad_buffers()` and routes the fused eval_3D replay backward path through it, so the fused path clears only raw position/scale/rotation gradient buffers before raster backward writes them instead of also clearing SH and opacity buffers that are not written by that path.
+
+The sync deliberately did not wholesale overwrite current files: kept `VK_BUFFER_USAGE_TRANSFER_DST_BIT` on fill-cleared preprocessor gradients, kept GPU `cache.dL_dpixels_gpu` precedence and CPU null guards, kept grouped CTest registration, kept current DSSIM/noise/raw-activation/position-noise/cache-skip trainer work, and kept tangent subgroup replay opt-in rather than adopting backward's default-on behavior. Imported `investigations/backward_eval3d_replay_perf.md` as the reproducibility/performance evidence from the backward worktree.
+
+Validation is green: Release `gs3d_vk_train` and `gs3d_vk_tests` build PASS, targeted backward/training/CUDA-first-loss **47/47 PASS**, explicit fused replay env **3/3 PASS**, fused split-backward timing **1/1 PASS**, and full Release CTest **134/134 PASS** in **67.72s** with 5 expected skips. `tests/TEST_PLAN.md` now reports **134 CTest entries / 372 GoogleTest cases**.
+
+## Session 27 — 2026-05-20 — Gate grouping and eval_3D backward perf sync
+
+Synced the `remove_test` gate optimization into the current worktree: CPU GoogleTests now run as one grouped `gs3d_tests` CTest entry, and selected Vulkan infra/sort/config suites run through four manual group entries while excluded from discovery. The gate inventory is **133 CTest entries / 371 GoogleTest cases**, preserving the full GoogleTest case count with a much smaller CTest process count.
+
+Synced the performance-oriented `backward` worktree eval_3D backward path with performance preferred in conflicts, but kept current correctness fixes. The imported pieces include fused replay tangent/subgroup shaders, hot-GID shader/reduction scaffolding currently disabled by `hot_gid_shard_bwd_enabled()`, C++ binding/pass plumbing, CMake shader generation, and Vulkan subgroup BASIC/BALLOT/SHUFFLE device minimums. Current fixes preserved include GPU `cache.dL_dpixels_gpu` precedence, the CPU `dL_dpixels` null guard, `PreprocessorBackwardVulkan` `TRANSFER_DST` gradient buffers, grouped CTest registration, and the existing DSSIM/noise/raw-activation trainer fast paths.
+
+Review found two blockers after the initial import: `backward_record_fused_eval3d_replay_into()` had one unguarded CPU `dL_dpixels` upload, and the disabled hot fused shader treated all full-tile subgroup lanes as active instead of using an active-lane ballot. Both were fixed; re-review found no remaining blockers. Validation is green: Debug and Release `gs3d_vk_tests` builds PASS, focused Debug backward/parity **20/20 PASS**, explicit `GS3D_EVAL3D_FUSED_REPLAY_BWD=1 GS3D_EVAL3D_TANGENT_ROT_BWD=1 GS3D_EVAL3D_TANGENT_SUBGROUP_BWD=1` Debug **4/4 PASS**, focused Release backward **9/9 PASS**, and full grouped Debug CTest **133/133 PASS** in **49.41s** with 5 expected skips.
+
 ## Session 26 — 2026-05-15 — Noise raw materialization fast path
 
 Optimized the second AAA-default host-bound regression by allowing GPU raw activation with nonzero `noise_lr`. The trainer now downloads only active scale/rotation/opacity values after GPU activation so CPU `inject_position_noise()` keeps the same pre-Adam active-input semantics, then downloads only raw positions after VulkanAdam before mutating and re-uploading positions. Full raw materialization is still forced for densification, opacity reset, and `raw_params()`/checkpoint boundaries; the positions-only sync intentionally leaves `raw_cpu_dirty_` set because SH and non-position raw CPU vectors remain stale.

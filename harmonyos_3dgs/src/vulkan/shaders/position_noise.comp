@@ -1,0 +1,103 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer RawPositions {
+    float raw_positions[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer ActiveScales {
+    float active_scales[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer ActiveRotations {
+    float active_rotations[];
+};
+layout(std430, set = 0, binding = 3) readonly buffer ActiveOpacities {
+    float active_opacities[];
+};
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint step;
+    float noise_lr;
+    float pos_lr;
+} pc;
+
+const float PI = 3.14159265358979323846;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float uniform01(uint seed) {
+    return (float(hash_u32(seed) & 0x00ffffffu) + 0.5) * (1.0 / 16777216.0);
+}
+
+float normal_sample(uint gid, uint component) {
+    uint seed0 = gid * 0x9e3779b9u ^ pc.step * 0x85ebca6bu ^ component * 0xc2b2ae35u;
+    uint seed1 = seed0 ^ 0x27d4eb2fu;
+    float u1 = max(uniform01(seed0), 1e-7);
+    float u2 = uniform01(seed1);
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * PI * u2);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.N) return;
+
+    float opacity = active_opacities[gid];
+    float opacity_factor = 1.0 / (1.0 + exp(-100.0 * ((1.0 - opacity) - 0.995)));
+    if (opacity_factor < 1e-6) return;
+
+    uint scale_base = gid * 3u;
+    float sx = active_scales[scale_base + 0u];
+    float sy = active_scales[scale_base + 1u];
+    float sz = active_scales[scale_base + 2u];
+
+    uint rot_base = gid * 4u;
+    float w = active_rotations[rot_base + 0u];
+    float x = active_rotations[rot_base + 1u];
+    float y = active_rotations[rot_base + 2u];
+    float z = active_rotations[rot_base + 3u];
+
+    float r00 = 1.0 - 2.0 * (y * y + z * z);
+    float r01 = 2.0 * (x * y + w * z);
+    float r02 = 2.0 * (x * z - w * y);
+    float r10 = 2.0 * (x * y - w * z);
+    float r11 = 1.0 - 2.0 * (x * x + z * z);
+    float r12 = 2.0 * (y * z + w * x);
+    float r20 = 2.0 * (x * z + w * y);
+    float r21 = 2.0 * (y * z - w * x);
+    float r22 = 1.0 - 2.0 * (x * x + y * y);
+
+    float l00 = r00 * sx;
+    float l01 = r01 * sy;
+    float l02 = r02 * sz;
+    float l10 = r10 * sx;
+    float l11 = r11 * sy;
+    float l12 = r12 * sz;
+    float l20 = r20 * sx;
+    float l21 = r21 * sy;
+    float l22 = r22 * sz;
+
+    float scalar = opacity_factor * pc.noise_lr * pc.pos_lr;
+    float e0 = scalar * normal_sample(gid, 0u);
+    float e1 = scalar * normal_sample(gid, 1u);
+    float e2 = scalar * normal_sample(gid, 2u);
+
+    float s00 = l00 * l00 + l01 * l01 + l02 * l02;
+    float s01 = l00 * l10 + l01 * l11 + l02 * l12;
+    float s02 = l00 * l20 + l01 * l21 + l02 * l22;
+    float s11 = l10 * l10 + l11 * l11 + l12 * l12;
+    float s12 = l10 * l20 + l11 * l21 + l12 * l22;
+    float s22 = l20 * l20 + l21 * l21 + l22 * l22;
+
+    uint pos_base = gid * 3u;
+    raw_positions[pos_base + 0u] += s00 * e0 + s01 * e1 + s02 * e2;
+    raw_positions[pos_base + 1u] += s01 * e0 + s11 * e1 + s12 * e2;
+    raw_positions[pos_base + 2u] += s02 * e0 + s12 * e1 + s22 * e2;
+}

@@ -72,7 +72,7 @@ public:
     /// Free a primary command buffer back to the owned pool.
     void freePrimary(VkCommandBuffer cmd);
 
-    /// Submit cmd on compute queue and vkQueueWaitIdle. Single-submit style.
+    /// Submit cmd on compute queue and wait for that submission. Single-submit style.
     void submitAndWait(VkCommandBuffer cmd);
 
 private:
@@ -82,6 +82,7 @@ private:
     VkQueue          compute_queue_ = VK_NULL_HANDLE;
     uint32_t         compute_qf_    = 0;
     VkCommandPool    command_pool_  = VK_NULL_HANDLE;
+    VkFence          submit_fence_  = VK_NULL_HANDLE;
     std::string      device_name_;
     uint32_t         api_version_   = 0;
     VulkanDeviceCapabilities caps_{};

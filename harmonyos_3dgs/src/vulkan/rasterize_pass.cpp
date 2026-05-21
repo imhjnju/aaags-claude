@@ -13,6 +13,7 @@
 
 // xxd-embedded SPIR-V (CMake build dir produces rasterize_spv.h).
 #include "rasterize_spv.h"
+#include "rasterize_raw_replay_spv.h"
 
 #include <array>
 #include <cstddef>
@@ -27,10 +28,13 @@ RasterizePass::RasterizePass(VulkanContext& ctx,
                              uint32_t spec_eval3d_raw_replay)
     : ctx_(ctx), trace_enabled_(spec_trace_enabled != 0u) {
     // --- 1. Load SPIR-V from embedded bytes --------------------------------
+    const bool raw_replay = spec_eval3d_raw_replay != 0u;
     shader_ = std::make_unique<VulkanShader>(
         ctx_,
-        static_cast<const uint8_t*>(rasterize_spv),
-        static_cast<std::size_t>(rasterize_spv_len));
+        raw_replay ? static_cast<const uint8_t*>(rasterize_raw_replay_spv)
+                   : static_cast<const uint8_t*>(rasterize_spv),
+        raw_replay ? static_cast<std::size_t>(rasterize_raw_replay_spv_len)
+                   : static_cast<std::size_t>(rasterize_spv_len));
 
     // --- 2. Specialization constants ---------------------------------------
     struct SpecBlob {

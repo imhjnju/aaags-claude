@@ -27,6 +27,7 @@
 #include "cpu/rasterizer_cpu.h"
 #include "cpu/rasterizer_backward_cpu.h"
 #include "vulkan/vk_context.h"
+#include "vulkan/vk_buffer.h"
 #include "vulkan/preprocessor_vulkan.h"
 #include "vulkan/tile_binner_vulkan.h"
 #include "vulkan/sorter_vulkan.h"
@@ -240,6 +241,45 @@ TEST(RasterizerBackwardVulkan, MatchesCPU_TinyFixture) {
         EXPECT_LT(diff, tol)
             << "d_rgb[" << i << "]: vk=" << rgrad_vk.d_rgb[i]
             << " cpu=" << rgrad_cpu.d_rgb[i];
+    }
+
+    // If a GPU loss-gradient buffer is present, it is the authoritative source
+    // even when a stale non-null CPU gradient pointer is also passed.
+    VulkanBuffer d_image_gpu(ctx,
+        static_cast<VkDeviceSize>(d_image.size() * sizeof(float)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    d_image_gpu.upload(d_image.data(), d_image.size() * sizeof(float));
+    ForwardCache gpu_gradient_cache = cache;
+    gpu_gradient_cache.dL_dpixels_gpu = d_image_gpu.handle();
+    std::vector<float> stale_cpu_d_image(d_image.size(), 0.0f);
+    FrameAllocator gpu_gradient_alloc(32u * 1024u * 1024u);
+    RasterGradOutput rgrad_gpu_gradient{};
+    bwd_vk.backward(pre, bin, N, cam, cfg, gpu_gradient_cache,
+                    stale_cpu_d_image.data(), rgrad_gpu_gradient, gpu_gradient_alloc);
+
+    for (int i = 0; i < N * 2; ++i) {
+        float diff = std::fabs(rgrad_gpu_gradient.d_means2D[i] - rgrad_cpu.d_means2D[i]);
+        EXPECT_LT(diff, tol)
+            << "GPU dL_dpixels precedence d_means2D[" << i << "]: vk="
+            << rgrad_gpu_gradient.d_means2D[i] << " cpu=" << rgrad_cpu.d_means2D[i];
+    }
+    for (int i = 0; i < N * 3; ++i) {
+        float diff = std::fabs(rgrad_gpu_gradient.d_conics[i] - rgrad_cpu.d_conics[i]);
+        EXPECT_LT(diff, tol)
+            << "GPU dL_dpixels precedence d_conics[" << i << "]: vk="
+            << rgrad_gpu_gradient.d_conics[i] << " cpu=" << rgrad_cpu.d_conics[i];
+    }
+    for (int i = 0; i < N; ++i) {
+        float diff = std::fabs(rgrad_gpu_gradient.d_opacities_2d[i] - rgrad_cpu.d_opacities_2d[i]);
+        EXPECT_LT(diff, tol)
+            << "GPU dL_dpixels precedence d_opacities_2d[" << i << "]: vk="
+            << rgrad_gpu_gradient.d_opacities_2d[i] << " cpu=" << rgrad_cpu.d_opacities_2d[i];
+    }
+    for (int i = 0; i < N * 3; ++i) {
+        float diff = std::fabs(rgrad_gpu_gradient.d_rgb[i] - rgrad_cpu.d_rgb[i]);
+        EXPECT_LT(diff, tol)
+            << "GPU dL_dpixels precedence d_rgb[" << i << "]: vk="
+            << rgrad_gpu_gradient.d_rgb[i] << " cpu=" << rgrad_cpu.d_rgb[i];
     }
 }
 

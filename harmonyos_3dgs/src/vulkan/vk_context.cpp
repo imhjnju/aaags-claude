@@ -9,6 +9,11 @@
 
 // Enforce spec §3.1 required minimums. A device that fails any check is
 // rejected during selection; the first check that fails is logged.
+constexpr VkSubgroupFeatureFlags kRequiredSubgroupOps =
+    VK_SUBGROUP_FEATURE_BASIC_BIT |
+    VK_SUBGROUP_FEATURE_BALLOT_BIT |
+    VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+
 static bool meets_minimums(const VulkanDeviceCapabilities& c) {
     if (c.api_version < VK_API_VERSION_1_1) return false;
     if (c.max_push_constants_size < 128u) return false;
@@ -18,6 +23,7 @@ static bool meets_minimums(const VulkanDeviceCapabilities& c) {
     if (c.max_compute_workgroup_size[1] < 256u) return false;
     if (c.max_compute_workgroup_size[2] < 64u) return false;
     if (!(c.subgroup_supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)) return false;
+    if ((c.subgroup_supported_ops & kRequiredSubgroupOps) != kRequiredSubgroupOps) return false;
     return true;
 }
 
@@ -35,6 +41,8 @@ static void log_minimums_failure(const char* device_name,
     else if (c.max_compute_workgroup_size[2] < 64u)                reason = "max_compute_workgroup_size[2] < 64";
     else if (!(c.subgroup_supported_stages & VK_SHADER_STAGE_COMPUTE_BIT))
         reason = "subgroup_supported_stages lacks COMPUTE";
+    else if ((c.subgroup_supported_ops & kRequiredSubgroupOps) != kRequiredSubgroupOps)
+        reason = "subgroup_supported_ops lacks BASIC/BALLOT/SHUFFLE";
     std::fprintf(stderr,
                  "[vk_context] rejecting device \"%s\": %s\n",
                  device_name ? device_name : "<unnamed>", reason);
@@ -234,12 +242,22 @@ bool VulkanContext::init() {
         release();
         return false;
     }
+
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device_, &fci, nullptr, &submit_fence_) != VK_SUCCESS) {
+        release();
+        return false;
+    }
     return true;
 }
 
 void VulkanContext::release() {
     if (device_ != VK_NULL_HANDLE)
         vkDeviceWaitIdle(device_);   // ensure GPU is idle before releasing resources
+    if (submit_fence_ != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, submit_fence_, nullptr);
+        submit_fence_ = VK_NULL_HANDLE;
+    }
     if (command_pool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, command_pool_, nullptr);
         command_pool_ = VK_NULL_HANDLE;
@@ -307,6 +325,7 @@ void VulkanContext::submitAndWait(VkCommandBuffer cmd) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(compute_queue_, 1, &si, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(compute_queue_));
+    VK_CHECK(vkResetFences(device_, 1, &submit_fence_));
+    VK_CHECK(vkQueueSubmit(compute_queue_, 1, &si, submit_fence_));
+    VK_CHECK(vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX));
 }

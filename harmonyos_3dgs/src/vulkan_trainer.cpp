@@ -65,6 +65,11 @@ bool gpu_dssim_loss_enabled() {
     return v && v[0] == '1' && v[1] == '\0';
 }
 
+bool gpu_dssim_validate_target_cache_enabled() {
+    const char* v = std::getenv("GS3D_TRAIN_GPU_DSSIM_VALIDATE_TARGET_CACHE");
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
 bool forward_gpu_cache_enabled() {
     const char* v = std::getenv("GS3D_REUSE_FORWARD_OUTPUTS");
     return v && v[0] == '1' && v[1] == '\0';
@@ -90,8 +95,23 @@ bool split_backward_timing_enabled() {
     return v && v[0] == '1' && v[1] == '\0';
 }
 
+bool fused_eval3d_replay_backward_enabled() {
+    const char* v = std::getenv("GS3D_EVAL3D_FUSED_REPLAY_BWD");
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
 double stage_elapsed_ms(StageClock::time_point start) {
     return std::chrono::duration<double, std::milli>(StageClock::now() - start).count();
+}
+
+uint64_t hash_float_bytes(const float* data, size_t count) {
+    uint64_t h = 0xcbf29ce484222325ull ^ static_cast<uint64_t>(count * sizeof(float));
+    const auto* bytes = reinterpret_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < count * sizeof(float); ++i) {
+        h ^= static_cast<uint64_t>(bytes[i]);
+        h *= 0x100000001b3ull;
+    }
+    return h;
 }
 
 // Gather DC slices (k=0) of all N Gaussians from interleaved [N, K, 3] -> [N, 3].
@@ -195,6 +215,7 @@ VulkanTrainer::VulkanTrainer(VulkanContext& ctx,
     , l1_loss_pass_(ctx)
     , sh_grad_split_pass_(ctx)
     , raw_activation_pass_(ctx)
+    , position_noise_pass_(ctx)
     , regularization_pass_(ctx)
 {
     // 1. Copy raw parameters into owned vectors.
@@ -615,6 +636,44 @@ float VulkanTrainer::run_gpu_l1_loss(const float* target,
     return loss;
 }
 
+void VulkanTrainer::ensure_gpu_dssim_loss_resources(size_t num_elements, size_t partial_count) {
+    const VkDeviceSize bytes_elements = static_cast<VkDeviceSize>(num_elements) * sizeof(float);
+    const VkDeviceSize bytes_partials = static_cast<VkDeviceSize>(partial_count == 0u ? 1u : partial_count) * sizeof(float);
+
+    if (num_elements > gpu_dssim_elements_capacity_) {
+        gpu_dssim_target_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_dlpix_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_alpha_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_beta_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_gamma_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_x2_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_y2_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_xy_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_scratch_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_mu1_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_elements_capacity_ = num_elements;
+        gpu_dssim_cached_target_ = nullptr;
+        gpu_dssim_cached_target_elements_ = 0;
+        gpu_dssim_cached_target_W_ = 0;
+        gpu_dssim_cached_target_H_ = 0;
+        gpu_dssim_cached_target_hash_ = 0;
+        gpu_dssim_cached_target_hash_valid_ = false;
+        gpu_dssim_pass_bound_ = false;
+        gpu_dssim_bound_rendered_ = VK_NULL_HANDLE;
+    }
+    if (partial_count > gpu_dssim_partials_capacity_) {
+        gpu_dssim_partials_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_partials, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gpu_dssim_partials_.resize(partial_count);
+        gpu_dssim_partials_capacity_ = partial_count;
+        gpu_dssim_pass_bound_ = false;
+        gpu_dssim_bound_rendered_ = VK_NULL_HANDLE;
+    }
+
+    if (!dssim_loss_pass_) {
+        dssim_loss_pass_ = std::make_unique<DssimLossPass>(ctx_);
+    }
+}
+
 float VulkanTrainer::run_gpu_dssim_loss(const float* target,
                                          int W,
                                          int H,
@@ -625,33 +684,63 @@ float VulkanTrainer::run_gpu_dssim_loss(const float* target,
     const size_t num_elements = static_cast<size_t>(W) * static_cast<size_t>(H) * 3u;
     const size_t partial_count = (num_elements + 255u) / 256u;
     const VkDeviceSize bytes_elements = static_cast<VkDeviceSize>(num_elements) * sizeof(float);
-    const VkDeviceSize bytes_partials = static_cast<VkDeviceSize>(partial_count == 0u ? 1u : partial_count) * sizeof(float);
 
-    if (num_elements > gpu_dssim_elements_capacity_) {
-        gpu_dssim_target_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_dlpix_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_alpha_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_beta_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_gamma_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_elements, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_elements_capacity_ = num_elements;
+    ensure_gpu_dssim_loss_resources(num_elements, partial_count);
+    const bool target_identity_changed = gpu_dssim_cached_target_ != target ||
+        gpu_dssim_cached_target_elements_ != num_elements ||
+        gpu_dssim_cached_target_W_ != W ||
+        gpu_dssim_cached_target_H_ != H;
+    const bool validate_target_cache = gpu_dssim_validate_target_cache_enabled();
+    bool target_changed = target_identity_changed;
+    uint64_t target_hash = 0;
+    bool target_hash_computed = false;
+    if (target_identity_changed) {
+        gpu_dssim_cached_target_hash_valid_ = false;
+        if (validate_target_cache) {
+            target_hash = hash_float_bytes(target, num_elements);
+            target_hash_computed = true;
+        }
+    } else if (validate_target_cache && gpu_dssim_cached_target_hash_valid_) {
+        target_hash = hash_float_bytes(target, num_elements);
+        target_hash_computed = true;
+        target_changed = target_hash != gpu_dssim_cached_target_hash_;
+    } else if (validate_target_cache) {
+        target_hash = hash_float_bytes(target, num_elements);
+        target_hash_computed = true;
+        target_changed = true;
     }
-    if (partial_count > gpu_dssim_partials_capacity_) {
-        gpu_dssim_partials_buf_ = std::make_unique<VulkanBuffer>(ctx_, bytes_partials, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gpu_dssim_partials_.resize(partial_count);
-        gpu_dssim_partials_capacity_ = partial_count;
+    if (target_changed) {
+        gpu_dssim_target_buf_->upload(target, static_cast<std::size_t>(bytes_elements));
     }
-
-    if (!dssim_loss_pass_) {
-        dssim_loss_pass_ = std::make_unique<DssimLossPass>(ctx_);
+    const VkBuffer rendered = static_cast<VkBuffer>(out_cache.rendered_image_gpu);
+    const bool descriptors_changed = !gpu_dssim_pass_bound_ || gpu_dssim_bound_rendered_ != rendered;
+    if (descriptors_changed) {
+        dssim_loss_pass_->bind_buffers(rendered,
+                                       gpu_dssim_target_buf_->handle(),
+                                       gpu_dssim_dlpix_buf_->handle(),
+                                       gpu_dssim_partials_buf_->handle(),
+                                       gpu_dssim_alpha_buf_->handle(),
+                                       gpu_dssim_beta_buf_->handle(),
+                                       gpu_dssim_gamma_buf_->handle(),
+                                       gpu_dssim_x2_buf_->handle(),
+                                       gpu_dssim_y2_buf_->handle(),
+                                       gpu_dssim_xy_buf_->handle(),
+                                       gpu_dssim_scratch_buf_->handle(),
+                                       gpu_dssim_mu1_buf_->handle());
+        gpu_dssim_pass_bound_ = true;
+        gpu_dssim_bound_rendered_ = rendered;
     }
-    gpu_dssim_target_buf_->upload(target, static_cast<std::size_t>(bytes_elements));
-    dssim_loss_pass_->bind_buffers(static_cast<VkBuffer>(out_cache.rendered_image_gpu),
-                                   gpu_dssim_target_buf_->handle(),
-                                   gpu_dssim_dlpix_buf_->handle(),
-                                   gpu_dssim_partials_buf_->handle(),
-                                   gpu_dssim_alpha_buf_->handle(),
-                                   gpu_dssim_beta_buf_->handle(),
-                                   gpu_dssim_gamma_buf_->handle());
+    if (target_changed || descriptors_changed) {
+        dssim_loss_pass_->precompute_target_terms(static_cast<uint32_t>(W), static_cast<uint32_t>(H), tcfg_.lambda_dssim);
+        gpu_dssim_cached_target_ = target;
+        gpu_dssim_cached_target_elements_ = num_elements;
+        gpu_dssim_cached_target_W_ = W;
+        gpu_dssim_cached_target_H_ = H;
+        if (target_hash_computed) {
+            gpu_dssim_cached_target_hash_ = target_hash;
+            gpu_dssim_cached_target_hash_valid_ = true;
+        }
+    }
     dssim_loss_pass_->dispatch_sync(static_cast<uint32_t>(W), static_cast<uint32_t>(H), tcfg_.lambda_dssim);
     gpu_dssim_partials_buf_->download(gpu_dssim_partials_.data(), partial_count * sizeof(float));
 
@@ -739,6 +828,7 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     last_forward_gpu_resident_outputs_ = false;
     last_forward_cpu_image_downloaded_ = false;
     last_forward_cpu_cache_downloaded_ = false;
+    last_preprocess_cpu_cache_downloaded_ = false;
     const bool use_gpu_l1 = gpu_l1_fast_path_allowed_
         && gpu_l1_loss_enabled()
         && tcfg_.lambda_dssim == 0.0f
@@ -762,8 +852,12 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
     active_cfg.sh_degree = active_sh_degree_;
     active_cfg.eval_3D_parity_mode = tcfg_.eval_3D && tcfg_.parity_mode;
     active_cfg.compact_eval3D_tiles = tcfg_.eval_3D && !tcfg_.parity_mode && compact_eval3d_tiles_enabled();
+    const bool skip_preprocess_cpu_cache_download = use_gpu_resident_outputs
+        && active_cfg.eval_3D
+        && !active_cfg.compact_eval3D_tiles
+        && !capture_backward_diagnostics_;
 
-    // 1. Forward preprocess (populates cache: cov3D, p_view, p_hom_w, cov2D, cov2D_det)
+    // 1. Forward preprocess.
     if (timing) t_stage = StageClock::now();
     if (use_gpu_raw_activation) {
         out_pre = preprocessor_.process_gpu_inputs(N_, max_coeffs_,
@@ -773,21 +867,34 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
             active_opacities_gpu_->handle(),
             active_sh_gpu_->handle(),
             filter_3D_gpu_->handle(),
-            cam, active_cfg, alloc_, &out_cache);
+            cam, active_cfg, alloc_, &out_cache,
+            !skip_preprocess_cpu_cache_download);
+    } else if (skip_preprocess_cpu_cache_download) {
+        out_pre = preprocessor_.process_without_cpu_cache_download(g_, cam, active_cfg, alloc_, &out_cache);
     } else {
         out_pre = preprocessor_.process(g_, cam, active_cfg, alloc_, &out_cache);
     }
+#ifdef GS3D_TESTING
+    last_preprocess_cpu_cache_downloaded_ = preprocessor_.last_cpu_cache_downloaded_for_test();
+#endif
     if (timing) stage_timing_preprocess_process_ms_ = stage_elapsed_ms(t_stage);
     if (timing) t_stage = StageClock::now();
-    if (N_ > 0) {
+    if (N_ > 0 && !skip_preprocess_cpu_cache_download) {
         preprocessor_.download_cache(N_, out_cache, alloc_);
     }
+#ifdef GS3D_TESTING
+    last_preprocess_cpu_cache_downloaded_ = preprocessor_.last_cpu_cache_downloaded_for_test();
+#endif
     if (timing) stage_timing_preprocess_cache_refresh_ms_ = stage_elapsed_ms(t_stage);
     out_cache.pre = &out_pre;
 
+    const bool use_gpu_pair_sort = !capture_intermediates_ && SorterVulkan::fuchsia_sort_enabled();
+
     // 2. Tile binning
     if (timing) t_stage = StageClock::now();
+    binner_.set_host_mirror_enabled(!use_gpu_pair_sort);
     out_bin = binner_.bin(out_pre, N_, cam, active_cfg, alloc_);
+    binner_.set_host_mirror_enabled(true);
     if (timing) stage_timing_bin_ms_ = stage_elapsed_ms(t_stage);
     out_cache.bin = &out_bin;
     // Record actual R for next step's arena estimate.
@@ -796,7 +903,7 @@ float VulkanTrainer::run_forward_and_loss(const Camera& cam,
 
     // 3. Sort
     if (timing) t_stage = StageClock::now();
-    sorter_.set_host_mirror_enabled(capture_intermediates_);
+    sorter_.set_host_mirror_enabled(!use_gpu_pair_sort);
     sorter_.sort(out_bin, alloc_);
     sorter_.set_host_mirror_enabled(true);
     if (timing) stage_timing_sort_ms_ = stage_elapsed_ms(t_stage);
@@ -1001,6 +1108,18 @@ float VulkanTrainer::step(const Camera& cam,
         pb_gpu_inputs.raw_rotations = raw_param_gpu_bufs_[5]->handle();
         pb_gpu_inputs.filter_3D = filter_3D_gpu_->handle();
 
+        const bool use_fused_eval3d_replay = fused_eval3d_replay_backward_enabled()
+            && tcfg_.eval_3D
+            && !tcfg_.parity_mode
+            && !tcfg_.proper_ewa
+            && !capture_backward_diagnostics_
+            && cache.replay_order_count > 0
+            && ((cache.replay_order_offsets && cache.replay_order_gids)
+                || (cache.replay_order_offsets_gpu && cache.replay_order_gids_gpu));
+        if (use_fused_eval3d_replay) {
+            preprocessor_bwd_.prepare_record_buffers(N_, max_coeffs_);
+        }
+
         if (split_backward_timing_enabled()) {
             auto t_split = StageClock::now();
             VkCommandBuffer rb_cmd = ctx_.allocatePrimary();
@@ -1008,8 +1127,22 @@ float VulkanTrainer::step(const Camera& cam,
             rb_bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             rb_bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(rb_cmd, &rb_bi);
-            rasterizer_bwd_.backward_record_into(rb_cmd, pre, bin, N_, cam, active_cfg,
-                                                  cache, dL_dpixels_.data(), image_.data());
+            if (use_fused_eval3d_replay) {
+                preprocessor_bwd_.clear_geometry_grad_buffers(rb_cmd);
+                rasterizer_bwd_.backward_record_fused_eval3d_replay_into(rb_cmd, pre, bin, N_, cam, active_cfg,
+                    cache, dL_dpixels_.data(),
+                    pb_gpu_inputs.positions,
+                    pb_gpu_inputs.scales,
+                    pb_gpu_inputs.rotations,
+                    pb_gpu_inputs.raw_rotations,
+                    pb_gpu_inputs.filter_3D,
+                    preprocessor_bwd_.d_raw_positions_buf(),
+                    preprocessor_bwd_.d_raw_scales_buf(),
+                    preprocessor_bwd_.d_raw_rotations_buf());
+            } else {
+                rasterizer_bwd_.backward_record_into(rb_cmd, pre, bin, N_, cam, active_cfg,
+                                                     cache, dL_dpixels_.data(), image_.data());
+            }
             vkEndCommandBuffer(rb_cmd);
             ctx_.submitAndWait(rb_cmd);
             ctx_.freePrimary(rb_cmd);
@@ -1032,7 +1165,8 @@ float VulkanTrainer::step(const Camera& cam,
                 rasterizer_bwd_.dL_dmeans2D_buf(),
                 raw_view_,
                 rasterizer_bwd_.dL_dgauss2screen_buf(),
-                &pb_gpu_inputs);
+                &pb_gpu_inputs,
+                use_fused_eval3d_replay);
             vkEndCommandBuffer(pb_cmd);
             ctx_.submitAndWait(pb_cmd);
             ctx_.freePrimary(pb_cmd);
@@ -1044,8 +1178,22 @@ float VulkanTrainer::step(const Camera& cam,
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(bwd_cmd, &bi);
 
-            rasterizer_bwd_.backward_record_into(bwd_cmd, pre, bin, N_, cam, active_cfg,
-                                                  cache, dL_dpixels_.data(), image_.data());
+            if (use_fused_eval3d_replay) {
+                preprocessor_bwd_.clear_geometry_grad_buffers(bwd_cmd);
+                rasterizer_bwd_.backward_record_fused_eval3d_replay_into(bwd_cmd, pre, bin, N_, cam, active_cfg,
+                    cache, dL_dpixels_.data(),
+                    pb_gpu_inputs.positions,
+                    pb_gpu_inputs.scales,
+                    pb_gpu_inputs.rotations,
+                    pb_gpu_inputs.raw_rotations,
+                    pb_gpu_inputs.filter_3D,
+                    preprocessor_bwd_.d_raw_positions_buf(),
+                    preprocessor_bwd_.d_raw_scales_buf(),
+                    preprocessor_bwd_.d_raw_rotations_buf());
+            } else {
+                rasterizer_bwd_.backward_record_into(bwd_cmd, pre, bin, N_, cam, active_cfg,
+                                                     cache, dL_dpixels_.data(), image_.data());
+            }
 #ifdef GS3D_TESTING
             last_forward_gpu_cache_used_ = rasterizer_bwd_.last_forward_gpu_cache_used_for_test();
 #endif
@@ -1057,7 +1205,8 @@ float VulkanTrainer::step(const Camera& cam,
                 rasterizer_bwd_.dL_dmeans2D_buf(),
                 raw_view_,
                 rasterizer_bwd_.dL_dgauss2screen_buf(),
-                &pb_gpu_inputs);
+                &pb_gpu_inputs,
+                use_fused_eval3d_replay);
 
             vkEndCommandBuffer(bwd_cmd);
             ctx_.submitAndWait(bwd_cmd);
@@ -1208,6 +1357,20 @@ float VulkanTrainer::step(const Camera& cam,
         return last_loss_;
     }
 
+    const bool densification_enabled = (tcfg_.densify_from_step > 0);
+    const bool should_densify =
+        densification_enabled &&
+        (step_count_ >= tcfg_.densify_from_step) &&
+        (step_count_ <= tcfg_.densify_until_step) &&
+        (step_count_ % tcfg_.densify_interval == 0);
+    const bool should_reset_opacity =
+        densification_enabled && tcfg_.opacity_reset_interval > 0 &&
+        step_count_ > 0 && step_count_ <= tcfg_.densify_until_step &&
+        (step_count_ % tcfg_.opacity_reset_interval == 0);
+    const bool skip_full_raw_download = can_use_gpu_raw_activation() && !should_densify && !should_reset_opacity;
+    const bool record_position_noise_with_adam =
+        skip_full_raw_download && tcfg_.noise_lr != 0.0f && pos_lr != 0.0f && N_ > 0;
+
     // GPU Adam — chain all 6 groups into one CB (6 submit+wait → 1).
     if (timing) t_stage = StageClock::now();
     {
@@ -1263,6 +1426,19 @@ float VulkanTrainer::step(const Camera& cam,
         vulkan_adam_.step_group_record(adam_cmd, 5,
             raw_param_gpu_bufs_[5]->handle(), grad_rot, group_lrs_[5], s);
 
+        if (record_position_noise_with_adam) {
+            insert_compute_barrier(adam_cmd);
+            position_noise_pass_.bind_buffers(raw_param_gpu_bufs_[0]->handle(),
+                                              active_scales_gpu_->handle(),
+                                              active_rotations_gpu_->handle(),
+                                              active_opacities_gpu_->handle());
+            position_noise_pass_.record(adam_cmd,
+                                        static_cast<uint32_t>(N_),
+                                        static_cast<uint32_t>(step_count_),
+                                        tcfg_.noise_lr,
+                                        pos_lr);
+        }
+
         vkEndCommandBuffer(adam_cmd);
         ctx_.submitAndWait(adam_cmd);
         ctx_.freePrimary(adam_cmd);
@@ -1279,30 +1455,20 @@ float VulkanTrainer::step(const Camera& cam,
     }
     if (timing) adam_capture_ms = stage_elapsed_ms(t_stage);
 
-    const bool densification_enabled = (tcfg_.densify_from_step > 0);
-    const bool should_densify =
-        densification_enabled &&
-        (step_count_ >= tcfg_.densify_from_step) &&
-        (step_count_ <= tcfg_.densify_until_step) &&
-        (step_count_ % tcfg_.densify_interval == 0);
-    const bool should_reset_opacity =
-        densification_enabled && tcfg_.opacity_reset_interval > 0 &&
-        step_count_ > 0 && step_count_ <= tcfg_.densify_until_step &&
-        (step_count_ % tcfg_.opacity_reset_interval == 0);
-    const bool skip_full_raw_download = can_use_gpu_raw_activation() && !should_densify && !should_reset_opacity;
-
     if (timing) t_stage = StageClock::now();
     raw_cpu_dirty_ = true;
     last_raw_materialization_kind_ = RawMaterializationKind::None;
     if (!skip_full_raw_download) {
         materialize_raw_params();
-    } else if (tcfg_.noise_lr != 0.0f) {
+    } else if (tcfg_.noise_lr != 0.0f && !record_position_noise_with_adam) {
         materialize_raw_positions();
     }
     if (timing) raw_download_ms = stage_elapsed_ms(t_stage);
 
     if (timing) t_stage = StageClock::now();
-    inject_position_noise(pos_lr);
+    if (!record_position_noise_with_adam) {
+        inject_position_noise(pos_lr);
+    }
     if (timing) noise_ms = stage_elapsed_ms(t_stage);
 
     if (timing) t_stage = StageClock::now();
@@ -1414,31 +1580,41 @@ float VulkanTrainer::forward_only(const Camera& cam,
 // inject_position_noise — covariance-scaled noise for near-dead Gaussians
 // ---------------------------------------------------------------------------
 // Matches train.py:141-148:
-//   noise = randn_like(xyz) * sigmoid(-100*(opacity - 0.995)) * noise_lr * xyz_lr
+//   noise = randn_like(xyz) * op_sigmoid(1-opacity) * noise_lr * xyz_lr
 //   noise = Sigma @ noise   where Sigma = L @ L^T
 //   xyz += noise
 //
-// Evidence: op_sigmoid(1 - opacity) = sigmoid(-100*(opacity - 0.005))
-// when opacity >= ~0.01 (active) the factor is < 1e-6 (no noise injected);
-// when opacity < ~0.005 (dead) the factor approaches 0.62 (noise injected).
+// Evidence: op_sigmoid(1 - opacity) = sigmoid(-100*(opacity - 0.005)).
+// The GPU path uses deterministic shader-local samples, preserving the
+// intended distribution rather than CPU std::mt19937 sample parity.
 void VulkanTrainer::inject_position_noise(float pos_lr) {
-    if (tcfg_.noise_lr == 0.f || N_ == 0) return;
+    if (tcfg_.noise_lr == 0.f || pos_lr == 0.f || N_ == 0) return;
+
+    if (raw_cpu_dirty_) {
+        position_noise_pass_.bind_buffers(raw_param_gpu_bufs_[0]->handle(),
+                                          active_scales_gpu_->handle(),
+                                          active_rotations_gpu_->handle(),
+                                          active_opacities_gpu_->handle());
+        position_noise_pass_.dispatch_sync(static_cast<uint32_t>(N_),
+                                           static_cast<uint32_t>(step_count_),
+                                           tcfg_.noise_lr,
+                                           pos_lr);
+        return;
+    }
 
     std::mt19937 rng(static_cast<uint32_t>(step_count_));
     std::normal_distribution<float> normal(0.f, 1.f);
 
     bool changed = false;
     for (int i = 0; i < N_; ++i) {
-        const float* act_sc  = act_scales_.data()    + static_cast<size_t>(i) * 3;
+        const size_t i3 = static_cast<size_t>(i) * 3;
+        const float* act_sc  = act_scales_.data() + i3;
         const float* act_rot = act_rotations_.data() + static_cast<size_t>(i) * 4;
         const float  opacity = act_opacities_[static_cast<size_t>(i)];
 
-        // Soft-step gate: near zero for active Gaussians (opacity close to 1),
-        // approaches 1 for dead Gaussians (opacity close to 0).
         const float opacity_factor = op_sigmoid(1.f - opacity);
         if (opacity_factor < 1e-6f) continue;
 
-        // Build L = R @ diag(act_scale), then Sigma = L @ L^T.
         float L[3][3];
         build_L(act_rot, act_sc, L);
 
@@ -1448,12 +1624,11 @@ void VulkanTrainer::inject_position_noise(float pos_lr) {
                 for (int k = 0; k < 3; ++k)
                     Sigma[r][c] += L[r][k] * L[c][k];
 
-        // Draw isotropic noise then scale by Sigma, opacity_factor, noise_lr, pos_lr.
         const float scalar = opacity_factor * tcfg_.noise_lr * pos_lr;
         float eta[3];
         for (int k = 0; k < 3; ++k) eta[k] = scalar * normal(rng);
 
-        float* pos = raw_positions_.data() + static_cast<size_t>(i) * 3;
+        float* pos = raw_positions_.data() + i3;
         for (int r = 0; r < 3; ++r) {
             float delta = 0.f;
             for (int c = 0; c < 3; ++c) delta += Sigma[r][c] * eta[c];

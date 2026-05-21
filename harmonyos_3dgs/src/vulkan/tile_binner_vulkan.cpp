@@ -243,10 +243,11 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     std::unique_ptr<VulkanBuffer> bin_cov3d_inv_buf;
     std::unique_ptr<VulkanBuffer> bin_mean_offset_buf;
     std::unique_ptr<VulkanBuffer> bin_gauss2screen_buf;
-    std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf;
     std::unique_ptr<VulkanBuffer> bin_conic_opacity_packed_buf;
-    auto dummy4_buf = std::make_unique<VulkanBuffer>(ctx_, 4u,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (!bin_dummy4_buf_) {
+        bin_dummy4_buf_ = std::make_unique<VulkanBuffer>(ctx_, 4u,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
     const bool use_eval3d_tile_binning = cfg.eval_3D && !cfg.eval_3D_parity_mode;
     if (use_eval3d_tile_binning) {
         if (!has_cov3D_inv_gpu) {
@@ -303,10 +304,12 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         subo.img_size[2] = 0.0f;
         subo.img_size[3] = 0.0f;
     }
-    bin_scatter_ubo_buf = std::make_unique<VulkanBuffer>(ctx_,
-        sizeof(ScatterUBO),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    bin_scatter_ubo_buf->upload(&subo, sizeof(ScatterUBO));
+    if (!bin_scatter_ubo_buf_) {
+        bin_scatter_ubo_buf_ = std::make_unique<VulkanBuffer>(ctx_,
+            sizeof(ScatterUBO),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+    bin_scatter_ubo_buf_->upload(&subo, sizeof(ScatterUBO));
 
     ScatterPass::Buffers sb{};
     sb.means2D         = has_means2D_gpu
@@ -327,17 +330,17 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
         : bin_rf_buf_->handle();
     sb.cov3D_inv       = has_cov3D_inv_gpu
         ? static_cast<VkBuffer>(pre.cov3D_inv_gpu)
-        : (bin_cov3d_inv_buf ? bin_cov3d_inv_buf->handle() : dummy4_buf->handle());
+        : (bin_cov3d_inv_buf ? bin_cov3d_inv_buf->handle() : bin_dummy4_buf_->handle());
     sb.mean_offset     = has_mean_offset_gpu
         ? static_cast<VkBuffer>(pre.mean_offset_gpu)
-        : (bin_mean_offset_buf ? bin_mean_offset_buf->handle() : dummy4_buf->handle());
-    sb.scatter_ubo          = bin_scatter_ubo_buf->handle();
+        : (bin_mean_offset_buf ? bin_mean_offset_buf->handle() : bin_dummy4_buf_->handle());
+    sb.scatter_ubo          = bin_scatter_ubo_buf_->handle();
     sb.gauss2screen         = has_gauss2screen_gpu
         ? static_cast<VkBuffer>(pre.gauss2screen_gpu)
-        : (bin_gauss2screen_buf ? bin_gauss2screen_buf->handle() : dummy4_buf->handle());
+        : (bin_gauss2screen_buf ? bin_gauss2screen_buf->handle() : bin_dummy4_buf_->handle());
     sb.conic_opacity_packed = has_conic_opacity_gpu
         ? static_cast<VkBuffer>(pre.conic_opacity_packed_gpu)
-        : (bin_conic_opacity_packed_buf ? bin_conic_opacity_packed_buf->handle() : dummy4_buf->handle());
+        : (bin_conic_opacity_packed_buf ? bin_conic_opacity_packed_buf->handle() : bin_dummy4_buf_->handle());
     sb.keyvals_unsorted     = bin_keyvals_buf_->handle();
     scatter_pass_->bind_buffers(sb);
     scatter_pass_->dispatch_sync(static_cast<uint32_t>(N),
@@ -347,10 +350,9 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
                                  use_eval3d_tile_binning && cfg.compact_eval3D_tiles);
 
     // -------------------------------------------------------------------
-    // 5. Download R valid pairs into FrameAllocator-backed output.
+    // 5. Publish R valid canonical pairs. Host mirrors are optional for
+    //    GPU-resident training; GPU handles remain authoritative.
     // -------------------------------------------------------------------
-    out.keys_unsorted   = alloc.allocate_array<uint64_t>(R);
-    out.values_unsorted = alloc.allocate_array<uint32_t>(R);
     out.keys_sorted     = nullptr;   // SorterVulkan (T14)
     out.values_sorted   = nullptr;
     out.max_value_exclusive = static_cast<uint32_t>(N);
@@ -359,10 +361,17 @@ BinningOutput TileBinnerVulkan::bin(const PreprocessOutput& pre,
     out.values_unsorted_gpu = reinterpret_cast<void*>(bin_vals_buf_->handle());
     out.keyvals_unsorted_gpu = reinterpret_cast<void*>(bin_keyvals_buf_->handle());
 
-    bin_keys_buf_->download(out.keys_unsorted,
-                            static_cast<std::size_t>(R) * sizeof(uint64_t));
-    bin_vals_buf_->download(out.values_unsorted,
-                            static_cast<std::size_t>(R) * sizeof(uint32_t));
+    if (host_mirror_enabled_) {
+        out.keys_unsorted   = alloc.allocate_array<uint64_t>(R);
+        out.values_unsorted = alloc.allocate_array<uint32_t>(R);
+        bin_keys_buf_->download(out.keys_unsorted,
+                                static_cast<std::size_t>(R) * sizeof(uint64_t));
+        bin_vals_buf_->download(out.values_unsorted,
+                                static_cast<std::size_t>(R) * sizeof(uint32_t));
+    } else {
+        out.keys_unsorted = nullptr;
+        out.values_unsorted = nullptr;
+    }
 
     return out;
 }

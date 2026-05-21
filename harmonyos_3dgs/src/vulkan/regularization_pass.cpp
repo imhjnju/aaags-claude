@@ -30,10 +30,13 @@ void RegularizationPass::bind_buffers(VkBuffer active_opacities,
                                       VkBuffer active_scales,
                                       VkBuffer d_raw_opacities,
                                       VkBuffer d_raw_scales) {
-    pipeline_->update_ssbo(descriptor_set_, regularization_bind::ACTIVE_OPACITIES, active_opacities);
-    pipeline_->update_ssbo(descriptor_set_, regularization_bind::ACTIVE_SCALES, active_scales);
-    pipeline_->update_ssbo(descriptor_set_, regularization_bind::D_RAW_OPACITIES, d_raw_opacities);
-    pipeline_->update_ssbo(descriptor_set_, regularization_bind::D_RAW_SCALES, d_raw_scales);
+    pipeline_->reset_descriptor_pool();
+    descriptor_set_ = pipeline_->allocateDescriptorSet({
+        active_opacities,
+        active_scales,
+        d_raw_opacities,
+        d_raw_scales,
+    });
 }
 
 void RegularizationPass::record(VkCommandBuffer cmd,

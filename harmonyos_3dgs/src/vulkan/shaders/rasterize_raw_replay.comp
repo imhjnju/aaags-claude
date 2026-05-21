@@ -1,0 +1,161 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ValuesSorted {
+    uint values_sorted[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer TileRanges {
+    uint tile_ranges[];
+};
+layout(std430, set = 0, binding = 3) readonly buffer ConicOpacity {
+    float conic_opacity[];
+};
+layout(std430, set = 0, binding = 4) readonly buffer RGB {
+    float rgb[];
+};
+layout(std430, set = 0, binding = 5) writeonly buffer OutImage {
+    float out_image[];
+};
+layout(std430, set = 0, binding = 6) writeonly buffer Transmittance {
+    float transmittance[];
+};
+layout(std430, set = 0, binding = 7) writeonly buffer NContrib {
+    uint n_contrib[];
+};
+layout(std140, set = 0, binding = 8) uniform RasterUBO {
+    vec4 bg_color;
+};
+layout(std430, set = 0, binding = 9) readonly buffer Gauss2Screen {
+    float gauss2screen[];
+};
+
+layout(push_constant) uniform PC {
+    uint num_gaussians;
+    uint image_width;
+    uint image_height;
+    uint num_tiles_x;
+    uint num_tiles_y;
+} pc;
+
+shared float s_g2s[256 * 16];
+shared float s_opa[256];
+shared float s_rgb_r[256];
+shared float s_rgb_g[256];
+shared float s_rgb_b[256];
+
+const float ALPHA_THRESHOLD = 1.0 / 255.0;
+const float T_MIN = 0.0001;
+const uint BATCH_SIZE = 256u;
+
+void main() {
+    uint tile_id = gl_WorkGroupID.y * pc.num_tiles_x + gl_WorkGroupID.x;
+    uint range_start = tile_ranges[tile_id * 2u + 0u];
+    uint range_end = tile_ranges[tile_id * 2u + 1u];
+
+    uint pixel_x = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint pixel_y = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    bool valid_pixel = (pixel_x < pc.image_width) && (pixel_y < pc.image_height);
+    uint local_idx = gl_LocalInvocationIndex;
+
+    float T = 1.0;
+    vec3 C = vec3(0.0);
+    uint n = 0u;
+    uint contributor_pos = 0u;
+    bool pixel_done = !valid_pixel;
+
+    for (uint batch_start = range_start; batch_start < range_end; batch_start += BATCH_SIZE) {
+        uint load_idx = batch_start + local_idx;
+        if (load_idx < range_end) {
+            uint gid = values_sorted[load_idx];
+            uint g2s_src = gid * 16u;
+            uint g2s_dst = local_idx * 16u;
+            s_g2s[g2s_dst + 0u]  = gauss2screen[g2s_src + 0u];
+            s_g2s[g2s_dst + 1u]  = gauss2screen[g2s_src + 1u];
+            s_g2s[g2s_dst + 2u]  = gauss2screen[g2s_src + 2u];
+            s_g2s[g2s_dst + 3u]  = gauss2screen[g2s_src + 3u];
+            s_g2s[g2s_dst + 4u]  = gauss2screen[g2s_src + 4u];
+            s_g2s[g2s_dst + 5u]  = gauss2screen[g2s_src + 5u];
+            s_g2s[g2s_dst + 6u]  = gauss2screen[g2s_src + 6u];
+            s_g2s[g2s_dst + 7u]  = gauss2screen[g2s_src + 7u];
+            s_g2s[g2s_dst + 8u]  = gauss2screen[g2s_src + 8u];
+            s_g2s[g2s_dst + 9u]  = gauss2screen[g2s_src + 9u];
+            s_g2s[g2s_dst + 10u] = gauss2screen[g2s_src + 10u];
+            s_g2s[g2s_dst + 11u] = gauss2screen[g2s_src + 11u];
+            s_g2s[g2s_dst + 12u] = gauss2screen[g2s_src + 12u];
+            s_g2s[g2s_dst + 13u] = gauss2screen[g2s_src + 13u];
+            s_g2s[g2s_dst + 14u] = gauss2screen[g2s_src + 14u];
+            s_g2s[g2s_dst + 15u] = gauss2screen[g2s_src + 15u];
+            s_opa[local_idx] = conic_opacity[gid * 4u + 3u];
+            s_rgb_r[local_idx] = rgb[gid * 3u + 0u];
+            s_rgb_g[local_idx] = rgb[gid * 3u + 1u];
+            s_rgb_b[local_idx] = rgb[gid * 3u + 2u];
+        }
+        barrier();
+
+        uint batch_size = min(BATCH_SIZE, range_end - batch_start);
+        if (!pixel_done) {
+            float fpx = float(pixel_x);
+            float fpy = float(pixel_y);
+            for (uint k = 0u; k < batch_size; ++k) {
+                contributor_pos += 1u;
+
+                uint base = k * 16u;
+                float pxa0 = s_g2s[base + 0u] - s_g2s[base + 12u] * fpx;
+                float pxa1 = s_g2s[base + 1u] - s_g2s[base + 13u] * fpx;
+                float pxa2 = s_g2s[base + 2u] - s_g2s[base + 14u] * fpx;
+                float pxa3 = s_g2s[base + 3u] - s_g2s[base + 15u] * fpx;
+                float pyb0 = s_g2s[base + 4u] - s_g2s[base + 12u] * fpy;
+                float pyb1 = s_g2s[base + 5u] - s_g2s[base + 13u] * fpy;
+                float pyb2 = s_g2s[base + 6u] - s_g2s[base + 14u] * fpy;
+                float pyb3 = s_g2s[base + 7u] - s_g2s[base + 15u] * fpy;
+                float dx = pxa1 * pyb2 - pxa2 * pyb1;
+                float dy = pxa2 * pyb0 - pxa0 * pyb2;
+                float dz = pxa0 * pyb1 - pxa1 * pyb0;
+                float mx = pxa3 * pyb0 - pxa0 * pyb3;
+                float my = pxa3 * pyb1 - pxa1 * pyb3;
+                float mz = pxa3 * pyb2 - pxa2 * pyb3;
+                float dd = dx * dx + dy * dy + dz * dz;
+                float valid_ray = step(1e-8, dd);
+                float inv_dd = 1.0 / max(dd, 1e-8);
+                float m0 = mx * inv_dd;
+                float m1 = my * inv_dd;
+                float m2 = mz * inv_dd;
+                float mp0 = (dy * m2 - dz * m1) * valid_ray;
+                float mp1 = (dz * m0 - dx * m2) * valid_ray;
+                float mp2 = (dx * m1 - dy * m0) * valid_ray;
+                float power = (-0.5 * (mx * m0 + my * m1 + mz * m2)) * valid_ray;
+                if (power > 0.0) continue;
+
+                float alpha = min(0.99, s_opa[k] * exp(power));
+                if (alpha < ALPHA_THRESHOLD) continue;
+
+                float w_ndc = s_g2s[base + 12u] * mp0 + s_g2s[base + 13u] * mp1 + s_g2s[base + 14u] * mp2 + s_g2s[base + 15u];
+                float z_ndc = s_g2s[base + 8u] * mp0 + s_g2s[base + 9u] * mp1 + s_g2s[base + 10u] * mp2 + s_g2s[base + 11u];
+                if (z_ndc < -w_ndc || z_ndc > w_ndc) continue;
+
+                float test_T = T * (1.0 - alpha);
+                if (test_T < T_MIN) {
+                    pixel_done = true;
+                    break;
+                }
+                C.r += s_rgb_r[k] * alpha * T;
+                C.g += s_rgb_g[k] * alpha * T;
+                C.b += s_rgb_b[k] * alpha * T;
+                T = test_T;
+                n = contributor_pos;
+            }
+        }
+        barrier();
+    }
+
+    if (valid_pixel) {
+        uint px = pixel_y * pc.image_width + pixel_x;
+        uint HW = pc.image_width * pc.image_height;
+        out_image[0u * HW + px] = C.r + T * bg_color.x;
+        out_image[1u * HW + px] = C.g + T * bg_color.y;
+        out_image[2u * HW + px] = C.b + T * bg_color.z;
+        transmittance[px] = T;
+        n_contrib[px] = n;
+    }
+}

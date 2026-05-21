@@ -40,6 +40,8 @@ public:
                       const RenderConfig& config,
                       FrameAllocator& allocator) override;
 
+    void set_host_mirror_enabled(bool enabled) { host_mirror_enabled_ = enabled; }
+
     // -- Layer-2 record-mode API -------------------------------------------
     //
     // Allocate internal GPU buffers for the chained forward pipeline and bind
@@ -114,6 +116,9 @@ private:
     std::unique_ptr<VulkanBuffer> bin_keys_buf_;  // keys_unsorted [R] u64
     std::unique_ptr<VulkanBuffer> bin_vals_buf_;  // values_unsorted [R] u32
     std::unique_ptr<VulkanBuffer> bin_keyvals_buf_; // packed keyvals_unsorted [R] u64
+    std::unique_ptr<VulkanBuffer> bin_scatter_ubo_buf_; // ScatterUBO
+    std::unique_ptr<VulkanBuffer> bin_dummy4_buf_; // 4-byte dummy for inactive eval_3D scatter inputs
+    bool host_mirror_enabled_ = true;
 
     // Allocate/grow the 7 N-sized + 1 wg-sized scan buffers.
     void prepare_for_bin(uint32_t N, uint32_t num_wgs);

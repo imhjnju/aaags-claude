@@ -45,15 +45,11 @@ PreprocessorBackwardVulkan::PreprocessorBackwardVulkan(VulkanContext& ctx,
 PreprocessorBackwardVulkan::~PreprocessorBackwardVulkan() = default;
 
 void PreprocessorBackwardVulkan::clear_grad_buffers(VkCommandBuffer cmd) {
-    // Clear all gradient output buffers to prevent accumulation of stale data.
-    // Currently unused; the preprocess-backward shaders overwrite core gradient outputs.
-    // vkCmdFillBuffer is efficient: GPU fills the buffer with a constant value.
-    // Must use a pipeline barrier after to ensure fills complete before shaders read.
-
-    VkBufferMemoryBarrier barriers[7];
+    VkBufferMemoryBarrier barriers[5];
     uint32_t num_barriers = 0;
 
-    auto add_barrier = [&](VulkanBuffer* buf) {
+    auto fill_and_barrier = [&](VulkanBuffer* buf) {
+        vkCmdFillBuffer(cmd, buf->handle(), 0, VK_WHOLE_SIZE, 0);
         VkBufferMemoryBarrier& b = barriers[num_barriers++];
         b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -65,24 +61,45 @@ void PreprocessorBackwardVulkan::clear_grad_buffers(VkCommandBuffer cmd) {
         b.size = VK_WHOLE_SIZE;
     };
 
-    // Fill all gradient buffers with zeros
-    // Note: This is called before backward_record_into, so we check pointer validity
-    // instead of buf_N_ (which is set by prepare_for_n called from backward_record_into).
     if (dm3d_buf_ && dsh_buf_ && dsc_buf_ && drot_buf_ && d_raw_opa_buf_) {
-        vkCmdFillBuffer(cmd, dm3d_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, dsh_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, dsc_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, drot_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
-        vkCmdFillBuffer(cmd, d_raw_opa_buf_->handle(), 0, VK_WHOLE_SIZE, 0);
-
-        add_barrier(dm3d_buf_.get());
-        add_barrier(dsh_buf_.get());
-        add_barrier(dsc_buf_.get());
-        add_barrier(drot_buf_.get());
-        add_barrier(d_raw_opa_buf_.get());
+        fill_and_barrier(dm3d_buf_.get());
+        fill_and_barrier(dsh_buf_.get());
+        fill_and_barrier(dsc_buf_.get());
+        fill_and_barrier(drot_buf_.get());
+        fill_and_barrier(d_raw_opa_buf_.get());
     }
 
-    // Barrier to ensure fills complete before shaders write to these buffers
+    if (num_barriers > 0) {
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, num_barriers, barriers, 0, nullptr);
+    }
+}
+
+void PreprocessorBackwardVulkan::clear_geometry_grad_buffers(VkCommandBuffer cmd) {
+    VkBufferMemoryBarrier barriers[3];
+    uint32_t num_barriers = 0;
+
+    auto fill_and_barrier = [&](VulkanBuffer* buf) {
+        vkCmdFillBuffer(cmd, buf->handle(), 0, VK_WHOLE_SIZE, 0);
+        VkBufferMemoryBarrier& b = barriers[num_barriers++];
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf->handle();
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+    };
+
+    if (dm3d_buf_ && dsc_buf_ && drot_buf_) {
+        fill_and_barrier(dm3d_buf_.get());
+        fill_and_barrier(dsc_buf_.get());
+        fill_and_barrier(drot_buf_.get());
+    }
+
     if (num_barriers > 0) {
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -106,6 +123,8 @@ void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
     const VkDeviceSize sz_N  = static_cast<VkDeviceSize>(N_new) * sizeof(float);
     const VkDeviceSize sz_Ni = static_cast<VkDeviceSize>(N_new) * sizeof(int32_t);
     const VkDeviceSize sz_sh = static_cast<VkDeviceSize>(N_new) * static_cast<VkDeviceSize>(K_new) * 3u * sizeof(float);
+    const VkBufferUsageFlags grad_output_usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
     pos_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     rad_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_Ni, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -126,11 +145,11 @@ void PreprocessorBackwardVulkan::prepare_for_n(int N, int K) {
     cov2d_in_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     c2ddet_in_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     phomw_in_buf_  = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    dm3d_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    dsh_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_sh, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    dsc_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    drot_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    d_raw_opa_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    dm3d_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N3, grad_output_usage);
+    dsh_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_sh, grad_output_usage);
+    dsc_buf_       = std::make_unique<VulkanBuffer>(ctx_, sz_N3, grad_output_usage);
+    drot_buf_      = std::make_unique<VulkanBuffer>(ctx_, sz_N4, grad_output_usage);
+    d_raw_opa_buf_ = std::make_unique<VulkanBuffer>(ctx_, sz_N,  grad_output_usage);
     ubo_buf_       = std::make_unique<VulkanBuffer>(ctx_,
         static_cast<VkDeviceSize>(sizeof(PreprocessBackwardUBO)),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -360,6 +379,10 @@ void PreprocessorBackwardVulkan::backward(const GaussianData& g,
     d_raw_opa_buf_->download(grads.d_raw_opacities, static_cast<std::size_t>(bytes_N_float));
 }
 
+void PreprocessorBackwardVulkan::prepare_record_buffers(int num_gaussians, int max_coeffs) {
+    prepare_for_n(num_gaussians, max_coeffs);
+}
+
 void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                        const GaussianData& g,
                                                        int num_gaussians,
@@ -372,7 +395,8 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
                                                        VkBuffer d_means2D_gpu,
                                                        const RawGaussianParams& raw,
                                                        VkBuffer d_gauss2screen_gpu,
-                                                       const PreprocessBackwardGpuInputs* gpu_inputs) {
+                                                       const PreprocessBackwardGpuInputs* gpu_inputs,
+                                                       bool skip_eval3d_geometry) {
     const int N = num_gaussians;
     const int K = g.max_coeffs;  // (sh_degree+1)^2
 
@@ -500,7 +524,7 @@ void PreprocessorBackwardVulkan::backward_record_into(VkCommandBuffer cmd,
         pb.raw_rotations = raw_rotations_handle;
         pb.filter_3D = filter_3D_handle;
         eval3d_pass_->bind_buffers(pb, ubo_buf_->handle());
-        eval3d_pass_->record(cmd, static_cast<uint32_t>(N));
+        eval3d_pass_->record(cmd, static_cast<uint32_t>(N), skip_eval3d_geometry);
         return;
     }
 

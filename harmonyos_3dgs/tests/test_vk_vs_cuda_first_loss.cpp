@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,13 @@ const std::string kCamPath =
 
 inline std::string dump_dir() {
     return std::string(TEST_DATA_DIR) + "/golden/basketball/cuda_ref/step_0001";
+}
+
+std::string missing_dump_file(std::initializer_list<const char*> names) {
+    for (const char* name : names) {
+        if (!std::filesystem::exists(dump_dir() + "/" + name)) return name;
+    }
+    return {};
 }
 
 inline std::string resolve_ply_path() {
@@ -170,6 +178,8 @@ TEST(VkVsCudaFirstLoss, Gate_I1_ViewMatrix) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
+    if (const std::string missing = missing_dump_file({"view_matrix.npy"}); !missing.empty())
+        GTEST_SKIP() << missing << " missing in CUDA dump";
 
     Camera cam = loadCameraJson(kCamPath.c_str(), /*cam_id=*/0);
     ASSERT_EQ(cam.width, kW);
@@ -205,6 +215,8 @@ TEST(VkVsCudaFirstLoss, Gate_I2_ProjMatrix) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
+    if (const std::string missing = missing_dump_file({"proj_matrix.npy", "cam_position.npy", "tan_fov.npy"}); !missing.empty())
+        GTEST_SKIP() << missing << " missing in CUDA dump";
 
     Camera cam = loadCameraJson(kCamPath.c_str(), /*cam_id=*/0);
     NpyArray pm = load_npy(dump_dir() + "/proj_matrix.npy");
@@ -1473,22 +1485,12 @@ TEST(VkVsCudaFirstLoss, Gate_P5_SortedIds) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/gt_image.npy"))
-        << "gt_image.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/means2D.npy"))
-        << "means2D.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/radii.npy"))
-        << "radii.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/tiles_touched.npy"))
-        << "tiles_touched.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/depths.npy"))
-        << "depths.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/rects2D.npy"))
-        << "rects2D.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/sorted_ids_per_tile.npy"))
-        << "sorted_ids_per_tile.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/tile_offsets.npy"))
-        << "tile_offsets.npy missing in CUDA dump";
+    if (const std::string missing = missing_dump_file({
+            "gt_image.npy", "means2D.npy", "radii.npy", "tiles_touched.npy",
+            "depths.npy", "rects2D.npy", "sorted_ids_per_tile.npy", "tile_offsets.npy"});
+        !missing.empty()) {
+        GTEST_SKIP() << missing << " missing in CUDA dump";
+    }
 
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
@@ -2242,18 +2244,12 @@ TEST(VkVsCudaFirstLoss, Gate_P6_TFinalNContrib) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/gt_image.npy"))
-        << "gt_image.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/T_final.npy"))
-        << "T_final.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/n_contrib.npy"))
-        << "n_contrib.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/depths.npy"))
-        << "depths.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/sorted_ids_per_tile.npy"))
-        << "sorted_ids_per_tile.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/tile_offsets.npy"))
-        << "tile_offsets.npy missing in CUDA dump";
+    if (const std::string missing = missing_dump_file({
+            "gt_image.npy", "T_final.npy", "n_contrib.npy", "depths.npy",
+            "sorted_ids_per_tile.npy", "tile_offsets.npy"});
+        !missing.empty()) {
+        GTEST_SKIP() << missing << " missing in CUDA dump";
+    }
 
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
@@ -2621,10 +2617,10 @@ TEST(VkVsCudaFirstLoss, Gate_P7_RenderedImage) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/gt_image.npy"))
-        << "gt_image.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/rendered_image.npy"))
-        << "rendered_image.npy missing in CUDA dump";
+    if (const std::string missing = missing_dump_file({"gt_image.npy", "rendered_image.npy"});
+        !missing.empty()) {
+        GTEST_SKIP() << missing << " missing in CUDA dump";
+    }
 
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
@@ -2764,12 +2760,10 @@ TEST(VkVsCudaFirstLoss, Gate_L1_L1Loss) {
         GTEST_SKIP() << "cameras.json not found: " << kCamPath;
     if (!std::filesystem::exists(dump_dir()))
         GTEST_SKIP() << "CUDA golden dump missing: " << dump_dir();
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/gt_image.npy"))
-        << "gt_image.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/rendered_image.npy"))
-        << "rendered_image.npy missing in CUDA dump";
-    ASSERT_TRUE(std::filesystem::exists(dump_dir() + "/l1_loss.npy"))
-        << "l1_loss.npy missing in CUDA dump";
+    if (const std::string missing = missing_dump_file({"gt_image.npy", "rendered_image.npy", "l1_loss.npy"});
+        !missing.empty()) {
+        GTEST_SKIP() << missing << " missing in CUDA dump";
+    }
 
     VulkanContext ctx;
     if (!ctx.init()) GTEST_SKIP() << "No Vulkan compute device.";
